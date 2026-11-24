@@ -1785,7 +1785,7 @@ if(/^https?:/.test(location.protocol)){var pad=function(n){return (n<10?'0':'')+
 """
 
 CONV_CSS = """
-.ctl{position:sticky;top:48px;z-index:10;background:color-mix(in srgb,var(--bg) 88%,transparent);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+.ctl{position:sticky;top:var(--abh,48px);z-index:10;background:color-mix(in srgb,var(--bg) 88%,transparent);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
 padding:10px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;border-bottom:1px solid var(--line);margin-bottom:4px}
 .ctl input[type=search]{flex:1;min-width:200px;padding:8px 14px;border-radius:99px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:14px}
 .ctl select,.ctl button{padding:6px 12px;border-radius:99px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:13px}
@@ -2372,7 +2372,7 @@ CSS = """
 @media (prefers-color-scheme:dark){:root{--bg:#0b1130;--card:#131a3d;--fg:#edf0ff;--mut:#a1aad5;--faint:#6b75a6;--line:rgba(140,160,255,.15);--bar:#222b59;--shadow:none;
 --violet:#b39dff;--sky:#62bfff;--teal:#2fdcc0;--lime:#a6e35c;--amber:#ffc25a;--orange:#ff9a5c;--rose:#ff6f92;--pink:#f78ad6;--gold:#ffd54a;--slate:#94a0d4;
 --redbg:#3b1733;--ambbg:#33291d;--grnbg:#1a2f2b;--blubg:#142a5c;--purbg:#271f5c;--tealbg:#0f3141;
---c-you:#2d6ae0;--t-agent:#2e1c6a;--t-you:#14275b;--t-sub:#0a3b3b;--c-task:#35b09f;--t-task:#0f3140;--t-event:#2e2a32;--t-review:#1a2147;
+--c-you:#2d6ae0;--t-agent:#251657;--t-you:#14275b;--t-sub:#0a3b3b;--c-task:#35b09f;--t-task:#0f3140;--t-event:#2e2a32;--t-review:#1a2147;
 --chatbg:#060a1d;--hu0:#b197fc;--hu1:#74b0ff;--hu2:#3bd9f0;--hu3:#38d9a9;--hu4:#a9e34b;--hu5:#ffd43b;--hu6:#ff9f5a;--hu7:#f783c4}}
 *{box-sizing:border-box}html{scroll-padding-top:110px}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif}
 a{color:var(--blu)}main{max-width:1120px;margin:0 auto;padding:18px 18px 48px}h1{font-size:22px;font-weight:650;margin:0;word-break:break-word}h2{font-size:15px;font-weight:650;margin:0 0 10px}
@@ -2485,11 +2485,15 @@ details[data-sec]>summary:after{margin:0 0 1px 9px}
 .scard .sn{color:color-mix(in srgb,var(--h) 72%,var(--fg))}
 .hc{background:color-mix(in srgb,var(--card) 80%,transparent)}
 .kind.claude{background:color-mix(in srgb,var(--orange) 16%,transparent);color:var(--orange)}
-.rfb{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;margin-left:6px;padding:0;border-radius:50%;
-border:1px solid var(--line);background:color-mix(in srgb,var(--card) 70%,transparent);color:var(--mut);cursor:pointer}
-.rfb:hover{color:var(--fg);border-color:var(--h)}.rfb:focus-visible{outline:2px solid var(--h);outline-offset:2px}
-.rfb.spin svg{animation:mcspin .9s linear infinite}@keyframes mcspin{to{transform:rotate(360deg)}}
-@media (prefers-reduced-motion:reduce){.rfb.spin svg{animation-duration:2.5s}}
+button.fresh{display:inline-flex;align-items:center;gap:7px;flex:none;font:inherit;font-size:12px;border:1px solid transparent;cursor:pointer}
+button.fresh svg{opacity:.7;flex:none}button.fresh:hover{border-color:currentColor}button.fresh:hover svg{opacity:1}
+button.fresh:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+.fresh.spin svg{opacity:1;animation:mcspin .9s linear infinite}@keyframes mcspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.fresh.spin svg{animation-duration:2.5s}}
+/* every session tab stays visible: the bar wraps onto a second row when they don't fit (phones scroll instead) */
+.appbar .in{height:auto;min-height:48px}.sw{flex-wrap:wrap;overflow-x:visible;row-gap:6px}
+@media (max-width:640px){.appbar .in{flex-wrap:wrap;column-gap:10px;padding-top:6px}.appbar .brand span{display:inline}
+.appbar button.fresh{margin-left:auto}.sw{order:3;flex:1 1 100%;flex-wrap:nowrap;overflow-x:auto;padding:4px 0 8px}}
 body.convpage{--bg:var(--chatbg)}.card[data-sec$=":latest"]{background:var(--chatbg)}
 .bub .mb,.msg .mb{line-height:1.6}.bub{border-color:color-mix(in srgb,var(--c) 38%,transparent)}.r-user .bub{border-color:transparent}.bub .who{color:color-mix(in srgb,var(--c) 78%,var(--fg))}
 .av{background:color-mix(in srgb,var(--c) 26%,var(--card));color:color-mix(in srgb,var(--c) 70%,var(--fg));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 45%,transparent)}
@@ -2573,11 +2577,12 @@ function fmt(s){if(s<60)return 'just now';var m=Math.round(s/60);if(m<60)return 
 function tick(){[].forEach.call(document.querySelectorAll('.fresh'),function(el){
  var c=+el.getAttribute('data-collected'),iv=+el.getAttribute('data-interval')||5,age=Math.max(0,Date.now()/1000-c),cls,txt,tip;
  var when=new Date(c*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
- if(age<(iv*2+2)*60){cls='ok';txt='Updated '+fmt(age);tip='Mission control collected this data at '+when+' and collects every '+iv+' min. '+
-  (window.MC_SEND?'This page updates itself as soon as new data arrives; \u21bb asks for fresh data now.':'This page reloads itself every 2 min; \u21bb reloads it now.');}
+ if(age<(iv*2+2)*60){cls='ok';txt='Updated '+fmt(age);tip='Collected at '+when+' (every '+iv+' min). '+
+  (window.MC_SEND?'The page updates itself when new data arrives. Click to collect fresh data now.':'The page reloads itself every 2 min. Click to reload now.');}
  else if(age<3600){cls='warn';txt='Data '+fmt(age).replace(' ago',' old');tip='No new data since '+when+'. The collector may be stopped or busy: run mctl on the collecting machine.';}
  else{cls='bad';txt='Stale: last data '+fmt(age);tip='No new data since '+when+'. The collector looks stopped: open Ubuntu on the PC that collects (it restarts itself) or run mctl.';}
- el.className='pill fresh '+cls;el.textContent=txt;el.title=tip;});}
+ el.className='pill fresh '+cls+(el.classList.contains('spin')?' spin':'');(el.querySelector('.ft')||el).textContent=txt;
+ if(!el.classList.contains('spin'))el.title=tip;});}
 window.mcFreshTick=tick;tick();setInterval(tick,15000);
 })();
 </script>"""
@@ -2595,6 +2600,8 @@ REFRESH_JS = r"""<script>
 // this page was rewritten and, if so, swaps the new content in place (scroll, open blocks and what you are typing
 // stay). Opened as a plain file: reloads every 2 min while visible. The refresh button asks for fresh data now.
 function xk(e){return 'mcx:'+location.pathname+':'+e.id;}
+function abh(){var a=document.querySelector('.appbar');if(a)document.documentElement.style.setProperty('--abh',a.offsetHeight+'px');}
+abh();window.addEventListener('resize',abh);
 function applyX(){[].forEach.call(document.querySelectorAll('[data-x]'),function(e){try{if(sessionStorage.getItem(xk(e))==='1')e.classList.add('open');}catch(_){}});}
 document.addEventListener('click',function(ev){var e=ev.target.closest&&ev.target.closest('[data-x]');if(!e||String(window.getSelection()).length)return;
  e.classList.toggle('open');try{sessionStorage.setItem(xk(e),e.classList.contains('open')?'1':'0');}catch(_){}});
@@ -2611,7 +2618,7 @@ function swap(h){
  if(nb&&build&&nb!==build){if(blocked()||hasText())return false;location.reload();return true;}   // the page code itself changed
  var na=d.querySelector('.appbar nav'),oa=document.querySelector('.appbar nav');if(na&&oa)oa.innerHTML=na.innerHTML;
  var nf=d.querySelector('.fresh'),of=document.querySelector('.fresh');if(nf&&of)of.setAttribute('data-collected',nf.getAttribute('data-collected'));
- document.title=d.title;if(window.mcFreshTick)window.mcFreshTick();
+ document.title=d.title;if(window.mcFreshTick)window.mcFreshTick();abh();
  if(conv){if(window.mcConvPoll)window.mcConvPoll();return true;}
  var nm=d.querySelector('main'),om=document.querySelector('main');if(!nm||!om)return false;
  var y=window.scrollY,act=document.activeElement,aid=act&&act.id,s0=null,s1=null,open={};
@@ -2691,11 +2698,10 @@ def fresh_pill(collected):
     """How old the data on the page is, counted live in the browser (the page itself is a snapshot)."""
     if not collected:
         return '<span class="pill bad" title="Mission control hasn\u2019t collected anything yet.">No data yet</span>'
-    return ('<span class="pill fresh ok" data-collected="%d" data-interval="%d" title="">Updated %s</span>'
-            '<button class="rfb" id="mc-refresh" type="button" title="Refresh now" aria-label="Refresh now"><svg viewBox="0 0 24 24" width="15" height="15" '
-            'fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-            '<path d="M20 11.5a8 8 0 1 1-2.4-5.7"/><path d="M20.5 3.5v5h-5"/></svg></button>%s' % (
-        int(collected), CFG["interval"], esc(ago(collected)), FRESH_JS))
+    return ('<button class="pill fresh ok" id="mc-refresh" type="button" data-collected="%d" data-interval="%d" title="Refresh now">'
+            '<span class="ft">Updated %s</span><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" '
+            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a8 8 0 1 1-2.4-5.7"/><path d="M20.5 3.5v5h-5"/></svg>'
+            '</button>%s' % (int(collected), CFG["interval"], esc(ago(collected)), FRESH_JS))
 
 
 def goal_sev(flags):
