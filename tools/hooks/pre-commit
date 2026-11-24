@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Blocks commits that would publish collected data, machine settings or credentials, and runs the checks.
+# Enable once per clone:   git config core.hooksPath tools/hooks
+set -uo pipefail
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+bad=$(printf '%s\n' "$files" | grep -v '^config\.example\.env$' | grep -E '^(state|goals|contract)/|^dashboard.*\.html$|^config(\..+)?\.env$|(^|/)(token|sent\.log)$|\.(jsonl|log)$' || true)
+if [ -n "$bad" ]; then
+  echo "pre-commit: refusing to commit collected data or machine-specific settings:" >&2
+  printf '  %s\n' $bad >&2
+  exit 1
+fi
+# credential patterns in the added lines (this hook file itself is skipped: it contains the patterns)
+if git diff --cached -U0 --diff-filter=ACMR -- . ':(exclude)tools/hooks/pre-commit' | grep -E '^\+' |
+   grep -Eq 'BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,}'; then
+  echo "pre-commit: this change looks like it contains a credential. Take it out before committing." >&2
+  exit 1
+fi
+bash tools/private-check.sh --staged || exit 1
+bash tools/check.sh > /dev/null || { echo "pre-commit: tools/check.sh failed; run it to see why." >&2; exit 1; }

@@ -1,0 +1,22 @@
+# Collected data and generated pages: they contain your agents' conversations and research details.
+# None of it belongs in git. (tools/hooks/pre-commit blocks it too.)
+state/
+goals/
+dashboard*.html
+contract/
+
+# Your settings: hosts, clusters, machine names. Only the example is shared.
+config.env
+config.*.env
+!config.example.env
+
+# The web server's secret key and logs live in ~/.local/state/mission-control, outside this folder;
+# these patterns are a second line of defence in case anything is copied here.
+token
+sent.log
+*.log
+.env
+
+# Python
+__pycache__/
+*.pyc
