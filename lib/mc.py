@@ -2369,11 +2369,11 @@ CSS = """
 --c-agent:var(--violet);--t-agent:#e8e0ff;--c-you:#2563eb;--t-you:#eaf1fe;--c-sub:var(--teal);--t-sub:#d3f2ea;--c-task:#2f9c8c;--t-task:#e3f5f1;
 --c-event:var(--amber);--t-event:#fff3df;--c-review:var(--slate);--t-review:#f0f1f8;
 --chatbg:#e7eaf7;--hu0:#7048e8;--hu1:#1c7ed6;--hu2:#0a8fa9;--hu3:#099268;--hu4:#5c940d;--hu5:#a87700;--hu6:#e8590c;--hu7:#d6336c;--h:var(--violet);--s:var(--slate)}
-@media (prefers-color-scheme:dark){:root{--bg:#0b1130;--card:#131a3d;--fg:#edf0ff;--mut:#a1aad5;--faint:#6b75a6;--line:rgba(140,160,255,.15);--bar:#222b59;--shadow:none;
+@media (prefers-color-scheme:dark){:root{--bg:#0f1219;--card:#171b26;--fg:#eceef5;--mut:#a3a8bd;--faint:#6d7387;--line:rgba(175,185,220,.13);--bar:#272c3a;--shadow:none;
 --violet:#b39dff;--sky:#62bfff;--teal:#2fdcc0;--lime:#a6e35c;--amber:#ffc25a;--orange:#ff9a5c;--rose:#ff6f92;--pink:#f78ad6;--gold:#ffd54a;--slate:#94a0d4;
---redbg:#3b1733;--ambbg:#33291d;--grnbg:#1a2f2b;--blubg:#142a5c;--purbg:#271f5c;--tealbg:#0f3141;
---c-you:#2d6ae0;--t-agent:#251657;--t-you:#14275b;--t-sub:#0a3b3b;--c-task:#35b09f;--t-task:#0f3140;--t-event:#2e2a32;--t-review:#1a2147;
---chatbg:#060a1d;--hu0:#b197fc;--hu1:#74b0ff;--hu2:#3bd9f0;--hu3:#38d9a9;--hu4:#a9e34b;--hu5:#ffd43b;--hu6:#ff9f5a;--hu7:#f783c4}}
+--redbg:#3a1a2a;--ambbg:#33291c;--grnbg:#1b2c22;--blubg:#16263f;--purbg:#271f4f;--tealbg:#0f2e31;
+--c-you:#2d6ae0;--t-agent:#27174f;--t-you:#18233a;--t-sub:#0b3836;--c-task:#35b09f;--t-task:#11303a;--t-event:#2d2a2c;--t-review:#1c202b;
+--chatbg:#0a0c11;--hu0:#b197fc;--hu1:#74b0ff;--hu2:#3bd9f0;--hu3:#38d9a9;--hu4:#a9e34b;--hu5:#ffd43b;--hu6:#ff9f5a;--hu7:#f783c4}}
 *{box-sizing:border-box}html{scroll-padding-top:110px}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif}
 a{color:var(--blu)}main{max-width:1120px;margin:0 auto;padding:18px 18px 48px}h1{font-size:22px;font-weight:650;margin:0;word-break:break-word}h2{font-size:15px;font-weight:650;margin:0 0 10px}
 .sub{color:var(--mut);font-size:13px;margin:3px 0 0}header{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin:6px 0 16px}
@@ -2485,6 +2485,9 @@ details[data-sec]>summary:after{margin:0 0 1px 9px}
 .scard .sn{color:color-mix(in srgb,var(--h) 72%,var(--fg))}
 .hc{background:color-mix(in srgb,var(--card) 80%,transparent)}
 .kind.claude{background:color-mix(in srgb,var(--orange) 16%,transparent);color:var(--orange)}
+html{background:var(--bg);color-scheme:light dark}main{overflow-wrap:break-word}header>div{min-width:0;flex:1}h1,.sub,.objective,.xp{overflow-wrap:anywhere}
+@media (max-width:640px){.appbar,.ctl{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}.appbar{background:var(--card)}.ctl{background:var(--bg)}
+main table{display:block;max-width:100%;overflow-x:auto}}
 button.fresh{display:inline-flex;align-items:center;gap:7px;flex:none;font:inherit;font-size:12px;border:1px solid transparent;cursor:pointer}
 button.fresh svg{opacity:.7;flex:none}button.fresh:hover{border-color:currentColor}button.fresh:hover svg{opacity:1}
 button.fresh:focus-visible{outline:2px solid currentColor;outline-offset:2px}
@@ -2581,15 +2584,15 @@ function tick(){[].forEach.call(document.querySelectorAll('.fresh'),function(el)
   (window.MC_SEND?'The page updates itself when new data arrives. Click to collect fresh data now.':'The page reloads itself every 2 min. Click to reload now.');}
  else if(age<3600){cls='warn';txt='Data '+fmt(age).replace(' ago',' old');tip='No new data since '+when+'. The collector may be stopped or busy: run mctl on the collecting machine.';}
  else{cls='bad';txt='Stale: last data '+fmt(age);tip='No new data since '+when+'. The collector looks stopped: open Ubuntu on the PC that collects (it restarts itself) or run mctl.';}
- el.className='pill fresh '+cls+(el.classList.contains('spin')?' spin':'');(el.querySelector('.ft')||el).textContent=txt;
- if(!el.classList.contains('spin'))el.title=tip;});}
+ el.className='pill fresh '+cls+(el.classList.contains('spin')?' spin':'');
+ if(!(+el.getAttribute('data-hold')>Date.now())){(el.querySelector('.ft')||el).textContent=txt;if(!el.classList.contains('spin'))el.title=tip;}});}
 window.mcFreshTick=tick;tick();setInterval(tick,15000);
 })();
 </script>"""
 
 
 HEAD_META = ('<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-             '<meta name="theme-color" content="#22221f"><meta name="apple-mobile-web-app-capable" content="yes">'
+             '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f1219"><meta name="theme-color" media="(prefers-color-scheme: light)" content="#f1f3fd"><meta name="apple-mobile-web-app-capable" content="yes">'
              '<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Mission control">'
              '<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect x=%277%27 y=%277%27 '
              'width=%2718%27 height=%2718%27 rx=%274%27 transform=%27rotate(45 16 16)%27 fill=%27%23534ab7%27/%3E%3C/svg%3E">')
@@ -2611,7 +2614,9 @@ var S=window.MC_SEND||null,served=!!(S&&/^https?:/.test(location.protocol)),mt=(
 function blocked(){var a=document.activeElement;return !!window.MC_BUSY||String(window.getSelection()).length>0||!!(a&&a.tagName==='SELECT');}
 function hasText(){return [].some.call(document.querySelectorAll('textarea,input[type=search]'),function(t){return t.value.trim();});}
 function atBottom(){return window.innerHeight+window.scrollY>=document.documentElement.scrollHeight-240;}
-function spin(on){if(btn)btn.classList.toggle('spin',!!on);}
+function spin(on,msg){if(!btn)return;btn.classList.toggle('spin',!!on);if(msg)say(msg,on?0:4000);else if(!on){btn.removeAttribute('data-hold');if(window.mcFreshTick)window.mcFreshTick();}}
+function say(t,ms){var f=btn&&btn.querySelector('.ft');if(!f)return;f.textContent=t;btn.setAttribute('data-hold',ms?Date.now()+ms:9e15);
+ if(ms)setTimeout(function(){btn.removeAttribute('data-hold');if(window.mcFreshTick)window.mcFreshTick();},ms+50);}
 function stamp(){return fetch('/api/stamp?p='+encodeURIComponent(location.pathname),{cache:'no-store'}).then(function(r){return r.json();});}
 function swap(h){
  var d=new DOMParser().parseFromString(h,'text/html'),nb=(d.querySelector('meta[name=mc-build]')||{}).content;
@@ -2641,11 +2646,14 @@ setInterval(function(){served?check():fallback();},served?15000:30000);
 document.addEventListener('visibilitychange',function(){if(!document.hidden){served?check():fallback();}});
 if(btn)btn.addEventListener('click',function(){
  if(!served){location.reload();return;}
- spin(true);
- stamp().then(function(j){mt=Math.max(mt,0);return pull().then(function(ok){if(ok)mt=j.mtime;return j;});}).then(function(j){
-  if(Date.now()/1000-(j.collected||0)<60){spin(false);return;}   // the data is already fresh
+ if(btn.classList.contains('spin'))return;
+ spin(true,'Checking\u2026');
+ stamp().then(function(j){return pull().then(function(ok){if(ok)mt=j.mtime;return j;});}).then(function(j){
+  var age=Date.now()/1000-(j.collected||0);
+  if(age<240){spin(false,'Fresh \u00b7 again in '+Math.max(1,Math.ceil((240-age)/60))+' min');return;}   // at most every 4 min
   return fetch('/api/collect',{method:'POST',headers:{'Content-Type':'application/json','X-MC-Token':S.token},body:'{}'}).then(function(r){return r.json();}).then(function(c){
-   if(c.message)btn.title=c.message;if(!c.started){spin(false);return;}
+   if(c.message)btn.title=c.message;if(!c.started){spin(false,c.short||'Not now');return;}
+   say('Collecting fresh data\u2026',0);
    var n=0,iv=setInterval(function(){n++;stamp().then(function(s){
     if(s.mtime>mt){clearInterval(iv);var m=s.mtime;pull().then(function(ok){if(ok)mt=m;spin(false);btn.title='Refresh now';});}
     else if(n>40){clearInterval(iv);spin(false);}}).catch(function(){});},5000);});

@@ -172,12 +172,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         host, t = self._collector()
         age, now = time.time() - t, time.time()
         if host and MY_HOST and host.lower() != MY_HOST:
-            return {"ok": True, "started": False,
+            return {"ok": True, "started": False, "short": "%s collects" % host,
                     "message": "%s collects the data; this page updates by itself when its next data arrives." % host}
-        if age < 45:
-            return {"ok": True, "started": False, "message": "The data is only %d s old." % max(0, age)}
-        if now - LAST_NUDGE[0] < 60:
+        if age < 240:   # fresh data at most every 4 minutes
+            return {"ok": True, "started": False, "short": "Fresh \u00b7 again in %d min" % max(1, -(-(240 - age) // 60)),
+                    "message": "The data is %d min old; fresh data can be asked for every 4 minutes." % (age // 60)}
+        if now - LAST_NUDGE[0] < 120:
             return {"ok": True, "started": True, "message": "Collecting fresh data now. The page updates when it arrives."}
+        if now - LAST_NUDGE[0] < 240:
+            return {"ok": True, "started": False, "short": "Asked already",
+                    "message": "Fresh data was asked for at %s and hasn't arrived yet; the collector may be busy." % time.strftime("%H:%M", time.localtime(LAST_NUDGE[0]))}
         LAST_NUDGE[0] = now
         with open(os.path.join(ARCHIVE, "collect.now"), "w") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
