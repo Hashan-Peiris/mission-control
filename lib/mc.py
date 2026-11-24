@@ -14,6 +14,7 @@ import re
 import socket
 import sys
 import time
+import zlib
 import signal
 import urllib.request
 
@@ -1005,7 +1006,15 @@ def analyze_goal(gdesc, shared):
             flags.add("agent:notrunning", "red", "goal", "No Codex or Claude process is running in %s" % gname,
                       "The tmux session exists but the agent has exited.", "Open the session and resume the goal.")
     tail = tm.get("pane_tail", [])
-    tail_txt = "\n".join(tail[-25:])
+    # a status line with "esc to interrupt" means the agent is busy (e.g. "Reviewing approval request" by Codex's own
+    # reviewer), not asking you anything
+    tail_txt = "\n".join(l for l in tail[-25:] if "esc to interrupt" not in l)
+    rv = re.search(r"Reviewing approval request \((?:(\d+)h )?(\d+)m", "\n".join(tail[-6:]))
+    if rv and int(rv.group(1) or 0) * 60 + int(rv.group(2)) >= 15:
+        flags.add("pane:review-slow", "amber", "goal", "Codex's approval reviewer has been checking one request for %s"
+                  % ("%sh %sm" % (rv.group(1), rv.group(2)) if rv.group(1) else "%s min" % rv.group(2)),
+                  "The agent waits until the reviewer decides. It isn't asking you anything.",
+                  "If it stays stuck, press Esc in the session (mctl peek %s to look first)." % gkey)
     m = re.search(r"(Allow (this|command)|Approve|approval|Do you want to|\[y/N\]|\(y/n\)|Press enter to continue|"
                   r"waiting for (your )?(input|approval)|Run this command\?|Proceed\?)", tail_txt, re.I)
     if m:
@@ -1845,6 +1854,33 @@ def hidden_note():
         ", ".join(SEC_LABEL.get(n, n) for n in CFG["hide"]))
 
 
+HUE = {}   # session key -> palette index 0..7 (state/hues.json keeps it for the session's whole life)
+
+
+def assign_hues(keys):
+    """Give every session its own colour and keep it: a new session takes the least-used free colour."""
+    path = os.path.join(STATE, "hues.json")
+    db = rjson(path, {}) or {}
+    db = {k: v for k, v in db.items() if isinstance(v, list) and len(v) == 2 and (k in keys or NOW - v[1] < 14 * 86400)}
+    for k in keys:
+        if k not in db:  # the least-used colour, as far round the colour wheel from the others as possible
+            used = [db[x][0] for x in keys if x in db]
+            dist = lambda i: min([min((i - u) % 8, (u - i) % 8) for u in used] or [8])  # noqa: E731
+            idx = min(range(8), key=lambda i: (used.count(i), -dist(i), (zlib.crc32(k.encode()) + i) % 8))
+            db[k] = [idx, NOW]
+        db[k][1] = NOW
+        HUE[k] = db[k][0]
+    try:
+        wjson(path, db)
+    except OSError:
+        pass
+
+
+def hue(key):
+    """CSS custom property for a session's colour."""
+    return "--h:var(--hu%d)" % HUE.get(key, zlib.crc32((key or "").encode()) % 8)
+
+
 def appbar(nav, cur=None, where="root", conv=False, collected=None):
     """Sticky bar on every page: every agent session, grouped by host, one click away."""
     pre = "goals/" if where == "root" else ""
@@ -1862,8 +1898,9 @@ def appbar(nav, cur=None, where="root", conv=False, collected=None):
         for n in groups[h]:
             href = pre + n["key"] + (".conversation.html" if conv and n.get("conv") else ".html")
             dot = "gray" if n.get("dim") else {"red": "red", "amber": "amber"}.get(n.get("sev"), "")
-            parts.append('<a class="np%s%s" href="%s" title="%s on %s"><span class="dot %s"></span>%s</a>' % (
-                " cur" if n["key"] == cur else "", " dim" if n.get("dim") else "", esc(href), esc(n["name"]), esc(h), dot, esc(trunc(n["name"], 30))))
+            parts.append('<a class="np%s%s" style="%s" href="%s" title="%s on %s"><span class="dot %s"></span>%s</a>' % (
+                " cur" if n["key"] == cur else "", " dim" if n.get("dim") else "", hue(n["key"]), esc(href), esc(n["name"]), esc(h), dot,
+                esc(trunc(n["name"], 30))))
     return ('<div class="appbar"><div class="in"><a class="brand" href="%s"><i></i><span>Mission control</span></a><nav class="sw">%s</nav>%s</div></div>' % (
         home, "".join(parts) or '<span class="small mut">no agent sessions found</span>', fresh_pill(collected) if collected is not None else ""))
 
@@ -1892,13 +1929,13 @@ def write_conv_page(snap, nav):
         r, "" if r != "review" else " off", r, "" if r == "review" else " checked", lab, "{:,}".format(counts[r]))
         for r, lab in ROLE_CHIPS if counts.get(r))
     scripts = "".join('<script src="conv/%s/%s.js"></script>' % (esc(gkey), esc(d)) for d in cv.get("days") or [])
-    page = ('<!doctype html><html lang="en"><head>%s<title>%s \u00b7 conversation</title><style>%s%s</style></head><body data-key="%s">%s<main class="chatpage">'
+    page = ('<!doctype html><html lang="en"><head>%s<title>%s \u00b7 conversation</title><style>%s%s</style></head><body data-key="%s" style="%s">%s<main class="chatpage">'
             '<header><div><h1>%s</h1><p class="sub">%s on %s \u00b7 <span id="n"></span> \u00b7 new messages appear by themselves when opened with mctl</p></div>'
             '<a class="np" href="%s.html">\u2190 Session page</a></header>'
             '<div class="ctl"><input id="q" type="search" placeholder="Search the conversation">%s'
             '<select id="order"><option value="chat">Chat order</option><option value="new">Newest first</option></select><button id="jump">Latest \u2193</button></div>'
             '<div id="list" class="chat"></div><div class="composer">%s</div></main>%s<script>%s</script>%s</body></html>') % (
-        HEAD_META, esc(gname), CSS, CONV_CSS, esc(gkey), appbar(nav, gkey, "goals", True, snap.get("collected")), esc(gname),
+        HEAD_META, esc(gname), CSS, CONV_CSS, esc(gkey), hue(gkey), appbar(nav, gkey, "goals", True, snap.get("collected")), esc(gname),
         esc((snap["goal"].get("agent_kind") or "agent").capitalize()), esc(LOGIN_HOSTS.get(snap.get("node_name"), snap.get("node_name") or "?")),
         esc(gkey), chips, send_box(snap, compact=True), scripts, CONV_JS, SEND_JS)
     fp = os.path.join(MC_DIR, "goals", gkey + ".conversation.html")
@@ -2078,6 +2115,7 @@ def analyze():
                                            (80 if x["node_name"] in LOGIN_HOSTS else 90)), x["node_name"], x["session"].lower()))
     nav = [{"key": x["key"], "name": x["session"], "node": x["node_name"], "sev": goal_sev(x["flags"]),
             "dim": bool(x.get("ended") or x.get("unreachable")), "conv": bool((x.get("conv") or {}).get("page"))} for x in real]
+    assign_hues([n["key"] for n in nav])
     for x in real:
         x["nav"] = nav
         wjson(os.path.join(STATE, "goals", x["key"] + ".json"), x)
@@ -2173,8 +2211,8 @@ def session_card(g):
     gray = g["unreachable"] or g["ended"]
     stxt, scls = session_state(g.get("g") or {}, g.get("fkeys"), g["unreachable"], g["ended"], g["node"], g.get("last_seen"))
     sev = "gray" if gray else {"red": "red", "amber": "amber"}.get(g["sev"], "")
-    o = ['<a class="scard %s" href="goals/%s.html"%s><div class="sh"><span class="dot %s"></span><span class="sn" title="%s">%s</span>%s</div>' % (
-        sev, esc(g["key"]), sec("o", "s:" + g["key"], "Session " + g["name"]), sev, esc(g["name"]), esc(g["name"]), kind_badge(g.get("kind")))]
+    o = ['<a class="scard %s" style="%s" href="goals/%s.html"%s><div class="sh"><span class="dot %s"></span><span class="sn" title="%s">%s</span>%s</div>' % (
+        sev, hue(g["key"]), esc(g["key"]), sec("o", "s:" + g["key"], "Session " + g["name"]), sev, esc(g["name"]), esc(g["name"]), kind_badge(g.get("kind")))]
     o.append('<div class="st %s">%s</div>' % (scls, esc(stxt)))
     if g.get("title") and g["title"] != g["name"]:
         o.append('<div class="obj" title="%s">%s</div>' % (esc(trunc(g["title"], 600)), esc(trunc(g["title"], 160))))
@@ -2212,7 +2250,7 @@ def session_card(g):
 def render_overview(ov):
     reds = [f for f in ov["flags"] if f["sev"] == "red"]
     goals = ov["goals"]
-    o = ['<!doctype html><html lang="en"><head>%s<title>%smission control</title><style>%s</style>%s</head><body>' % (
+    o = ['<!doctype html><html lang="en"><head>%s<title>%smission control</title><style>%s</style>%s</head><body class="ov">' % (
              HEAD_META, ("(%d) " % len(reds)) if reds else "", CSS, hide_css())]
     o.append(appbar(ov.get("nav") or [], None, "root", False, ov.get("collected")))
     o.append("<main>")
@@ -2323,14 +2361,17 @@ def alerts(ov):
 
 # ---------------------------------------------------------------- rendering
 CSS = """
-:root{--bg:#f5f4f0;--card:#fff;--fg:#1f1e1c;--mut:#6b6a65;--faint:#9a9892;--line:rgba(0,0,0,.09);--bar:#e8e6df;--shadow:0 1px 2px rgba(0,0,0,.05);
---red:#a32d2d;--redbg:#fcebeb;--amb:#854f0b;--ambbg:#faeeda;--grn:#3b6d11;--grnbg:#eaf3de;--blu:#185fa5;--blubg:#e6f1fb;--pur:#534ab7;--purbg:#eeedfe;--teal:#0f6e66;--tealbg:#e1f5f1;
---c-agent:#7f77dd;--t-agent:#f6f5fe;--c-you:#2f80d0;--t-you:#eaf3fc;--c-sub:#1f9a8c;--t-sub:#ebf7f5;--c-task:#62b5aa;--t-task:#f3faf9;
---c-event:#d29426;--t-event:#fdf7ea;--c-review:#a5a39c;--t-review:#f3f2ee}
-@media (prefers-color-scheme:dark){:root{--bg:#171715;--card:#22221f;--fg:#ecebe5;--mut:#a5a39c;--faint:#77756f;--line:rgba(255,255,255,.1);--bar:#34332f;--shadow:none;
---red:#f09595;--redbg:#3b1c1c;--amb:#fac775;--ambbg:#3a2b10;--grn:#a7d16b;--grnbg:#1e2b11;--blu:#85b7eb;--blubg:#12273b;--pur:#afa9ec;--purbg:#25223f;--teal:#6fd3c4;--tealbg:#123330;
---c-agent:#958ef0;--t-agent:#232236;--c-you:#5aa7ee;--t-you:#13283d;--c-sub:#4fc1b0;--t-sub:#13302c;--c-task:#3f9d92;--t-task:#172926;
---c-event:#e0a845;--t-event:#30270f;--c-review:#8a8882;--t-review:#292926}}
+:root{--bg:#f1f3fd;--card:#fff;--fg:#171a33;--mut:#5a618b;--faint:#8a90b4;--line:rgba(40,52,130,.13);--bar:#e2e6f8;--shadow:0 1px 2px rgba(30,40,110,.06);
+--violet:#6c4de0;--sky:#0f78cf;--teal:#08917e;--lime:#4a870f;--amber:#ad6500;--orange:#d0520b;--rose:#d02c5c;--pink:#b8338f;--gold:#9c7200;--slate:#6670a6;
+--red:var(--rose);--redbg:#fde9ef;--amb:var(--amber);--ambbg:#fff1db;--grn:var(--lime);--grnbg:#e9f5dc;--blu:var(--sky);--blubg:#e2f0fd;--pur:var(--violet);--purbg:#eeeafe;--tealbg:#dcf5f0;
+--c-agent:var(--violet);--t-agent:#f2effe;--c-you:#2563eb;--t-you:#eaf1fe;--c-sub:var(--teal);--t-sub:#e5f6f3;--c-task:#2f9c8c;--t-task:#effaf7;
+--c-event:var(--amber);--t-event:#fff3df;--c-review:var(--slate);--t-review:#f0f1f8;
+--hu0:#7048e8;--hu1:#1c7ed6;--hu2:#0a8fa9;--hu3:#099268;--hu4:#5c940d;--hu5:#a87700;--hu6:#e8590c;--hu7:#d6336c;--h:var(--violet);--s:var(--slate)}
+@media (prefers-color-scheme:dark){:root{--bg:#0b1130;--card:#131a3d;--fg:#edf0ff;--mut:#a1aad5;--faint:#6b75a6;--line:rgba(140,160,255,.15);--bar:#222b59;--shadow:none;
+--violet:#b39dff;--sky:#62bfff;--teal:#2fdcc0;--lime:#a6e35c;--amber:#ffc25a;--orange:#ff9a5c;--rose:#ff6f92;--pink:#f78ad6;--gold:#ffd54a;--slate:#94a0d4;
+--redbg:#3b1733;--ambbg:#33291d;--grnbg:#1a2f2b;--blubg:#142a5c;--purbg:#271f5c;--tealbg:#0f3141;
+--c-you:#2d6ae0;--t-agent:#1e2058;--t-you:#14275b;--t-sub:#0f2e46;--c-task:#35b09f;--t-task:#132a45;--t-event:#2e2a32;--t-review:#1a2147;
+--hu0:#b197fc;--hu1:#74b0ff;--hu2:#3bd9f0;--hu3:#38d9a9;--hu4:#a9e34b;--hu5:#ffd43b;--hu6:#ff9f5a;--hu7:#f783c4}}
 *{box-sizing:border-box}html{scroll-padding-top:110px}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif}
 a{color:var(--blu)}main{max-width:1120px;margin:0 auto;padding:18px 18px 48px}h1{font-size:22px;font-weight:650;margin:0;word-break:break-word}h2{font-size:15px;font-weight:650;margin:0 0 10px}
 .sub{color:var(--mut);font-size:13px;margin:3px 0 0}header{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin:6px 0 16px}
@@ -2408,6 +2449,40 @@ border:1px solid var(--line);background:var(--t-you);color:var(--fg);font:inheri
 .sendbox textarea:disabled{opacity:.6;background:var(--bg)}.sendrow{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:6px}
 .sendbtn{padding:6px 18px;border-radius:99px;border:none;background:var(--c-you);color:#fff;font-weight:600;cursor:pointer}.sendbtn:disabled{opacity:.45;cursor:default}
 .sentok{color:var(--grn);margin-top:8px}.sendscr{max-height:260px;margin-top:6px}
+/* colour: each session has its own hue (--h), each block its own (--s) */
+body{background:radial-gradient(1000px 360px at 50% -150px,color-mix(in srgb,var(--h) 26%,transparent),transparent 72%) no-repeat,var(--bg)}
+body.ov{background:radial-gradient(700px 320px at 15% -120px,color-mix(in srgb,var(--violet) 24%,transparent),transparent 72%) no-repeat,
+radial-gradient(700px 320px at 85% -120px,color-mix(in srgb,var(--teal) 18%,transparent),transparent 72%) no-repeat,var(--bg)}
+.appbar{background:color-mix(in srgb,var(--card) 86%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom-color:color-mix(in srgb,var(--h) 30%,var(--line))}
+.brand i{width:12px;height:12px;border-radius:3px;background:conic-gradient(var(--hu0),var(--hu1),var(--hu2),var(--hu3),var(--hu4),var(--hu5),var(--hu6),var(--hu7),var(--hu0))}
+.np{--h:var(--slate);background:color-mix(in srgb,var(--h) 10%,transparent);border-color:color-mix(in srgb,var(--h) 42%,transparent)}
+.np:hover{border-color:var(--h)}.np.cur{background:color-mix(in srgb,var(--h) 28%,transparent);border-color:var(--h);color:var(--fg)}
+body[style] h1{color:color-mix(in srgb,var(--h) 72%,var(--fg))}
+.card[data-sec],details[data-sec]{background:color-mix(in srgb,var(--s) 6%,var(--card));border-color:color-mix(in srgb,var(--s) 30%,transparent)}
+.card[data-sec] h2:first-of-type,details[data-sec]>summary{color:color-mix(in srgb,var(--s) 62%,var(--fg))}
+.card[data-sec] h2:first-of-type:before,details[data-sec]>summary:after{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--s);
+box-shadow:0 0 0 3px color-mix(in srgb,var(--s) 22%,transparent);margin:0 9px 1px 1px;vertical-align:middle}
+details[data-sec]>summary:after{margin:0 0 1px 9px}
+[data-sec$=":latest"],[data-sec$=":sessions"]{--s:var(--violet)}[data-sec$=":needs"]{--s:var(--rose)}.calm[data-sec$=":needs"]{--s:var(--lime)}
+[data-sec$=":criteria"],[data-sec$=":referee"]{--s:var(--pink)}[data-sec$=":plan"],[data-sec$=":instructions"]{--s:var(--sky)}
+[data-sec$=":resources"],[data-sec$=":slurm"]{--s:var(--teal)}[data-sec$=":integrity"],[data-sec$=":contract"]{--s:var(--gold)}
+[data-sec$=":watchdog"]{--s:var(--orange)}[data-sec$=":timeline"]{--s:var(--lime)}[data-sec$=":screen"],[data-sec$=":others"]{--s:var(--slate)}
+.m{--s:var(--slate);background:color-mix(in srgb,var(--s) 11%,var(--card));border-color:color-mix(in srgb,var(--s) 34%,transparent);box-shadow:inset 0 3px 0 var(--s)}
+.m .l{color:color-mix(in srgb,var(--s) 70%,var(--fg));font-weight:600}
+.flag{--fc:var(--slate);background:color-mix(in srgb,var(--fc) 9%,var(--card));border:1px solid color-mix(in srgb,var(--fc) 24%,transparent);border-left:3px solid var(--fc);color:var(--fg)}
+.flag.red{--fc:var(--rose)}.flag.amber{--fc:var(--amber)}.flag.info{--fc:var(--slate)}
+.flag.red,.flag.amber,.flag.info{color:var(--fg);background:color-mix(in srgb,var(--fc) 8%,var(--card));border-left-color:var(--fc)}
+.flag.red{background:color-mix(in srgb,var(--fc) 14%,var(--card))}
+.flag .t{color:color-mix(in srgb,var(--fc) 82%,var(--fg))}.flag .d{opacity:.92}.flag .a{color:var(--mut);opacity:1}
+.quiet{background:color-mix(in srgb,var(--lime) 13%,var(--card));border:1px solid color-mix(in srgb,var(--lime) 32%,transparent)}
+.bar{height:8px;border-radius:99px}.bar i{height:8px;border-radius:99px;background:linear-gradient(90deg,var(--teal),var(--lime) 50%,var(--amber) 78%,var(--orange));background-size:var(--bs,100%) 100%}
+.bar i.eff{background:var(--lime)}.bar i.w{background:var(--amber)}.bar i.b{background:var(--rose)}
+.scard{--h:var(--slate);background:color-mix(in srgb,var(--h) 9%,var(--card));border:1px solid color-mix(in srgb,var(--h) 34%,transparent);border-top:3px solid var(--h)}
+.scard:hover{border-color:var(--h);border-top-color:var(--h)}.scard.amber,.scard.red,.scard.gray{border-left-color:color-mix(in srgb,var(--h) 34%,transparent)}
+.scard.red{box-shadow:0 0 0 2px color-mix(in srgb,var(--rose) 60%,transparent)}.scard.gray{filter:saturate(.45);opacity:.85}
+.scard .sn{color:color-mix(in srgb,var(--h) 72%,var(--fg))}
+.hc{background:color-mix(in srgb,var(--card) 80%,transparent)}
+.kind.claude{background:color-mix(in srgb,var(--orange) 16%,transparent);color:var(--orange)}
 """ + HIDE_CSS
 
 
@@ -2428,7 +2503,7 @@ def spark(values, w=120, h=26, color="var(--blu)"):
 
 def bar(frac, cls=""):
     frac = max(0.0, min(1.0, frac or 0))
-    return '<div class="bar"><i class="%s" style="width:%.0f%%"></i></div>' % (cls, frac * 100)
+    return '<div class="bar"><i class="%s" style="width:%.0f%%;--bs:%.0f%%"></i></div>' % (cls, frac * 100, 100 / max(frac, .01))
 
 
 def flag_html(f):
@@ -2467,7 +2542,7 @@ def resources_html(resources, nodes, c, hist):
             continue
         eff = 1 - (r["idle_ch"] + r["failed_ch"]) / r["alloc_ch"] if r["alloc_ch"] else None
         o.append('<div class="row"><span class="n">%s</span><span class="x">%s</span><span class="r">%dR %dPD \u00b7 %d cores</span></div>' % (
-            esc(r["name"]), bar(eff if eff is not None else 0, "" if (eff or 1) > .7 else "w") if eff is not None else '<span class="small mut">no finished jobs in 48 h</span>',
+            esc(r["name"]), bar(eff if eff is not None else 0, "eff" if (eff or 1) > .7 else "w") if eff is not None else '<span class="small mut">no finished jobs in 48 h</span>',
             r["running"], r["pending"], r["cores"]))
         if r["alloc_ch"]:
             o.append('<div class="small mut" style="margin:-4px 0 6px 102px">bar = share of 48 h core-hours used well \u00b7 %.0f core-h, %.0f idle, %.0f failed</div>' % (
@@ -2600,8 +2675,8 @@ def render(s):
     ambers = [f for f in s["flags"] if f["sev"] == "amber"]
     cv = s.get("conv") or {}
     o = []
-    o.append('<!doctype html><html lang="en"><head>%s<title>%s%s \u00b7 mission control</title><style>%s</style>%s</head><body>'
-             % (HEAD_META, ("(%d) " % len(reds)) if reds else "", esc(s["session"]), CSS, hide_css()))
+    o.append('<!doctype html><html lang="en"><head>%s<title>%s%s \u00b7 mission control</title><style>%s</style>%s</head><body style="%s">'
+             % (HEAD_META, ("(%d) " % len(reds)) if reds else "", esc(s["session"]), CSS, hide_css(), hue(s.get("key"))))
     o.append(appbar(s.get("nav") or [], s.get("key"), "goals", False, s.get("collected")))
     o.append("<main>")
     stxt, scls = session_state(g, [f["key"] for f in s["flags"]], s.get("unreachable"), s.get("ended"), s.get("node_name"), s.get("last_seen"))
@@ -2707,13 +2782,16 @@ def render(s):
          or "add them in the contract"),
     ]
     o.append('<section class="cards"%s>' % sec("g", "cards"))
+    tile_hue = {"Goal": "lime", "Last agent activity": "sky", "Plan": "violet", "Slurm jobs now": "teal",
+                "Idle or failed compute, 48 h": "orange", "Acceptance criteria": "pink"}
     for l, v, sub in cards:
-        o.append('<div class="m"><div class="l">%s</div><div class="v">%s</div><div class="s">%s</div></div>' % (esc(l), v, sub))
+        o.append('<div class="m" style="--s:var(--%s)"><div class="l">%s</div><div class="v">%s</div><div class="s">%s</div></div>'
+                 % (tile_hue.get(l, "slate"), esc(l), v, sub))
     o.append("</section>")
 
     # needs you
     needs = [f for f in s["flags"] if f.get("needs_you")]
-    o.append('<section class="card"%s><h2>Needs you</h2>' % sec("g", "needs"))
+    o.append('<section class="card%s"%s><h2>Needs you</h2>' % ("" if needs else " calm", sec("g", "needs")))
     if needs:
         o.extend(flag_html(f) for f in needs)
     else:

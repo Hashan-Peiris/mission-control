@@ -528,7 +528,7 @@ send_msg() {  # mctl send [--goal NAME] [--force] [--file F | "message"]: type a
 f=$(mktemp) || exit 1
 printf '%s' "$B" | base64 -d > "$f"
 scr=$(tmux capture-pane -p -J -t "$P" -S -25 2> /dev/null) || { rm -f "$f"; echo "tmux pane $P not found on $(hostname -s)" >&2; exit 4; }
-if [ "$F" != 1 ] && printf '%s\n' "$scr" | tail -n 25 | grep -Eiq 'Allow (this|command)|Approve|approval|Do you want to|\[y/N\]|\(y/n\)|Press enter to continue|waiting for (your )?(input|approval)|Run this command\?|Proceed\?'; then
+if [ "$F" != 1 ] && printf '%s\n' "$scr" | tail -n 25 | grep -v 'esc to interrupt' | grep -Eiq 'Allow (this|command)|Approve|approval|Do you want to|\[y/N\]|\(y/n\)|Press enter to continue|waiting for (your )?(input|approval)|Run this command\?|Proceed\?'; then
   rm -f "$f"; echo "---screen---"; printf '%s\n' "$scr" | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'; exit 3
 fi
 tmux load-buffer -b mc-send "$f" && tmux paste-buffer -p -d -b mc-send -t "$P" && sleep 0.7 && tmux send-keys -t "$P" Enter
