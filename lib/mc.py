@@ -1930,7 +1930,7 @@ def write_conv_page(snap, nav):
         r, "" if r != "review" else " off", r, "" if r == "review" else " checked", lab, "{:,}".format(counts[r]))
         for r, lab in ROLE_CHIPS if counts.get(r))
     scripts = "".join('<script src="conv/%s/%s.js"></script>' % (esc(gkey), esc(d)) for d in cv.get("days") or [])
-    page = ('<!doctype html><html lang="en"><head>%s<title>%s \u00b7 conversation</title><style>%s%s</style></head><body data-key="%s" style="%s">%s<main class="chatpage">'
+    page = ('<!doctype html><html lang="en"><head>%s<title>%s \u00b7 conversation</title><style>%s%s</style></head><body class="convpage" data-key="%s" style="%s">%s<main class="chatpage">'
             '<header><div><h1>%s</h1><p class="sub">%s on %s \u00b7 <span id="n"></span> \u00b7 new messages appear by themselves when opened with mctl</p></div>'
             '<a class="np" href="%s.html">\u2190 Session page</a></header>'
             '<div class="ctl"><input id="q" type="search" placeholder="Search the conversation">%s'
@@ -2367,12 +2367,12 @@ CSS = """
 --red:var(--rose);--redbg:#fde9ef;--amb:var(--amber);--ambbg:#fff1db;--grn:var(--lime);--grnbg:#e9f5dc;--blu:var(--sky);--blubg:#e2f0fd;--pur:var(--violet);--purbg:#eeeafe;--tealbg:#dcf5f0;
 --c-agent:var(--violet);--t-agent:#f2effe;--c-you:#2563eb;--t-you:#eaf1fe;--c-sub:var(--teal);--t-sub:#e5f6f3;--c-task:#2f9c8c;--t-task:#effaf7;
 --c-event:var(--amber);--t-event:#fff3df;--c-review:var(--slate);--t-review:#f0f1f8;
---hu0:#7048e8;--hu1:#1c7ed6;--hu2:#0a8fa9;--hu3:#099268;--hu4:#5c940d;--hu5:#a87700;--hu6:#e8590c;--hu7:#d6336c;--h:var(--violet);--s:var(--slate)}
+--chatbg:#e7eaf7;--hu0:#7048e8;--hu1:#1c7ed6;--hu2:#0a8fa9;--hu3:#099268;--hu4:#5c940d;--hu5:#a87700;--hu6:#e8590c;--hu7:#d6336c;--h:var(--violet);--s:var(--slate)}
 @media (prefers-color-scheme:dark){:root{--bg:#0b1130;--card:#131a3d;--fg:#edf0ff;--mut:#a1aad5;--faint:#6b75a6;--line:rgba(140,160,255,.15);--bar:#222b59;--shadow:none;
 --violet:#b39dff;--sky:#62bfff;--teal:#2fdcc0;--lime:#a6e35c;--amber:#ffc25a;--orange:#ff9a5c;--rose:#ff6f92;--pink:#f78ad6;--gold:#ffd54a;--slate:#94a0d4;
 --redbg:#3b1733;--ambbg:#33291d;--grnbg:#1a2f2b;--blubg:#142a5c;--purbg:#271f5c;--tealbg:#0f3141;
 --c-you:#2d6ae0;--t-agent:#1e2058;--t-you:#14275b;--t-sub:#0f2e46;--c-task:#35b09f;--t-task:#132a45;--t-event:#2e2a32;--t-review:#1a2147;
---hu0:#b197fc;--hu1:#74b0ff;--hu2:#3bd9f0;--hu3:#38d9a9;--hu4:#a9e34b;--hu5:#ffd43b;--hu6:#ff9f5a;--hu7:#f783c4}}
+--chatbg:#060a1d;--hu0:#b197fc;--hu1:#74b0ff;--hu2:#3bd9f0;--hu3:#38d9a9;--hu4:#a9e34b;--hu5:#ffd43b;--hu6:#ff9f5a;--hu7:#f783c4}}
 *{box-sizing:border-box}html{scroll-padding-top:110px}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif}
 a{color:var(--blu)}main{max-width:1120px;margin:0 auto;padding:18px 18px 48px}h1{font-size:22px;font-weight:650;margin:0;word-break:break-word}h2{font-size:15px;font-weight:650;margin:0 0 10px}
 .sub{color:var(--mut);font-size:13px;margin:3px 0 0}header{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin:6px 0 16px}
@@ -2484,6 +2484,7 @@ details[data-sec]>summary:after{margin:0 0 1px 9px}
 .scard .sn{color:color-mix(in srgb,var(--h) 72%,var(--fg))}
 .hc{background:color-mix(in srgb,var(--card) 80%,transparent)}
 .kind.claude{background:color-mix(in srgb,var(--orange) 16%,transparent);color:var(--orange)}
+body.convpage{--bg:var(--chatbg)}.card[data-sec$=":latest"]{background:var(--chatbg)}
 .bub .mb,.msg .mb{line-height:1.6}.bub .who{color:color-mix(in srgb,var(--c) 78%,var(--fg))}
 .av{background:color-mix(in srgb,var(--c) 26%,var(--card));color:color-mix(in srgb,var(--c) 70%,var(--fg));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 45%,transparent)}
 .mb code{font-family:Consolas,"Cascadia Mono",ui-monospace,monospace;font-size:.9em;font-weight:400;padding:1px 5px;border:none;border-radius:5px;
