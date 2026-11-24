@@ -1,0 +1,697 @@
+#!/usr/bin/env bash
+# mctl: mission control for long-running Codex/Claude goal sessions.
+# It reads session logs, the tmux screen and Slurm tables through SSH shared connections you already
+# opened (your connection script, CONNECT_CMD in config.env). The only thing it ever types is a message you send (Send box or mctl send).
+set -uo pipefail
+MC_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+export MC_DIR
+MC_HOST="${MC_HOST_OVERRIDE:-$(hostname -s 2>/dev/null || hostname)}"
+# config.env (shared) < config.local.env (shared, older setups) < config.<this machine>.env (per machine)
+load_cfg() {
+  # a fresh clone has only the example; your own config.env is never committed (see .gitignore)
+  [ -f "$MC_DIR/config.env" ] || cp "$MC_DIR/config.example.env" "$MC_DIR/config.env" 2> /dev/null || true
+  set -a
+  [ -f "$MC_DIR/config.env" ] && . "$MC_DIR/config.env"
+  [ -f "$MC_DIR/config.local.env" ] && . "$MC_DIR/config.local.env"
+  [ -f "$MC_DIR/config.$MC_HOST.env" ] && . "$MC_DIR/config.$MC_HOST.env"
+  set +a
+}
+load_cfg
+C48="${CONNECT_CMD:-your SSH connection script}"   # what to tell you to run when a connection is missing
+# NEVER_CONTACT: words for hosts mission control must never touch (matched anywhere in an alias, host name
+# or socket name, any case). Checked before every connection decision, on top of EXCLUDE_HOSTS.
+is_never() {
+  local s w
+  s=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  for w in ${NEVER_CONTACT:-}; do
+    w=$(printf '%s' "$w" | tr 'A-Z' 'a-z')
+    case "$s" in *"$w"*) return 0 ;; esac
+  done
+  return 1
+}
+STATE="$MC_DIR/state"
+LATEST="$STATE/latest"
+ARCHIVE="${MC_ARCHIVE:-$HOME/.local/state/mission-control}"
+mkdir -p "$LATEST" "$ARCHIVE/raw"
+SSHO=(-T -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
+LOOP_NAME="mission-control"
+PY=python3
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+# Per-host shared-connection socket, found by `discover` (your connection script may keep its sockets anywhere).
+cp_for() {
+  case "$1" in
+    "${RF_HOST:-#}") echo "${RF_CP:-}" ;;
+    "${SJ_HOST:-#}") echo "${SJ_CP:-}" ;;
+    "${SCYTHE_HOST:-#}") echo "${SC_CP:-}" ;;
+    *) echo "" ;;
+  esac
+}
+hopts() { local cp; cp=$(cp_for "$1"); HOPTS=(); [ -n "$cp" ] && HOPTS=(-o "ControlPath=${cp//%/%%}" -o ControlMaster=no); return 0; }
+# Mission control never logs in by itself: it only rides shared connections that already exist
+# (opened by your connection script). Repeated failed logins could get this machine locked out of a cluster.
+has_master() {  # local check only, no network traffic
+  [ -n "$(cp_for "$1")" ] && return 0
+  ssh -O check -o BatchMode=yes "$1" > /dev/null 2>&1
+}
+no_master() {
+  # If WSL can't even look up the cluster's address, say so: the connection script fails for the same reason.
+  local hn
+  hn=$(ssh -G "$1" 2> /dev/null | awk '$1 == "hostname" {print $2; exit}')
+  if [ -n "$hn" ] && ! [[ "$hn" =~ ^[0-9.]+$ ]] && ! timeout 6 getent hosts "$hn" > /dev/null 2>&1; then
+    echo "no shared connection to $1: this PC can't look up $hn (DNS isn't working inside WSL), so $C48 can't connect either" >&2
+  else
+    echo "no shared connection to $1 (mission control never logs in by itself; run $C48)" >&2
+  fi
+  return 255
+}
+NOLOGIN=(-o ProxyCommand=/bin/false)   # if a shared connection vanishes mid-call, fail instead of connecting
+rssh() {
+  local h="$1"; shift
+  has_master "$h" || { no_master "$h"; return 255; }
+  hopts "$h"; timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" "${HOPTS[@]}" "$h" "$@"
+}
+# Command for the Rockfish login node: find the shared connection to NODE that your connection script left
+# there (any socket with the node's name, e.g. ~/.ssh/mypc-shared/node7-reconnected.sock) and run CMD through it.
+nested_cmd() {
+  local n="$1"; shift
+  local cmd; cmd=$(printf '%q ' "$@")
+  printf 'S=; for s in "$HOME"/.ssh/*%s* "$HOME"/.ssh/*/*%s* /tmp/*%s* /tmp/*/*%s*; do [ -S "$s" ] && ssh -S "$s" -o ProxyCommand=/bin/false -O check %s </dev/null >/dev/null 2>&1 && { S="$s"; break; }; done; ' "$n" "$n" "$n" "$n" "$n"
+  printf 'if [ -z "$S" ]; then ssh -o ProxyCommand=/bin/false -o BatchMode=yes -O check %s </dev/null >/dev/null 2>&1 || { echo "no shared connection to %s on Rockfish login node $(hostname -s) (mission control never logs in by itself; run %s)" >&2; exit 255; }; exec ssh -T -o BatchMode=yes -o ProxyCommand=/bin/false %s %s; fi; ' "$n" "$n" "$C48" "$n" "$cmd"
+  printf 'exec ssh -T -o BatchMode=yes -o ProxyCommand=/bin/false -o ControlMaster=no -S "$S" %s %s' "$n" "$cmd"
+}
+NODES="${NODES:-${SAIPH_HOST:-}}"   # SAIPH_HOST: historical name for the first agent node
+node_route() {  # nested (through Rockfish), direct (own ssh alias), or local (this WSL)
+  local n="$1" v
+  v="ROUTE_$(echo "$n" | tr -c 'A-Za-z0-9_\n' '_')"
+  if [ -n "${!v:-}" ]; then echo "${!v}"
+  elif [ -n "${SAIPH_HOST:-}" ] && [ "$n" = "$SAIPH_HOST" ] && [ -n "${SAIPH_ROUTE:-}" ]; then echo "$SAIPH_ROUTE"
+  else echo nested; fi
+}
+run_node() {  # run_node NODE cmd...   (stdin passes through to the command on the node)
+  local n="$1"; shift
+  case "$n" in  # agents on a login node or on this PC (found automatically)
+    rockfish-login) rssh "$RF_HOST" "$@"; return ;;
+    skipjack-login) rssh "$SJ_HOST" "$@"; return ;;
+    "$(echo "$MC_HOST" | tr 'A-Z' 'a-z')") timeout 170 "$@"; return ;;
+  esac
+  if [ -n "${NODE_CP[$n]:-}" ]; then  # the connection script keeps its own connection to this node (e.g. via ProxyJump)
+    timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" -o "ControlPath=${NODE_CP[$n]//%/%%}" -o ControlMaster=no "$n" "$@"
+    return
+  fi
+  case "$(node_route "$n")" in
+    local) timeout 170 "$@" ;;
+    direct) has_master "$n" || { no_master "$n"; return 255; }
+            hopts "$n"; timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" "${HOPTS[@]}" "$n" "$@" ;;
+    *) has_master "$RF_HOST" || { no_master "$RF_HOST"; return 255; }
+       hopts "$RF_HOST"
+       timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" "${HOPTS[@]}" "$RF_HOST" "$(nested_cmd "$n" "$@")" ;;
+  esac
+}
+run_saiph() { run_node "${SAIPH_HOST:-${NODES%% *}}" "$@"; }
+
+c48_script() {  # the script behind your CONNECT_CMD alias, read for socket locations (never run)
+  local t
+  [ -n "${CONNECT_CMD:-}" ] || return 0
+  t=$(grep -hE "^[[:space:]]*alias[[:space:]]+${CONNECT_CMD}=" ~/.bashrc ~/.bash_aliases 2>/dev/null | tail -1 |
+      sed -E "s/^[^=]*=['\"]?([^'\" ]+).*/\1/")
+  t="${t/#\~/$HOME}"
+  [ -n "$t" ] && [ -f "$t" ] && echo "$t"
+  return 0
+}
+
+# Find the live shared connections (whatever opened them) and map them to our hosts. Local only:
+# it asks the local ssh master processes, never the remote hosts.
+declare -A NODE_CP=()
+discover() {
+  local out k v log="${1:-/dev/null}" c48 n
+  RF_CP=""; SJ_CP=""; SC_CP=""; NODE_CP=()
+  c48=$(c48_script)
+  out=$($PY "$MC_DIR/lib/mc.py" discover "${c48:--}" ${RF_HOST:-} ${SJ_HOST:-} ${SCYTHE_HOST:-} --nodes $NODES 2>> "$log")
+  while IFS='=' read -r k v; do
+    [ -z "$k" ] && continue
+    case "$k" in
+      "${RF_HOST:-#}") RF_CP="$v" ;;
+      "${SJ_HOST:-#}") SJ_CP="$v" ;;
+      "${SCYTHE_HOST:-#}") SC_CP="$v" ;;
+    esac
+    for n in $NODES; do [ "$k" = "$n" ] && NODE_CP[$n]="$v"; done
+  done <<< "$out"
+  {
+    echo "connection script: ${c48:-not found}"
+    [ -n "$c48" ] && grep -nE 'ssh|[Cc]ontrol|-S |-F |rockfish|skipjack|rf\b' "$c48" 2>/dev/null | redact | head -60 | sed 's/^/  /'
+  } >> "$log"
+  return 0
+}
+
+# ------------------------------------------------------------------ detection
+detect() {
+  local aliases a hn rf="" sj="" sa="" sc=""
+  aliases=$({ cat ~/.ssh/config ~/.ssh/config.d/* 2>/dev/null; } |
+    awk 'tolower($1)=="host"{for(i=2;i<=NF;i++)print $i}' | grep -v '[*?!]' | sort -u)
+  for a in $aliases; do
+    hn=$(ssh -G "$a" 2>/dev/null | awk '$1=="hostname"{print tolower($2); exit}')
+    is_never "$a $hn" && continue   # never touched
+    case "$a $hn" in
+      *"${SAIPH_HOST:-#none#}"*) [ -z "$sa" ] && sa="$a" ;;
+      *scythe*) [ -z "$sc" ] && sc="$a" ;;
+      *dtn*) ;;
+      *rockfish*) if [ "$a" = rf ] || [ -z "$rf" ] || { [ "$rf" != rf ] && [ ${#a} -lt ${#rf} ]; }; then rf="$a"; fi ;;
+      *skipjack*|*"${SJ_TARGET:-skipjack}"*) if [ "$a" = sj ] || [ -z "$sj" ] || { [ "$sj" != sj ] && [ ${#a} -lt ${#sj} ]; }; then sj="$a"; fi ;;
+    esac
+    [ "$a" = rf ] && rf=rf
+  done
+  DET_RF="${rf:-${RF_HOST:-rf}}"
+  DET_SJ="${sj:-${SJ_HOST:-skipjack}}"
+  DET_SA="$sa"
+  DET_SC="${sc:-${SCYTHE_HOST:-}}"
+}
+
+probe() { ssh -O check -o BatchMode=yes "$1" > /dev/null 2>&1; }  # is there a live shared connection? (no login)
+
+write_local_cfg() {
+  local route="nested" sahost="${DET_SA:-${SAIPH_HOST:-}}"
+  [ -n "$DET_SA" ] && route="direct"   # its own ssh alias (the connection script may reach it with ProxyJump)
+  cat > "$MC_DIR/config.$MC_HOST.env" <<EOF
+# written by mctl setup on $MC_HOST, $(date '+%F %T'); settings for this machine only
+RF_HOST="$DET_RF"
+SJ_HOST="$DET_SJ"
+SCYTHE_HOST="$DET_SC"
+SAIPH_HOST="$sahost"
+SAIPH_ROUTE="$route"
+EOF
+  load_cfg
+}
+
+# ------------------------------------------------------------------ doctor
+redact() { sed -E 's/(sshpass[[:space:]]+-p[[:space:]]*)[^[:space:]]+/\1*****/g; s/(pass(word)?[=:])[^[:space:]]+/\1*****/Ig'; }
+
+doctor() {
+  local out="$STATE/doctor.log" h m b err
+  {
+    echo "mission-control doctor $(date '+%F %T %Z')"
+    echo "wsl: $(uname -r)  python: $($PY -V 2>&1)  tmux: $(command -v tmux >/dev/null && tmux -V || echo missing)  ssh: $(ssh -V 2>&1)"
+    echo "hosts: RF=${RF_HOST:-?} SJ=${SJ_HOST:-none} SCYTHE=${SCYTHE_HOST:-none} agent nodes: $NODES"
+    discover "$STATE/conn_doctor.txt"
+    for h in ${RF_HOST:-} ${SJ_HOST:-} ${SCYTHE_HOST:-}; do
+      m="no"; b=no
+      [ -n "$(cp_for "$h")" ] && m="yes ($(cp_for "$h"))"
+      ssh -O check "$h" >/dev/null 2>&1 && m="yes (ssh config)"
+      err=""
+      if [ "$m" != no ]; then hopts "$h"; err=$(timeout 30 ssh "${SSHO[@]}" "${HOPTS[@]}" "$h" true 2>&1) && b=yes; fi
+      echo "  $h: shared connection=$m  usable=$b${err:+  ($(echo "$err" | tr -d '\r' | tail -1))}"
+    done
+    for n in $NODES; do
+      if out_sa=$(printf 'echo PY=$(python3 -V 2>&1); echo TMUX: $(tmux list-sessions -F "#{session_name}" 2>&1 | head -12 | tr "\\n" " ")\n' | run_node "$n" bash -s 2>&1); then
+        echo "  $n ($(node_route "$n")): $(echo "$out_sa" | tr '\n' ' ')"
+      else
+        echo "  $n ($(node_route "$n")): FAILED $(echo "$out_sa" | tr -d '\r' | tail -1)"
+      fi
+    done
+    echo "connection script (CONNECT_CMD=${CONNECT_CMD:-unset}):"
+    [ -n "${CONNECT_CMD:-}" ] && grep -hE "$CONNECT_CMD" ~/.bashrc ~/.bash_aliases ~/.profile ~/.zshrc 2>/dev/null | redact | sed 's/^/  /' | head -20
+    echo "ssh config (host lines only):"
+    { cat ~/.ssh/config ~/.ssh/config.d/* 2>/dev/null; } |
+      grep -iE '^\s*(host|hostname|user|proxyjump|controlmaster|controlpath|controlpersist)\b' | sed 's/^/  /' | head -80
+  } > "$out" 2>&1
+  cat "$out"
+}
+
+# ------------------------------------------------------------------ collection
+collect() {
+  local ts dir cfg lcfg
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  dir="$ARCHIVE/raw/$ts"
+  mkdir -p "$dir"
+  : > "$dir/status"
+  # Agent nodes: the configured ones plus any node your connection script keeps a shared connection to on the Rockfish
+  # login node (found last cycle, private address, ssh answering). New tmux sessions need no configuration.
+  local n an nested="" probe=""
+  if [ "${AUTO_NODES:-1}" = 1 ]; then
+    for an in $(cat "$STATE/auto_nodes" 2>/dev/null); do
+      case " $NODES " in *" $an "*) ;; *) NODES="$NODES $an" ;; esac
+    done
+    probe=$(cat "$STATE/auto_candidates" 2>/dev/null | tr '\n' ' ')
+  fi
+  discover "$dir/conn.txt"
+  cfg=$($PY "$MC_DIR/lib/mc.py" digest-config) || cfg=""
+  for an in $probe; do case " $NODES " in *" $an "*) ;; *) nested="$nested $an" ;; esac; done
+  for n in $NODES; do
+    [ "$(node_route "$n")" = nested ] && nested="$nested $n"
+    (
+      t=$SECONDS
+      run_node "$n" python3 - "$cfg" < "$MC_DIR/lib/remote_digest.py" > "$dir/node_$n.json" 2> "$dir/node_$n.err"
+      echo "node:$n $? $((SECONDS - t))" >> "$dir/status"
+    ) &
+  done
+  if [ -n "${RF_HOST:-}" ]; then
+    ( t=$SECONDS; rssh "$RF_HOST" "bash -s --$nested" < "$MC_DIR/lib/remote_cluster.sh" > "$dir/rockfish.txt" 2> "$dir/rockfish.err"
+      echo "rockfish $? $((SECONDS - t))" >> "$dir/status" ) &
+  fi
+  if [ -n "${SJ_HOST:-}" ]; then
+    if [ -n "${SJ_CP:-}" ] || [ "${SJ_ROUTE:-auto}" = direct ] || [ -z "${RF_HOST:-}" ]; then
+      ( t=$SECONDS; rssh "$SJ_HOST" 'bash -s' < "$MC_DIR/lib/remote_cluster.sh" > "$dir/skipjack.txt" 2> "$dir/skipjack.err"
+        echo "skipjack $? $((SECONDS - t))" >> "$dir/status" ) &
+    else  # Skipjack only answers from inside the campus network: go through the Skipjack connection left on Rockfish
+      ( t=$SECONDS
+        { printf 'MC_SJ_TARGET=%q\nMC_NEVER=%q\nMC_CONNECT=%q\nMC_CLUSTER_SCRIPT=$(cat <<'"'"'MC_EOF'"'"'\n' "${SJ_TARGET:-}" "${NEVER_CONTACT:-}" "$C48"
+          cat "$MC_DIR/lib/remote_cluster.sh"; printf 'MC_EOF\n)\n'; cat "$MC_DIR/lib/hop_skipjack.sh"; } |
+          rssh "$RF_HOST" 'bash -s' > "$dir/skipjack.txt" 2> "$dir/skipjack.err"
+        echo "skipjack $? $((SECONDS - t))" >> "$dir/status" ) &
+    fi
+  fi
+  if [ -n "${SCYTHE_HOST:-}" ]; then
+    ( rssh "$SCYTHE_HOST" 'hostname; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits' \
+        > "$dir/scythe.txt" 2> "$dir/scythe.err"; echo "scythe $? 0" >> "$dir/status" ) &
+  fi
+  # Agents running on the login nodes themselves (only live sessions; read-only, a few seconds)
+  if [ "${LOGIN_DIGESTS:-1}" = 1 ] && [ -n "${RF_HOST:-}" ]; then
+    ( t=$SECONDS; hcfg=$($PY "$MC_DIR/lib/mc.py" digest-config --login rockfish-login) || hcfg=""
+      rssh "$RF_HOST" python3 - "$hcfg" < "$MC_DIR/lib/remote_digest.py" > "$dir/host_rockfish-login.json" 2> "$dir/host_rockfish-login.err"
+      echo "rockfish-login $? $((SECONDS - t))" >> "$dir/status" ) &
+  fi
+  if [ "${LOGIN_DIGESTS:-1}" = 1 ] && [ -n "${SJ_HOST:-}" ]; then
+    ( t=$SECONDS; hcfg=$($PY "$MC_DIR/lib/mc.py" digest-config --login skipjack-login) || hcfg=""
+      if [ -n "${SJ_CP:-}" ] || [ "${SJ_ROUTE:-auto}" = direct ] || [ -z "${RF_HOST:-}" ]; then
+        rssh "$SJ_HOST" python3 - "$hcfg" < "$MC_DIR/lib/remote_digest.py"
+      else
+        { printf 'MC_SJ_TARGET=%q\nMC_NEVER=%q\nMC_CONNECT=%q\nMC_SJ_REMOTE=%q\nMC_PAYLOAD_B64=%q\n' "${SJ_TARGET:-}" "${NEVER_CONTACT:-}" "$C48" "python3 - $hcfg" \
+            "$(base64 -w0 < "$MC_DIR/lib/remote_digest.py")"; cat "$MC_DIR/lib/hop_skipjack.sh"; } | rssh "$RF_HOST" 'bash -s'
+      fi > "$dir/host_skipjack-login.json" 2> "$dir/host_skipjack-login.err"
+      echo "skipjack-login $? $((SECONDS - t))" >> "$dir/status" ) &
+  fi
+  if [ "${LOCAL_DIGEST:-1}" = 1 ]; then
+    lcfg=$($PY "$MC_DIR/lib/mc.py" digest-config --local) || lcfg=""
+    ( timeout 120 $PY "$MC_DIR/lib/remote_digest.py" "$lcfg" > "$dir/local.json" 2> "$dir/local.err"
+      echo "local $? 0" >> "$dir/status" ) &
+  fi
+  wait
+  rm -f "$LATEST"/*.json "$LATEST"/*.txt "$LATEST"/*.err "$LATEST/status" 2>/dev/null
+  cp "$dir"/* "$LATEST"/ 2>/dev/null
+  echo "$ts" > "$LATEST/STAMP"
+  printf '{"host": "%s", "time": %s}\n' "$MC_HOST" "$(date +%s)" > "$STATE/collector.json"
+  ls -1d "$ARCHIVE"/raw/*/ 2>/dev/null | head -n -288 | xargs -r rm -rf
+}
+
+# Only one machine collects at a time (the folder is shared through OneDrive). PRIMARY_HOST always
+# collects; any other machine stands by and takes over when the active collector goes quiet.
+active_elsewhere() {
+  local me host t now limit sf sh st first last gap
+  me=$(echo "$MC_HOST" | tr 'A-Z' 'a-z')
+  [ "$(echo "${PRIMARY_HOST:-}" | tr 'A-Z' 'a-z')" = "$me" ] && return 1
+  host=""; t=0
+  if [ -f "$STATE/collector.json" ]; then
+    read -r host t < <($PY -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("host","-"), int(d.get("time",0)))' "$STATE/collector.json" 2>/dev/null)
+    [ "$host" = "-" ] && host=""
+  fi
+  host=$(echo "${host:-}" | tr 'A-Z' 'a-z'); t=${t:-0}
+  [ -z "$host" ] && return 1          # nobody has collected yet
+  [ "$host" = "$me" ] && return 1     # this machine is the one collecting
+  # Is the other collector alive? Judge by how long THIS machine has watched the same heartbeat, never by
+  # comparing clocks: WSL clocks drift after sleep and OneDrive can deliver files minutes late. Time this
+  # machine spent asleep or not checking doesn't count.
+  now=$(date +%s); limit=$(( ${INTERVAL_MIN:-5} * 60 * 6 )); [ "$limit" -lt 1800 ] && limit=1800
+  gap=$(( ${INTERVAL_MIN:-5} * 60 * 2 + 60 ))
+  sf="$ARCHIVE/heartbeat_seen"
+  sh=""; st=""; first=""; last=0
+  [ -f "$sf" ] && read -r sh st first last < "$sf"
+  if [ "${sh:-} ${st:-}" != "$host $t" ] || [ -z "${first:-}" ] || [ $((now - ${last:-0})) -gt "$gap" ] || [ "$now" -lt "${last:-0}" ]; then
+    first=$now
+  fi
+  echo "$host $t $first $now" > "$sf"
+  if [ $((now - first)) -lt "$limit" ]; then ACTIVE_HOST="$host"; return 0; fi
+  return 1
+}
+
+run_once() {
+  log "collect start"
+  collect
+  log "collect done: $(tr '\n' ' ' < "$LATEST/status")"
+  $PY "$MC_DIR/lib/mc.py" analyze
+}
+
+referee() {  # referee [goal]   (no goal: every goal)
+  local keys k line b out
+  if [ -n "${1:-}" ]; then keys=$($PY "$MC_DIR/lib/mc.py" goal-info "$1" | cut -f3) || return 1
+  else keys=$($PY "$MC_DIR/lib/mc.py" goals | awk '$3 != "node" && $3 != "ended" {print $1}'); fi
+  mkdir -p "$STATE/referee"
+  for k in $keys; do
+    line=$($PY "$MC_DIR/lib/mc.py" referee-bundle --goal "$k") || continue
+    b=$(echo "$line" | cut -f2)
+    if [ -z "${REFEREE_CMD:-}" ]; then
+      echo "$k: referee bundle written to $b (set REFEREE_CMD in config.env, e.g. claude -p, to have a second model review it)"
+      continue
+    fi
+    out="$STATE/referee/$k.md"
+    if { cat "$MC_DIR/lib/referee_prompt.md"; echo; cat "$b"; } | eval "$REFEREE_CMD" > "$out.tmp" 2>&1; then
+      mv "$out.tmp" "$out"; echo "$k: referee review saved to $out"
+    else
+      echo "$k: referee command failed; see $out.tmp"
+    fi
+  done
+  $PY "$MC_DIR/lib/mc.py" analyze > /dev/null
+}
+
+loop() {
+  local last_ref=0 me_mtime
+  export MC_REEXEC=1
+  [ -x "$HOME/.local/bin/mctl" ] || install_shell_hook   # machines set up by an older version get the mctl command
+  me_mtime=$(stat -c %Y "$MC_DIR/mctl" 2>/dev/null || echo 0)
+  while true; do
+    if [ "$(stat -c %Y "$MC_DIR/mctl" 2>/dev/null || echo 0)" != "$me_mtime" ]; then
+      log "mctl was updated; restarting the collector with the new version" >> "$ARCHIVE/loop.log"
+      exec bash "$MC_DIR/mctl" loop
+    fi
+    load_cfg
+    ensure_server
+    if active_elsewhere; then
+      log "standby: $ACTIVE_HOST is collecting" >> "$ARCHIVE/loop.log"
+      sleep $(( ${INTERVAL_MIN:-5} * 60 )); continue
+    fi
+    if [ "$(echo "${PRIMARY_HOST:-}" | tr 'A-Z' 'a-z')" != "$(echo "$MC_HOST" | tr 'A-Z' 'a-z')" ]; then
+      discover /dev/null
+      if [ -z "$RF_CP$SJ_CP$SC_CP" ] && [ "${#NODE_CP[@]}" -eq 0 ]; then
+        # no shared connections on this machine: keep the other machine's last dashboard rather than an all-red one
+        log "standby: ${PRIMARY_HOST:-the primary} is quiet but this machine has no shared connections (run $C48 here to take over)" >> "$ARCHIVE/loop.log"
+        sleep $(( ${INTERVAL_MIN:-5} * 60 )); continue
+      fi
+    fi
+    run_once >> "$ARCHIVE/loop.log" 2>&1
+    if [ "${REFEREE_EVERY_H:-0}" != 0 ] && [ -n "${REFEREE_CMD:-}" ] && [ $((SECONDS - last_ref)) -ge $((REFEREE_EVERY_H * 3600)) ]; then
+      referee >> "$ARCHIVE/loop.log" 2>&1
+      last_ref=$SECONDS
+    fi
+    if [ "$(stat -c %s "$ARCHIVE/loop.log" 2>/dev/null || echo 0)" -gt 2000000 ]; then
+      tail -n 3000 "$ARCHIVE/loop.log" > "$ARCHIVE/loop.log.tmp" && mv "$ARCHIVE/loop.log.tmp" "$ARCHIVE/loop.log"
+    fi
+    sleep $(( ${INTERVAL_MIN:-5} * 60 ))
+  done
+}
+
+running() {
+  if command -v tmux > /dev/null 2>&1 && tmux has-session -t "=$LOOP_NAME" 2> /dev/null; then return 0; fi
+  [ -f "$ARCHIVE/loop.pid" ] && kill -0 "$(cat "$ARCHIVE/loop.pid")" 2> /dev/null
+}
+
+collector_stuck() {  # this machine is the collector but has written no new data for two cycles
+  local me host age
+  me=$(echo "$MC_HOST" | tr 'A-Z' 'a-z')
+  host=$($PY -c 'import json,sys; print(json.load(open(sys.argv[1])).get("host", ""))' "$STATE/collector.json" 2> /dev/null | tr 'A-Z' 'a-z')
+  [ "$host" = "$me" ] || return 1
+  age=$(( $(date +%s) - $(stat -c %Y "$STATE/collector.json" 2> /dev/null || echo 0) ))
+  [ "$age" -gt $(( ${INTERVAL_MIN:-5} * 60 * 2 + 120 )) ]
+}
+
+start() {
+  ensure_server
+  if running; then
+    if ! collector_stuck; then echo "Collector already running (every ${INTERVAL_MIN} min)."; return 0; fi
+    log "the collector stopped producing data; restarting it" >> "$ARCHIVE/loop.log"
+    command -v tmux > /dev/null 2>&1 && tmux kill-session -t "=$LOOP_NAME" 2> /dev/null
+    [ -f "$ARCHIVE/loop.pid" ] && kill "$(cat "$ARCHIVE/loop.pid")" 2> /dev/null
+    sleep 1
+  fi
+  if command -v tmux > /dev/null 2>&1; then
+    tmux new-session -d -s "$LOOP_NAME" "bash $(printf %q "$MC_DIR/mctl") loop"
+  else
+    nohup bash "$MC_DIR/mctl" loop > /dev/null 2>&1 &
+    echo $! > "$ARCHIVE/loop.pid"
+  fi
+  echo "Collector started: new data every ${INTERVAL_MIN} min."
+}
+
+stop() {
+  command -v tmux > /dev/null 2>&1 && tmux kill-session -t "=$LOOP_NAME" 2> /dev/null
+  [ -f "$ARCHIVE/loop.pid" ] && kill "$(cat "$ARCHIVE/loop.pid")" 2> /dev/null && rm -f "$ARCHIVE/loop.pid"
+  [ -f "$ARCHIVE/server.pid" ] && kill "$(cat "$ARCHIVE/server.pid")" 2> /dev/null && rm -f "$ARCHIVE/server.pid"
+  echo "Collector stopped."
+}
+
+open_dash() {
+  local url
+  ensure_server
+  if url=$(server_url); then
+    if command -v wslpath > /dev/null 2>&1; then explorer.exe "$url" > /dev/null 2>&1 || true
+    elif command -v xdg-open > /dev/null 2>&1; then xdg-open "$url" > /dev/null 2>&1 || true; fi
+    echo "Dashboard: $url   (you can message agents from this address)"
+    return 0
+  fi
+  if command -v wslpath > /dev/null 2>&1; then
+    explorer.exe "$(wslpath -w "$MC_DIR/dashboard.html")" > /dev/null 2>&1 || true
+  elif command -v xdg-open > /dev/null 2>&1; then
+    xdg-open "$MC_DIR/dashboard.html" > /dev/null 2>&1 || true
+  fi
+  echo "Dashboard: $MC_DIR/dashboard.html"
+}
+
+install_shell_hook() {
+  local rc="$HOME/.bashrc" bin="$HOME/.local/bin/mctl"
+  mkdir -p "$HOME/.local/bin"
+  # The launcher finds the shared OneDrive folder by itself, so the same `mctl` works on every machine
+  # and keeps working if OneDrive moves.
+  cat > "$bin" <<EOF
+#!/usr/bin/env bash
+# mission control launcher, written by 'mctl setup' on $MC_HOST
+d=$(printf %q "$MC_DIR")
+if [ ! -f "\$d/mctl" ]; then
+  for c in /mnt/*/Users/*/OneDrive*{,/*,/*/*,/*/*/*}/mission-control /mnt/*/*/OneDrive*{,/*,/*/*}/mission-control; do
+    [ -f "\$c/mctl" ] && d="\$c" && break
+  done
+fi
+[ -f "\$d/mctl" ] || { echo "mctl: can't find the mission-control folder in OneDrive (is OneDrive running?)" >&2; exit 1; }
+exec bash "\$d/mctl" "\$@"
+EOF
+  chmod +x "$bin"
+  sed -i '/# >>> mission-control >>>/,/# <<< mission-control <<</d' "$rc" 2> /dev/null
+  cat >> "$rc" <<'EOF'
+# >>> mission-control >>>
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
+alias mctl="$HOME/.local/bin/mctl"
+# keep the mission-control collector running whenever a WSL shell opens (quietly, in the background)
+( "$HOME/.local/bin/mctl" start >/dev/null 2>&1 & )
+# <<< mission-control <<<
+EOF
+}
+
+setup() {
+  echo "== Mission control setup =="
+  detect
+  write_local_cfg
+  echo "Rockfish: ${RF_HOST:-not found} | first node: ${SAIPH_HOST:-none} via ${SAIPH_ROUTE} | Skipjack: ${SJ_HOST:-not found} | Scythe: ${SCYTHE_HOST:-not found}"
+  echo "-- checking connections (read-only) --"
+  doctor | sed -n '2,12p'
+  install_shell_hook
+  if active_elsewhere; then
+    echo "-- $ACTIVE_HOST is already collecting into this shared folder --"
+    echo "This machine stands by: it uses the same dashboard and takes over by itself if $ACTIVE_HOST stops."
+  else
+    echo "-- first collection --"
+    run_once
+  fi
+  stop > /dev/null; start
+  open_dash
+  echo
+  echo "Done. From now on just type 'mctl' (in a new WSL tab) to open the dashboard; 'mctl help' lists the rest."
+  echo "If a cluster shows as unreachable, run $C48 once; mission control picks the connection up on its next cycle."
+}
+
+peek() {  # peek [goal] [lines]
+  local goal="" lines=60 info node sess
+  for a in "$@"; do case "$a" in ''|*[!0-9]*) goal="$a" ;; *) lines="$a" ;; esac; done
+  info=$($PY "$MC_DIR/lib/mc.py" goal-info $goal) || return 1
+  discover /dev/null
+  node=$(echo "$info" | cut -f1); sess=$(echo "$info" | cut -f2)
+  printf 'tmux capture-pane -p -J -t "=%s:" -S -%s | awk '"'"'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'"'"'\n' \
+    "$sess" "$lines" | run_node "$node" bash -s
+}
+
+send_msg() {  # mctl send [--goal NAME] [--force] [--file F | "message"]: type a message into the agent's tmux pane
+  local goal="" force=0 file="" text="" info node pane key notmux b64 script
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --goal) goal="${2:-}"; shift 2 ;;
+      --force) force=1; shift ;;
+      --file) file="${2:-}"; shift 2 ;;
+      *) text="${text:+$text }$1"; shift ;;
+    esac
+  done
+  if [ -n "$file" ]; then b64=$(base64 -w0 < "$file")
+  elif [ -n "$text" ]; then b64=$(printf '%s' "$text" | base64 -w0)
+  else echo 'usage: mctl send [--goal NAME] "message"' >&2; return 2; fi
+  info=$($PY "$MC_DIR/lib/mc.py" send-target ${goal:+"$goal"}) || return 1
+  IFS=$'\t' read -r node pane key notmux <<< "$info"
+  [ "$notmux" = 1 ] && { echo "$key runs outside tmux, so mission control can't type into it." >&2; return 5; }
+  discover /dev/null
+  # The message travels base64-encoded on stdin and is pasted as one block (bracketed paste, so line
+  # breaks don't submit early), then Enter is pressed: the same as typing it in the agent's terminal.
+  script=$(printf 'P=%q; F=%q; B=%q\n' "$pane" "$force" "$b64"; cat <<'EOS'
+f=$(mktemp) || exit 1
+printf '%s' "$B" | base64 -d > "$f"
+scr=$(tmux capture-pane -p -J -t "$P" -S -25 2> /dev/null) || { rm -f "$f"; echo "tmux pane $P not found on $(hostname -s)" >&2; exit 4; }
+if [ "$F" != 1 ] && printf '%s\n' "$scr" | tail -n 25 | grep -Eiq 'Allow (this|command)|Approve|approval|Do you want to|\[y/N\]|\(y/n\)|Press enter to continue|waiting for (your )?(input|approval)|Run this command\?|Proceed\?'; then
+  rm -f "$f"; echo "---screen---"; printf '%s\n' "$scr" | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'; exit 3
+fi
+tmux load-buffer -b mc-send "$f" && tmux paste-buffer -p -d -b mc-send -t "$P" && sleep 0.7 && tmux send-keys -t "$P" Enter
+rc=$?; rm -f "$f"
+[ $rc -eq 0 ] || { echo "tmux could not type into $P" >&2; exit $rc; }
+sleep 3
+echo "---screen---"
+tmux capture-pane -p -J -t "$P" -S -30 | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'
+EOS
+)
+  printf '%s\n' "$script" | run_node "$node" bash -s
+}
+
+ensure_server() {  # the local web page server (http://localhost:PORT) that lets the dashboard send messages
+  [ "${WEB_SERVER:-1}" = 1 ] || return 0
+  local mt
+  mt=$(stat -c %Y "$MC_DIR/lib/server.py" 2> /dev/null) || return 0
+  if [ -f "$ARCHIVE/server.pid" ] && kill -0 "$(cat "$ARCHIVE/server.pid")" 2> /dev/null; then
+    [ "$(cat "$ARCHIVE/server.mtime" 2> /dev/null)" = "$mt" ] && return 0
+    kill "$(cat "$ARCHIVE/server.pid")" 2> /dev/null; sleep 1   # a new version arrived: restart it
+  fi
+  # started from a subshell so it is not a child job of the collector (whose `wait` would then never return)
+  ( MC_ARCHIVE_DIR="$ARCHIVE" MC_PORT="${WEB_PORT:-8765}" MC_WEB_LOGINS="${WEB_LOGINS:-}" nohup $PY "$MC_DIR/lib/server.py" >> "$ARCHIVE/server.log" 2>&1 < /dev/null &
+    echo $! > "$ARCHIVE/server.pid" )
+  echo "$mt" > "$ARCHIVE/server.mtime"
+}
+
+phone() {  # share this machine's dashboard with your own phone over Tailscale (private; nothing opens to the internet)
+  local ts="" c port name
+  for c in tailscale.exe tailscale; do command -v "$c" > /dev/null 2>&1 && { ts="$c"; break; }; done
+  [ -z "$ts" ] && [ -x "/mnt/c/Program Files/Tailscale/tailscale.exe" ] && ts="/mnt/c/Program Files/Tailscale/tailscale.exe"
+  if [ -z "$ts" ]; then
+    cat <<'EOF'
+Phone access uses Tailscale: a private network of only your own devices. Nothing is opened to the internet.
+One-time setup (about 5 minutes):
+  1. On this PC, install Tailscale for Windows from https://tailscale.com/download and sign in.
+  2. On your phone, install the Tailscale app and sign in with the same account.
+  3. Run  mctl phone  here again. It prints the address to open on your phone.
+EOF
+    return 1
+  fi
+  ensure_server
+  port=$(cat "$ARCHIVE/port" 2> /dev/null || echo "${WEB_PORT:-8765}")
+  name=$("$ts" status --json 2> /dev/null | $PY -c 'import json,sys; print(((json.load(sys.stdin).get("Self") or {}).get("DNSName") or "").rstrip("."))' 2> /dev/null)
+  if [ -z "$name" ]; then echo "Tailscale is installed but not signed in on this PC. Open Tailscale, sign in, then run mctl phone again."; return 1; fi
+  if ! "$ts" serve status 2> /dev/null | grep -Eq "(127\.0\.0\.1|localhost):$port"; then
+    echo "Sharing this machine's dashboard with your own Tailscale devices..."
+    if ! "$ts" serve --bg "$port"; then
+      echo "Tailscale couldn't share it. If it printed a link about HTTPS, open the link, enable HTTPS for your tailnet, and run mctl phone again."
+      return 1
+    fi
+  fi
+  echo
+  echo "On your phone (with Tailscale switched on), open:   https://$name/"
+  echo "Then use the browser's Share > Add to Home Screen for an app-like icon."
+  echo "Only your own Tailscale login can open it. To stop sharing: $ts serve reset"
+}
+
+server_url() {  # prints http://localhost:PORT/dashboard.html if this machine's server answers
+  local port i
+  for i in 1 2 3 4 5 6 7 8; do
+    port=$(cat "$ARCHIVE/port" 2> /dev/null)
+    if [ -n "$port" ] && (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then echo "http://localhost:$port/dashboard.html"; return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+set_hidden() {  # set_hidden add|remove NAME...   (config.env is shared, so this applies on every machine)
+  local mode="$1" cur n k known
+  shift
+  known=" $($PY "$MC_DIR/lib/mc.py" sections | awk 'NR>1 && $1 !~ /^Or$/ {print $1}' | tr '\n' ' ') "
+  cur=" ${HIDE_SECTIONS:-} "
+  for n in "$@"; do
+    n="${n#o:}"; n="${n#g:}"
+    case "$known" in
+      *" $n "*) ;;
+      *) k=$($PY "$MC_DIR/lib/mc.py" goal-info "$n" 2> /dev/null | cut -f3)   # a session name
+         if [ -n "$k" ]; then n="s:$k"; else echo "mctl: no block called '$n' (mctl hide lists them)" >&2; continue; fi ;;
+    esac
+    if [ "$mode" = add ]; then case "$cur" in *" $n "*) ;; *) cur="$cur$n " ;; esac
+    else cur="${cur// $n / }"; fi
+  done
+  cur=$(echo $cur)
+  if grep -q '^HIDE_SECTIONS=' "$MC_DIR/config.env"; then
+    sed -i "s|^HIDE_SECTIONS=.*|HIDE_SECTIONS=\"$cur\"   # blocks hidden on every machine: mctl hide / mctl unhide|" "$MC_DIR/config.env"
+  else
+    printf '\nHIDE_SECTIONS="%s"   # blocks hidden on every machine: mctl hide / mctl unhide\n' "$cur" >> "$MC_DIR/config.env"
+  fi
+  export HIDE_SECTIONS="$cur"
+  echo "Hidden on every machine: ${cur:-nothing}"
+  if active_elsewhere; then echo "The dashboard changes on $ACTIVE_HOST's next refresh (within ${INTERVAL_MIN} min)."
+  else $PY "$MC_DIR/lib/mc.py" analyze > /dev/null && echo "Dashboard redrawn."; fi
+}
+
+usage() {
+  cat <<EOF
+mctl: mission control for your agent goals   (dashboard: $MC_DIR/dashboard.html)
+Every tmux session on the watched nodes ($NODES) that runs Codex or Claude is a goal.
+Commands that act on one goal take --goal NAME (or a unique prefix) when several are running.
+
+  mctl                 start the collector if needed and open the dashboard (all you usually need)
+  mctl status          one-screen text summary of the latest data
+  mctl open            open the dashboard in your Windows browser
+  mctl run             collect now and refresh the dashboard
+  mctl goals           list the goals mission control sees
+  mctl send [--goal G] "text"   type a message into an agent's tmux pane and press Enter (same as the Send box)
+  mctl phone           use the dashboard (and chat) from your phone, privately over Tailscale
+  mctl hide [NAME...]  hide blocks on every machine (no NAME: list them); mctl unhide NAME... brings them back.
+                       To hide something in one browser only, hover over it and click its x.
+  mctl peek [GOAL] [N] show a goal's live tmux screen (last N lines, read-only)
+  mctl amend [--goal G] "text"   add a dated amendment to that goal's contract
+  mctl promote ID      turn one of your captured TUI instructions (U...) into an amendment
+  mctl contract [--goal G]       print contract path(s) (contract/<goal>.md; edit in any editor)
+  mctl referee [GOAL]  second-model review (set REFEREE_CMD in config.env)
+  mctl start | stop | restart   background collector (auto-starts with any WSL shell)
+  mctl doctor          check every connection and write state/doctor.log
+  mctl setup           detect hosts, install the shell hook, first run, start the collector
+EOF
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  "")  # just `mctl`: make sure the collector runs here, then show the dashboard
+    [ -f "$MC_DIR/config.$MC_HOST.env" ] || { echo "First time on $MC_HOST: running setup."; setup; exit; }
+    start > /dev/null   # also restarts a collector that has stopped producing data
+    open_dash > /dev/null
+    if active_elsewhere; then echo "Dashboard opened. $ACTIVE_HOST is collecting; this machine ($MC_HOST) stands by."
+    else echo "Dashboard opened. $MC_HOST is collecting every ${INTERVAL_MIN} min."; fi
+    echo "Dashboard file: $MC_DIR/dashboard.html   (mctl help for more)" ;;
+  setup) setup ;;
+  doctor) doctor ;;
+  collect) collect ;;
+  analyze|render) $PY "$MC_DIR/lib/mc.py" analyze ;;
+  run)
+    if [ "${1:-}" != --force ] && active_elsewhere; then
+      echo "$ACTIVE_HOST is collecting into this shared folder; showing its latest data (mctl run --force to collect from here anyway)."
+      $PY "$MC_DIR/lib/mc.py" summary
+    else
+      run_once && $PY "$MC_DIR/lib/mc.py" summary
+    fi ;;
+  loop) loop ;;
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status)
+    if ! running; then echo "collector on $MC_HOST: STOPPED (mctl start)"
+    elif active_elsewhere; then echo "collector on $MC_HOST: standby ($ACTIVE_HOST is collecting)"
+    else echo "collector on $MC_HOST: active, every ${INTERVAL_MIN} min"; fi
+    $PY "$MC_DIR/lib/mc.py" summary "$@" ;;
+  open) open_dash ;;
+  peek) peek "$@" ;;
+  send) send_msg "$@" ;;
+  phone) phone ;;
+  serve) MC_ARCHIVE_DIR="$ARCHIVE" MC_PORT="${WEB_PORT:-8765}" exec $PY "$MC_DIR/lib/server.py" ;;
+  goals) $PY "$MC_DIR/lib/mc.py" goals ;;
+  hide) if [ $# -eq 0 ]; then $PY "$MC_DIR/lib/mc.py" sections; else set_hidden add "$@"; fi ;;
+  unhide) if [ $# -eq 0 ]; then $PY "$MC_DIR/lib/mc.py" sections; else set_hidden remove "$@"; fi ;;
+  amend) $PY "$MC_DIR/lib/mc.py" amend "$@" && $PY "$MC_DIR/lib/mc.py" analyze > /dev/null ;;
+  promote) $PY "$MC_DIR/lib/mc.py" promote "$@" && $PY "$MC_DIR/lib/mc.py" analyze > /dev/null ;;
+  contract) $PY "$MC_DIR/lib/mc.py" contract "$@" ;;
+  referee) referee "${1:-}" ;;
+  log) tail -n "${1:-40}" "$ARCHIVE/loop.log" ;;
+  help|-h|--help|*) usage ;;
+esac
