@@ -27,6 +27,8 @@ import urllib.parse
 MC_DIR = os.path.realpath(os.environ.get("MC_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ARCHIVE = os.environ.get("MC_ARCHIVE_DIR") or os.path.expanduser("~/.local/state/mission-control")
 PORT0 = int(os.environ.get("MC_PORT") or 8765)
+MY_HOST = (os.environ.get("MC_HOST") or "").lower()   # this machine's name in mission control
+LAST_NUDGE = [0.0]
 SERVE_EXT = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css",
              ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
 os.makedirs(ARCHIVE, exist_ok=True)
@@ -122,36 +124,76 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._reply(code, json.dumps(obj))
 
+    @staticmethod
+    def _file(path):
+        """A page or data file of the dashboard folder, or None."""
+        if path in ("", "/"):
+            path = "/dashboard.html"
+        fp = os.path.realpath(os.path.join(MC_DIR, path.lstrip("/")))
+        if os.path.splitext(fp)[1].lower() not in SERVE_EXT or not fp.startswith(MC_DIR + os.sep) or not os.path.isfile(fp):
+            return None
+        return fp
+
+    @staticmethod
+    def _collector():
+        try:
+            c = json.load(open(os.path.join(MC_DIR, "state", "collector.json")))
+            return str(c.get("host") or ""), float(c.get("time") or 0)
+        except (OSError, ValueError):
+            return "", 0.0
+
     def do_GET(self):
         if self.headers.get("Host", "").lower() not in self._allowed_hosts():
             return self._reply(403, "forbidden", "text/plain")   # blocks DNS-rebinding tricks
         if not self._remote_ok():
             return self._reply(403, "Mission control only answers your own devices on your Tailscale network.", "text/plain")
-        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+        u = urllib.parse.urlparse(self.path)
+        path = urllib.parse.unquote(u.path)
         if path == "/api/ping":
             return self._json(200, {"ok": True})
-        if path in ("", "/"):
-            path = "/dashboard.html"
-        ext = os.path.splitext(path)[1].lower()
-        fp = os.path.realpath(os.path.join(MC_DIR, path.lstrip("/")))
-        if ext not in SERVE_EXT or not fp.startswith(MC_DIR + os.sep) or not os.path.isfile(fp):
+        if path == "/api/stamp":   # has this page been rewritten since you loaded it? (pages poll this, it's tiny)
+            fp = self._file(urllib.parse.unquote((urllib.parse.parse_qs(u.query).get("p") or ["/"])[0]))
+            host, t = self._collector()
+            return self._json(200, {"mtime": os.path.getmtime(fp) if fp else 0, "collected": t, "by": host})
+        fp = self._file(path)
+        if not fp:
             return self._reply(404, "not found", "text/plain")
+        ext = os.path.splitext(fp)[1].lower()
+        mtime = os.path.getmtime(fp)
         with open(fp, "rb") as f:
             data = f.read()
         if ext == ".html":
-            inject = '<script>window.MC_SEND={"token":"%s","port":%d}</script></head>' % (TOKEN, PORT)
+            inject = '<script>window.MC_SEND={"token":"%s","port":%d,"mtime":%.3f}</script></head>' % (TOKEN, PORT, mtime)
             data = data.replace(b"</head>", inject.encode(), 1)
         self._reply(200, data, SERVE_EXT[ext])
 
+    def _collect_now(self):
+        """The refresh button: wake the collector for a cycle now (only on the machine that collects, at most once a minute)."""
+        host, t = self._collector()
+        age, now = time.time() - t, time.time()
+        if host and MY_HOST and host.lower() != MY_HOST:
+            return {"ok": True, "started": False,
+                    "message": "%s collects the data; this page updates by itself when its next data arrives." % host}
+        if age < 45:
+            return {"ok": True, "started": False, "message": "The data is only %d s old." % max(0, age)}
+        if now - LAST_NUDGE[0] < 60:
+            return {"ok": True, "started": True, "message": "Collecting fresh data now. The page updates when it arrives."}
+        LAST_NUDGE[0] = now
+        with open(os.path.join(ARCHIVE, "collect.now"), "w") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        return {"ok": True, "started": True, "message": "Collecting fresh data now (about a minute). The page updates when it arrives."}
+
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path != "/api/send":
+        if path not in ("/api/send", "/api/collect"):
             return self._reply(404, "not found", "text/plain")
         origin = self.headers.get("Origin", "").lower()
         if (self.headers.get("Host", "").lower() not in self._allowed_hosts() or not self._remote_ok()
                 or origin not in self._allowed_origins()
                 or not secrets.compare_digest(self.headers.get("X-MC-Token", ""), TOKEN)):
             return self._json(403, {"ok": False, "message": "Refused: this request didn't come from a mission control page on this machine."})
+        if path == "/api/collect":
+            return self._json(200, self._collect_now())
         try:
             n = int(self.headers.get("Content-Length") or 0)
             req = json.loads(self.rfile.read(min(n, 200000)).decode("utf-8"))
