@@ -50,6 +50,10 @@ heartbeat file change, so a laptop with a drifting clock or a slow OneDrive does
 
 After that you don't need to do anything else:
 - The collector refreshes every 5 minutes. It restarts by itself whenever you open a WSL shell.
+- Open pages keep themselves current. Opened with `mctl` (or on your phone), a page updates in place
+  within about 15 s of new data, keeping your scroll position, open blocks and any message you're typing.
+  Opened straight from the shared folder, it reloads every 2 minutes. The refresh button next to the
+  status asks the collector for fresh data right away.
 - If a connection drops, the dashboard turns red and tells you to run your connection script. The next
   cycle picks the connection up again.
 - `dashboard.html` sits in the shared folder, so it syncs to your other devices.

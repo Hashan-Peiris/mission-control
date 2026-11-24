@@ -352,6 +352,19 @@ referee() {  # referee [goal]   (no goal: every goal)
   $PY "$MC_DIR/lib/mc.py" analyze > /dev/null
 }
 
+# Wait for the next cycle, or less when a page's refresh button asked for fresh data (the server leaves collect.now).
+nap() {
+  local end=$((SECONDS + $1))
+  while [ $SECONDS -lt $end ]; do
+    if [ -f "$ARCHIVE/collect.now" ]; then
+      rm -f "$ARCHIVE/collect.now"
+      log "collecting now: asked from a page" >> "$ARCHIVE/loop.log"
+      return 0
+    fi
+    sleep 5
+  done
+}
+
 loop() {
   local last_ref=0 me_mtime
   export MC_REEXEC=1
@@ -384,7 +397,7 @@ loop() {
     if [ "$(stat -c %s "$ARCHIVE/loop.log" 2>/dev/null || echo 0)" -gt 2000000 ]; then
       tail -n 3000 "$ARCHIVE/loop.log" > "$ARCHIVE/loop.log.tmp" && mv "$ARCHIVE/loop.log.tmp" "$ARCHIVE/loop.log"
     fi
-    sleep $(( ${INTERVAL_MIN:-5} * 60 ))
+    nap $(( ${INTERVAL_MIN:-5} * 60 ))
   done
 }
 
@@ -551,7 +564,7 @@ ensure_server() {  # the local web page server (http://localhost:PORT) that lets
     kill "$(cat "$ARCHIVE/server.pid")" 2> /dev/null; sleep 1   # a new version arrived: restart it
   fi
   # started from a subshell so it is not a child job of the collector (whose `wait` would then never return)
-  ( MC_ARCHIVE_DIR="$ARCHIVE" MC_PORT="${WEB_PORT:-8765}" MC_WEB_LOGINS="${WEB_LOGINS:-}" nohup $PY "$MC_DIR/lib/server.py" >> "$ARCHIVE/server.log" 2>&1 < /dev/null &
+  ( MC_ARCHIVE_DIR="$ARCHIVE" MC_HOST="$MC_HOST" MC_PORT="${WEB_PORT:-8765}" MC_WEB_LOGINS="${WEB_LOGINS:-}" nohup $PY "$MC_DIR/lib/server.py" >> "$ARCHIVE/server.log" 2>&1 < /dev/null &
     echo $! > "$ARCHIVE/server.pid" )
   echo "$mt" > "$ARCHIVE/server.mtime"
 }
