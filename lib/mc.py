@@ -1645,17 +1645,17 @@ def tex(x):
 
 
 def md_inline(t):
-    out = []
-    for i, part in enumerate(re.split(r"(`[^`]+`)", t or "")):
-        if i % 2:
-            out.append("<code>%s</code>" % esc(part[1:-1]))
-            continue
-        part = esc(part)
-        part = re.sub(r"\\\((.+?)\\\)|\\\[(.+?)\\\]", lambda m: tex(m.group(1) or m.group(2)), part)
-        part = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", part)
-        part = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", part)
-        out.append(part)
-    return "".join(out)
+    # code spans first (their contents stay literal), held as placeholders so **bold** can wrap them
+    codes = []
+
+    def hold(m):
+        codes.append("<code>%s</code>" % esc(m.group(1)))
+        return "\x00%d\x00" % (len(codes) - 1)
+    part = esc(re.sub(r"`([^`]+)`", hold, (t or "").replace("\x00", "")))
+    part = re.sub(r"\\\((.+?)\\\)|\\\[(.+?)\\\]", lambda m: tex(m.group(1) or m.group(2)), part)
+    part = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", part)
+    part = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", part)
+    return re.sub(r"\x00(\d+)\x00", lambda m: codes[int(m.group(1))], part)
 
 
 def md_table(rows):
@@ -1732,8 +1732,9 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 function tex(x){x=x.replace(/\\(?:mathrm|text|mathit|mathbf|operatorname)\{([^{}]*)\}/g,'$1').replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g,'$1/$2').replace(/\\sqrt\{([^{}]*)\}/g,'√$1')
  .replace(/\\([A-Za-z]+|[,;! %])/g,function(a,k){return TEX.hasOwnProperty(k)?TEX[k]:k;}).replace(/\^\{([^{}]*)\}/g,'<sup>$1</sup>').replace(/_\{([^{}]*)\}/g,'<sub>$1</sub>')
  .replace(/\^([A-Za-z0-9+\-])/g,'<sup>$1</sup>').replace(/_([A-Za-z0-9])/g,'<sub>$1</sub>');return '<span class="math">'+x.replace(/[{}]/g,'')+'</span>';}
-function inl(s){return String(s).split(/(`[^`]+`)/).map(function(p,i){if(i%2)return '<code>'+esc(p.slice(1,-1))+'</code>';p=esc(p);
- return p.replace(/\\\((.+?)\\\)|\\\[(.+?)\\\]/g,function(a,b,c){return tex(b||c);}).replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\[([^\]]+)\]\(([^)]+)\)/g,'$1');}).join('');}
+function inl(s){var cd=[],p=esc(String(s).replace(/\u0000/g,'').replace(/`([^`]+)`/g,function(a,c){cd.push('<code>'+esc(c)+'</code>');return '\u0000'+(cd.length-1)+'\u0000';}));
+ p=p.replace(/\\\((.+?)\\\)|\\\[(.+?)\\\]/g,function(a,b,c){return tex(b||c);}).replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\[([^\]]+)\]\(([^)]+)\)/g,'$1');
+ return p.replace(/\u0000(\d+)\u0000/g,function(a,i){return cd[+i];});}
 function tbl(rows){var cs=rows.map(function(r){return r.trim().replace(/^\||\|$/g,'').split('|').map(function(c){return c.trim();});});var h=null;
  if(cs.length>=2&&cs[1].every(function(c){return !c||/^:?-{2,}:?$/.test(c);})){h=cs[0];cs=cs.slice(2);}
  return '<table class="mdt">'+(h?'<tr>'+h.map(function(c){return '<th>'+inl(c)+'</th>';}).join('')+'</tr>':'')+cs.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+inl(c)+'</td>';}).join('')+'</tr>';}).join('')+'</table>';}
@@ -2483,6 +2484,12 @@ details[data-sec]>summary:after{margin:0 0 1px 9px}
 .scard .sn{color:color-mix(in srgb,var(--h) 72%,var(--fg))}
 .hc{background:color-mix(in srgb,var(--card) 80%,transparent)}
 .kind.claude{background:color-mix(in srgb,var(--orange) 16%,transparent);color:var(--orange)}
+.bub .mb,.msg .mb{line-height:1.6}.bub .who{color:color-mix(in srgb,var(--c) 78%,var(--fg))}
+.av{background:color-mix(in srgb,var(--c) 26%,var(--card));color:color-mix(in srgb,var(--c) 70%,var(--fg));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 45%,transparent)}
+.mb code{font-family:Consolas,"Cascadia Mono",ui-monospace,monospace;font-size:.9em;font-weight:400;padding:1px 5px;border:none;border-radius:5px;
+background:color-mix(in srgb,var(--fg) 7%,transparent);color:color-mix(in srgb,var(--fg) 80%,var(--c,var(--mut)))}
+.mb b{font-weight:600}
+@media (prefers-color-scheme:dark){.bub .mb,.msg .mb{color:color-mix(in srgb,var(--fg) 88%,var(--bg))}.bub .mb b{color:var(--fg)}}
 """ + HIDE_CSS
 
 
