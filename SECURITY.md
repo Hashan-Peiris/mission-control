@@ -48,6 +48,10 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
   `state/outbox/`): only scripts mission control wrote for one of the actions above, run by the other PC's
   collector loop, and dropped if they arrive more than 3 minutes late. Anyone who can write to that folder
   can already change mission control's code, so this adds no new way in; keep the folder private.
+- Contract upkeep only adds or tightens rules by itself; loosening one always needs your Approve. It reads the
+  agent's instruction files and `.mc/requests.jsonl` in its folder, and writes nothing on the cluster.
+- Messages to an agent about the contract (your answer to its request, "Tell the agent how to ask") are sent
+  only when you press that button.
 - It never submits or cancels jobs.
 - To report Claude's usage it gives sessions it starts a status line script
   (`~/.cache/mission-control/claude_statusline.py`) that saves the usage numbers and then runs your own

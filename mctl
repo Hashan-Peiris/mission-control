@@ -991,6 +991,10 @@ case "$cmd" in
   run-on) RELAYING=1; discover /dev/null < /dev/null; run_node "${1:?node}" bash -s ;;   # for relayed requests: run the script (stdin) on that node
   key) press_key "$@" ;;
   answer) answer_q "$@" ;;
+  contract-edit)   # a change to a goal's contract from the dashboard (JSON on stdin); the pages refresh right after
+    out=$($PY "$MC_DIR/lib/mc.py" contract-edit "${1:?goal}"); rc=$?; printf '%s\n' "$out"
+    [ $rc -eq 0 ] && ! active_elsewhere && ( $PY "$MC_DIR/lib/mc.py" analyze > /dev/null 2>&1 & )
+    exit $rc ;;
   end) end_session "$@" ;;
   phone) phone ;;
   serve) MC_ARCHIVE_DIR="$ARCHIVE" MC_PORT="${WEB_PORT:-8765}" exec $PY "$MC_DIR/lib/server.py" ;;

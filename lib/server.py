@@ -274,6 +274,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"ok": rc == 0, "message": msg if rc else (out.strip().splitlines() or ["Done."])[-1] if path == "/api/end" else "Pressed Esc.",
                 "screen": screen}
 
+    def _contract(self, req):
+        """A change to a goal's contract (lib/contract.py via mctl contract-edit). Approving or rejecting an agent's request,
+        and "Tell the agent how to ask", also send the agent a short message (you pressed the button)."""
+        key = str(req.get("key") or "")
+        if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
+            return {"ok": False, "message": "Unknown session."}
+        body = {k: str(req.get(k))[:1500] for k in ("op", "name", "rule_op", "val", "value", "text", "pid", "uid") if req.get(k) is not None}
+        try:
+            p = subprocess.run(["bash", os.path.join(MC_DIR, "mctl"), "contract-edit", key], input=json.dumps(body),
+                               capture_output=True, text=True, timeout=90)
+            res = json.loads((p.stdout.strip().splitlines() or ["{}"])[-1])
+        except (subprocess.TimeoutExpired, ValueError) as e:
+            return {"ok": False, "message": "Couldn't change the contract (%s)." % e.__class__.__name__}
+        self._log({"key": key, "contract": body.get("op"), "ok": res.get("ok")})
+        if res.get("ok") and res.get("agent_msg"):
+            with tempfile.NamedTemporaryFile("w", delete=False, dir=ARCHIVE, prefix="send-", suffix=".txt", encoding="utf-8") as f:
+                f.write(res["agent_msg"])
+                tmp = f.name
+            try:
+                rc, out, err = self._mctl(["send", "--goal", key, "--file", tmp], timeout=200)
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            res["message"] = (res.get("message") or "") + (" The agent has been told." if rc == 0 else
+                                                           " Telling the agent didn't work (%s); send it yourself if needed." % (
+                                                               (err.strip().splitlines() or ["the session was busy or asking something"])[-1]))
+        return {"ok": bool(res.get("ok")), "message": res.get("message") or "Done."}
+
     def _collect_now(self):
         """The refresh button: wake the collector for a cycle now (only on the machine that collects, at most once a minute)."""
         host, t = self._collector()
@@ -296,7 +326,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path not in ("/api/send", "/api/collect", "/api/launch", "/api/key", "/api/end", "/api/answer"):
+        if path not in ("/api/send", "/api/collect", "/api/launch", "/api/key", "/api/end", "/api/answer", "/api/contract"):
             return self._reply(404, "not found", "text/plain")
         origin = self.headers.get("Origin", "").lower()
         if (self.headers.get("Host", "").lower() not in self._allowed_hosts() or not self._remote_ok()
@@ -314,6 +344,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, self._launch(req))
         if path in ("/api/key", "/api/end", "/api/answer"):
             return self._json(200, self._session_action(path, req))
+        if path == "/api/contract":
+            return self._json(200, self._contract(req))
         key, text, force = str(req.get("key") or ""), str(req.get("text") or ""), bool(req.get("force"))
         if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
             return self._json(400, {"ok": False, "message": "Unknown session."})

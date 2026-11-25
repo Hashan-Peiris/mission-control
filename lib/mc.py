@@ -17,6 +17,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import question as QN  # noqa: E402  (finds a question or approval prompt on an agent's screen)
+import contract as CT  # noqa: E402  (keeps each goal's contract in step with the goal; automatic changes only tighten)
 import zlib
 import signal
 import urllib.request
@@ -30,6 +31,7 @@ LATEST = os.path.join(STATE, "latest")
 CONTRACT_DIR = os.path.join(MC_DIR, "contract")
 LEGACY_CONTRACT = os.path.join(CONTRACT_DIR, "goal_contract.md")
 CONTRACT = LEGACY_CONTRACT   # switched per goal by use_contract()
+CSTATE_DIR = os.path.join(MC_DIR, "state", "contract")   # per goal: decisions, values being learned, recent automatic changes
 CUR_GOAL = None
 NOW = time.time()
 
@@ -256,6 +258,9 @@ def use_contract(key, name):
     global CONTRACT, CUR_GOAL
     os.makedirs(CONTRACT_DIR, exist_ok=True)
     p = os.path.join(CONTRACT_DIR, key + ".md")
+    old_p = os.path.join(CONTRACT_DIR, "old", key + ".md")
+    if not os.path.exists(p) and os.path.exists(old_p):   # tidied away while the goal was gone: bring it back
+        os.replace(old_p, p)
     if not os.path.exists(p) and os.path.exists(LEGACY_CONTRACT) and key == slug(CFG["session"]):
         os.replace(LEGACY_CONTRACT, p)  # the original single-goal contract belongs to this goal
     if not os.path.exists(p):  # a tmux session group (X) replacing its member sessions (X-0, X-1...): keep the best contract
@@ -566,6 +571,9 @@ def cmd_digest_config(local=False, login=None, probe=False):
         for cr in c["criteria"]:
             if cr.get("regex") and cr["label"] not in [x["label"] for x in customs]:
                 customs.append({"label": cr["label"], "regex": cr["regex"]})
+    for n in CT.SCAN_NAMES:   # every setting the known codes use, so values can be learned before anyone lists them
+        if n not in watch:
+            watch.append(n)
     g = CFG["goals"].strip()
     sessions = ["*"] if (local or login or g in ("", "auto", "*")) else [x for x in re.split(r"[\s,]+", g) if x]
     cfg = {
@@ -589,6 +597,211 @@ def cmd_digest_config(local=False, login=None, probe=False):
         cfg["cache"] = "~/.cache/mission-control/digest_cache_local.json"
         cfg["probe"] = probe   # which agents, accounts and models this PC has (New session): only when publishing to other PCs
     sys.stdout.write(base64.b64encode(json.dumps(cfg).encode()).decode())
+
+
+# ---------------------------------------------------------------- contract upkeep (see lib/contract.py)
+def watched_hosts_text(shared):
+    every = {}
+    for h in (os.environ.get("HOSTS") or "").split():
+        m = re.match(r"^([A-Za-z0-9._-]+)(?:@[^/\s]+)?(?:/(\d+))?$", h)
+        if m and m.group(2):
+            every[m.group(1)] = m.group(2)
+    names = (["Rockfish"] if CFG["rf"] else []) + (["Skipjack"] if CFG["sj"] else [])
+    names += [n + (" (every %s min)" % every[n] if n in every else "") for n in shared["nodes"]]
+    return ", ".join(names)
+
+
+def write_contract(raw):
+    tmp = CONTRACT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(raw)
+    os.replace(tmp, CONTRACT)
+
+
+def contract_upkeep(gkey, goal_text, codex_goal, ndoc, shared):
+    """Bring this goal's contract up to date from its own instructions, its run files and what mission control knows."""
+    st = CT.load_state(CSTATE_DIR, gkey)
+    st.setdefault("first_seen", NOW)
+    raw = rd(CONTRACT, "") or ""
+    specs = {}
+    for c, files in ((ndoc or {}).get("specs") or {}).items():
+        for name, sp in files.items():
+            specs[name if name not in specs else "%s (%s)" % (name, os.path.basename(c.rstrip("/")))] = sp
+    params = (ndoc or {}).get("params") or {}
+    hosts = ["Rockfish", "Skipjack"] + list(shared["nodes"]) + [w.capitalize() for w in NEVER]
+    ctx = {"goal_text": goal_text, "codex_goal": codex_goal, "specs": specs, "values": params.get("values") or {},
+           "codes": params.get("codes") or {}, "hosts": [h for i, h in enumerate(hosts) if h.lower() not in [x.lower() for x in hosts[:i]]],
+           "watched": watched_hosts_text(shared), "never": [w.capitalize() for w in NEVER], "requests": (ndoc or {}).get("requests") or [],
+           "implicit": IMPLICIT_OPS, "varies": VARIES, "infer_criteria": infer_criteria, "now": NOW}
+    try:
+        new, notes = CT.upkeep(raw, ctx, st)
+    except Exception as e:  # never let contract upkeep break the dashboard
+        sys.stderr.write("contract upkeep %s: %s\n" % (gkey, e))
+        return st, []
+    if new != raw:
+        write_contract(new)
+    if notes:
+        st["log"] = (st.get("log") or [])[-40:] + [{"t": NOW, "x": n} for n in notes]
+    if (ndoc or {}).get("ok"):
+        st["specs_seen"] = {n: sp.get("mtime") for n, sp in specs.items()}
+        st["codes"] = ctx["codes"]
+    CT.save_state(CSTATE_DIR, gkey, st)
+    return st, notes
+
+
+def contract_flags(flags, contract, cst, res, comp, node, gnode, codex_goal):
+    raw = contract["raw"]
+    cp = CT.parse_compute(raw)
+    for p in CT.proposals(raw):   # changes that would loosen a rule: yours to decide
+        meta = (cst.get("proposals") or {}).get(p["id"]) or {}
+        agent = bool(meta.get("agent")) or p["text"].startswith("The agent asks")
+        flags.add("prop:%s" % p["id"], "red" if agent else "amber", "goal",
+                  "The agent asks to change a rule" if agent else "A change would loosen the contract", p["text"],
+                  "Approve applies it and records an amendment%s." % (" and tells the agent" if agent else ""), needs_you=True,
+                  acts=[{"label": "Approve", "op": "approve", "pid": p["id"], "confirm": "Approve %s?\n\n%s" % (p["id"], p["text"])},
+                        {"label": "Reject", "op": "reject", "pid": p["id"], "danger": True,
+                         "confirm": "Reject %s?%s" % (p["id"], "\n\nThe agent is told." if agent else "")}])
+    allowed = [x.lower() for x in cp["allowed"]] if cp["allowed"] else None
+    forbid = [x.split(" (")[0].strip().lower() for x in cp["forbid"]]
+    for r in res:   # jobs this goal's agents submitted on a cluster the contract doesn't allow
+        mine = [j for j in r.get("jobs") or [] if j.get("by") and j.get("state") in ("RUNNING", "PENDING")]
+        nm = str(r.get("name") or "").lower()
+        if mine and (nm in forbid or (allowed is not None and nm not in allowed)):
+            flags.add("compute:notallowed:%s" % nm, "red", "compute", "Jobs on %s, which the contract doesn't allow" % r["name"],
+                      "%d running or waiting: %s" % (len(mine), ", ".join(str(j.get("id")) for j in mine[:6])),
+                      "Ask the agent to move them, or change the Compute section of the contract.")
+    if cp["budget"] and cp["budget"][1].lower() in ("su", "core-h", "sus") and comp.get("alloc_ch"):
+        frac = comp["alloc_ch"] / cp["budget"][0]
+        if frac >= 0.8:
+            flags.add("compute:budget", "red" if frac >= 1 else "amber", "compute",
+                      "%.0f%% of the %g %s budget used in the last 48 h alone" % (frac * 100, cp["budget"][0], cp["budget"][1]),
+                      "%.0f core-hours in 48 h (the dashboard sees 48 h of accounting)." % comp["alloc_ch"], "Check the spending with the agent.")
+    cap = cp["cpu_cap"].get(str(gnode).lower())
+    if cap and (node or {}).get("ncpu"):
+        pct = (node.get("load") or [0])[0] / node["ncpu"] * 100
+        if pct > cap:
+            flags.add("compute:cap:%s" % gnode, "amber", "compute", "%s CPU at %.0f%%, over the %g%% cap in the contract" % (gnode, pct, cap),
+                      "Load %.1f on %d cores." % ((node.get("load") or [0])[0], node["ncpu"]), "Ask the agent to ease off, or raise the cap.")
+    gsec = "\n".join(l for _, l in CT.section_lines(raw, "Goal"))
+    if codex_goal and contract["goal"] and "_(auto-filled from the Codex goal" not in gsec and \
+            re.sub(r"\s+", " ", contract["goal"]).strip() != re.sub(r"\s+", " ", codex_goal).strip():
+        flags.add("contract:goal-changed", "info", "integrity", "The Codex goal differs from the goal you wrote in the contract",
+                  trunc(codex_goal, 220), "Keep yours, or use the Codex goal text.",
+                  acts=[{"label": "Use the Codex goal", "op": "goal_sync", "confirm": "Replace the contract's goal text with the Codex goal?"}])
+    if not contract["criteria"] and NOW - (cst.get("first_seen") or NOW) > 86400:
+        flags.add("contract:nocrit", "amber", "integrity", "No acceptance criteria yet",
+                  "Without them the checks can't tell finished from unfinished work.",
+                  "Add one in the Scientific integrity card, e.g. force error <= 30 meV/A.")
+
+
+def cmd_contract_edit(key, req):
+    """One change to a goal's contract from the dashboard (JSON on stdin). Prints {"ok", "message", "agent_msg"}."""
+    def out(ok, msg, agent_msg=None):
+        print(json.dumps({"ok": ok, "message": msg, "agent_msg": agent_msg}))
+        return 0 if ok else 1
+    g = next((x for x in known_goals() if x["key"] == key), None)
+    if not g:
+        return out(False, "No session called %s." % key)
+    use_contract(key, g["name"])
+    raw = rd(CONTRACT, "") or ""
+    st = CT.load_state(CSTATE_DIR, key)
+    snap = rjson(os.path.join(STATE, "goals", key + ".json"), {}) or {}
+    op = str(req.get("op") or "")
+    name = str(req.get("name") or "").upper().strip()
+    if name and not re.match(r"^[A-Z_][A-Z0-9_]{0,40}$", name):
+        return out(False, "That isn't a parameter name.")
+    agent_msg, msg = None, ""
+    try:
+        if op == "set":
+            rop, val = str(req.get("rule_op") or "=="), str(req.get("val") or "").strip()
+            if rop not in ("==", "<=", ">=", "<", ">", "in", "abs<=") or not val or "|" in val and rop != "in" or len(val) > 80 or "#" in val:
+                return out(False, "Write the rule as NAME, a comparison and a value.")
+            raw, msg = CT.apply_action(raw, "set %s %s %s" % (name, rop, val))
+            raw, aid = CT.add_amendment(raw, "Rule set on the dashboard: %s" % msg)
+        elif op == "allow":
+            raw, msg = CT.apply_action(raw, "allow %s %s" % (name, str(req.get("value") or "").strip()))
+            raw, aid = CT.add_amendment(raw, "Allowed on the dashboard: %s" % msg)
+        elif op == "unlock":
+            e = CT.watch_entries(raw).get(name)
+            if not e or not e["op"]:
+                return out(False, "%s has no rule." % name)
+            raw = CT.set_watch(raw, name)
+            st.setdefault("unlocked", []).append(name)
+            raw, aid = CT.add_amendment(raw, "Unlocked %s on the dashboard (was %s %s)" % (name, e["op"], e["val"]))
+            msg = "%s is unlocked (any change is still shown)" % name
+        elif op == "unwatch":
+            raw, msg = CT.apply_action(raw, "unwatch %s" % name)
+            st.setdefault("unlocked", []).append(name)
+        elif op == "keep":
+            raw = CT.make_firm(raw, name)
+            msg = "%s is now your own rule" % name
+        elif op == "criterion":
+            text = re.sub(r"\s+", " ", str(req.get("text") or "")).strip()
+            if not text or len(text) > 300:
+                return out(False, "Write the criterion in one line.")
+            raw = CT.add_criterion(raw, text)
+            msg = "Added the criterion"
+        elif op == "uncriterion":
+            raw = CT.remove_criterion(raw, str(req.get("text") or ""))
+            st.setdefault("dropped_criteria", []).append(CT.crit_key(str(req.get("text") or "")))
+            msg = "Removed the criterion"
+        elif op == "amend":
+            text = re.sub(r"\s+", " ", str(req.get("text") or "")).strip()
+            if not text:
+                return out(False, "Nothing to add.")
+            raw, aid = CT.add_amendment(raw, trunc(text, 1200))
+            msg = "Added to the contract as %s" % aid
+        elif op == "bind":
+            uid = str(req.get("uid") or "")
+            u = next((x for x in snap.get("instructions", []) if x["id"].lower() == uid.lower()), None)
+            if not u:
+                return out(False, "That instruction isn't in the latest data any more.")
+            raw, aid = CT.add_amendment(raw, "%s (from %s)" % (trunc(u["text"], 1200), u["id"]))
+            msg = "Your instruction %s is now binding (%s)" % (u["id"], aid)
+        elif op in ("approve", "reject"):
+            raw, msg, info = CT.decide(raw, st, str(req.get("pid") or ""), op == "approve")
+            if info.get("agent"):
+                agent_msg = ("[mission control] Your request %s was approved by the user: %s." % (info["agent"], msg) if op == "approve" else
+                             "[mission control] Your request %s (%s) was not approved. Keep to the contract as it is." % (
+                                 info["agent"], info["action"].split(" ", 1)[1]))
+        elif op == "goal_sync":
+            cg = (snap.get("ccard") or {}).get("codex_goal") or ""
+            if not cg:
+                return out(False, "No Codex goal text known for this session.")
+            ls, secs = CT._split(raw)
+            r = CT._range(secs, "goal", len(ls))
+            if not r:
+                return out(False, "The contract has no Goal section.")
+            ls[r[0]:r[1]] = ["", cg, "", "_(auto-filled from the Codex goal on %s; kept in step with it)_" % CT.today(), ""]
+            raw = "\n".join(ls)
+            msg = "The goal text now follows the Codex goal"
+        elif op == "tell":
+            agent_msg = CT.protocol_text(raw, (snap.get("goal") or {}).get("cwd") or "")
+            msg = "Told the agent how to ask"
+        else:
+            return out(False, "Unknown change.")
+    except ValueError as e:
+        return out(False, str(e))
+    if op in ("set", "allow", "keep") and name in (st.get("unlocked") or []):
+        st["unlocked"] = [x for x in st["unlocked"] if x != name]
+    write_contract(raw)
+    st["log"] = (st.get("log") or [])[-40:] + [{"t": time.time(), "x": "you: " + msg}]
+    CT.save_state(CSTATE_DIR, key, st)
+    return out(True, msg + ".", agent_msg)
+
+
+def tidy_contracts(goals):
+    """Move contracts of goals gone for 3 days (and older copies from renamed sessions) to contract/old/."""
+    keep = {g["key"] for g in goals}
+    seen = rjson(os.path.join(STATE, "goals_seen.json"), {}) or {}
+    keep |= {k for k, v in seen.items() if NOW - ((v or {}).get("last_seen") or 0) < 3 * 86400}
+    for f in contract_files():
+        k = os.path.basename(f)[:-3]
+        if k in keep or k == "goal_contract" or NOW - os.path.getmtime(f) < 86400:
+            continue
+        os.makedirs(os.path.join(CONTRACT_DIR, "old"), exist_ok=True)
+        os.replace(f, os.path.join(CONTRACT_DIR, "old", os.path.basename(f)))
+        sys.stderr.write("contract: moved %s to contract/old/ (no such goal for 3 days)\n" % os.path.basename(f))
 
 
 # ---------------------------------------------------------------- parsing raw inputs
@@ -693,9 +906,9 @@ class Flags:
     def __init__(self):
         self.items = []
 
-    def add(self, key, sev, area, title, detail="", action="", needs_you=False, q=None):
+    def add(self, key, sev, area, title, detail="", action="", needs_you=False, q=None, acts=None):
         self.items.append({"key": key, "sev": sev, "area": area, "title": title, "detail": detail,
-                           "action": action, "needs_you": needs_you or sev == "red", "q": q})
+                           "action": action, "needs_you": needs_you or sev == "red", "q": q, "acts": acts or None})
 
     def sorted(self):
         return sorted(self.items, key=lambda f: (SEV_ORDER.get(f["sev"], 3), f["area"]))
@@ -912,8 +1125,10 @@ def load_shared():
 
 def merge_params(parts):
     out = {"values": {}, "examples": {}, "files": 0, "dirs": 0, "roots": [], "truncated": False, "metric_files": [],
-           "train_inputs": [], "cached": True, "t": 0}
+           "train_inputs": [], "cached": True, "t": 0, "codes": {}}
     for p in parts:
+        for k, n in (p.get("codes") or {}).items():
+            out["codes"][k] = out["codes"].get(k, 0) + n
         for k, vals in (p.get("values") or {}).items():
             dst = out["values"].setdefault(k, {})
             for v, n in vals.items():
@@ -954,9 +1169,11 @@ def goal_doc(goal):
         params = doc.get("params") or {}
     dec = [d for d in doc.get("decisions", []) if any(str(d.get("file", "")).startswith(c) for c in cwds)]
     git = {c: v for c, v in (doc.get("git") or {}).items() if c in cwds}
+    specs = {c: v for c, v in (doc.get("specs") or {}).items() if c in cwds}
+    reqs = [dict(r, cwd=c) for c, lst in (doc.get("requests") or {}).items() if c in cwds for r in lst]
     return {"ok": doc.get("ok", False), "tmux": goal.get("tm") or {}, "sessions": sessions, "goal_db": doc.get("goal_db"),
             "node": doc.get("node"), "params": params, "decisions": dec, "git": git, "goal_cwds": cwds,
-            "elapsed_s": doc.get("elapsed_s", 0)}
+            "elapsed_s": doc.get("elapsed_s", 0), "specs": specs, "requests": reqs}
 
 
 def analyze_goal(gdesc, shared):
@@ -1009,6 +1226,11 @@ def analyze_goal(gdesc, shared):
         goal_text = typed[0]["text"] if typed else ""
     if goal_text:
         fill_goal_if_empty(contract, goal_text)
+    codex_goal = (goal or {}).get("text") or ""
+    cst, cnotes = contract_upkeep(gkey, goal_text, codex_goal, ndoc, shared)
+    if cnotes:
+        contract = parse_contract()
+    went = CT.watch_entries(contract["raw"])
     agent_up = bool(tm.get("codex_running") or tm.get("claude_running"))
     goal_status = (goal or {}).get("status") or ("running" if agent_up else "unknown")
     gs = goal_status.lower()
@@ -1281,7 +1503,7 @@ def analyze_goal(gdesc, shared):
     ptable = []
     for k in [w["name"] for w in contract["watch"]]:
         vals = (params.get("values") or {}).get(k) or {}
-        if not vals:
+        if not vals and not (went.get(k) or {}).get("op"):
             continue
         rule = watch.get(k, {})
         row = {"name": k, "rule": (("%s %s" % (rule.get("op"), rule.get("val"))).strip() + (" (from goal)" if rule.get("src") == "goal text" else "")) if rule.get("op") else "any change",
@@ -1293,19 +1515,30 @@ def analyze_goal(gdesc, shared):
             row["values"].append({"v": v, "n": n, "bad": bad, "ex": (params.get("examples", {}).get(k, {}).get(v) or [""])[0]})
             row["bad"] = row["bad"] or bad
         ptable.append(row)
+        we = went.get(k) or {}
+        row["auto"], row["tag"] = bool(we.get("auto")), we.get("tag") or ""
         if row["bad"]:
             badv = [x for x in row["values"] if x["bad"]]
-            flags.add("param:%s" % k, "red", "integrity",
+            acts = [{"label": "Allow %s" % badv[0]["v"], "op": "allow", "name": k, "value": badv[0]["v"],
+                     "confirm": "Allow %s = %s? The rule is widened and an amendment is recorded." % (k, badv[0]["v"])}]
+            if row["auto"]:
+                acts.append({"label": "Keep the rule", "op": "keep", "name": k,
+                             "confirm": "Keep %s %s as your own rule? Breaks then show red." % (k, row["rule"])})
+            flags.add("param:%s" % k, "amber" if row["auto"] else "red", "integrity",
                       "%s breaks the contract in %d recent input file(s)" % (k, sum(x["n"] for x in badv)),
-                      "Rule %s; found %s (e.g. %s)" % (row["rule"], ", ".join("%s \u00d7%d" % (x["v"], x["n"]) for x in badv[:3]), trunc(badv[0]["ex"], 120)),
-                      "Reject it in the TUI, or allow it with: mctl amend \"...\"")
+                      "Rule %s%s; found %s (e.g. %s)" % (row["rule"], (" (%s)" % row["tag"]) if row["auto"] else "",
+                                                       ", ".join("%s \u00d7%d" % (x["v"], x["n"]) for x in badv[:3]), trunc(badv[0]["ex"], 120)),
+                      ("An automatic rule: keep it to make breaks red, or allow the value." if row["auto"] else
+                       "Ask the agent to fix it, or allow the value."), acts=acts)
         elif len(row["values"]) > 1 and not rule.get("op") and k not in VARIES:
             minority = [x for x in row["values"][1:] if not authorized(k, x["v"], perm_texts)]
             if minority:
                 flags.add("param-mixed:%s" % k, "amber", "integrity",
                           "%s has %d different values in recent inputs" % (k, len(row["values"])),
                           ", ".join("%s \u00d7%d" % (x["v"], x["n"]) for x in row["values"][:4]),
-                          "If only one value is valid, add a rule to the contract, e.g. - %s == %s" % (k, row["values"][0]["v"]))
+                          "If only one value is valid, lock it.",
+                          acts=[{"label": "Lock to %s" % row["values"][0]["v"], "op": "set", "name": k, "rule_op": "==", "val": row["values"][0]["v"],
+                                 "confirm": "Lock %s to %s? Other values then break the contract." % (k, row["values"][0]["v"])}])
     changes = []
     for s in sessions:
         for p in s.get("patches", []):
@@ -1447,6 +1680,10 @@ def analyze_goal(gdesc, shared):
     if not contract["goal"] and not goal_text:
         flags.add("contract:empty", "info", "integrity", "The contract has no goal text yet",
                   "Fill contract/goal_contract.md so the checks know what matters.")
+    contract_flags(flags, contract, cst, res, {"alloc_ch": tot_alloc}, node, gnode, codex_goal)
+    for f in flags.items:
+        if f.get("acts"):
+            f["gkey"] = gkey
 
     # ---- instructions you typed
     instr = []
@@ -1527,6 +1764,12 @@ def analyze_goal(gdesc, shared):
                  "warnings": int(warn_m.group(1)) if warn_m else 0, "busy": busy},
         "plan": {"steps": plan or [], "done": plan_done, "now": plan_now, "ts": plan_ts, "expl": plan_expl},
         "flags": flags.sorted(), "resources": res, "node": node, "scythe": scythe_txt,
+        "ccard": {"path": os.path.relpath(CONTRACT, MC_DIR), "codes": cst.get("codes") or {}, "specs": sorted((cst.get("specs_seen") or {}).items()),
+                  "compute": {k: v for k, v in CT.parse_compute(contract["raw"]).items() if k != "entries"},
+                  "criteria": [t for _, t in CT.criteria_texts(contract["raw"])], "log": (cst.get("log") or [])[-6:][::-1],
+                  "rules": {n: {"op": e["op"], "val": e["val"], "auto": e["auto"], "tag": e["tag"]} for n, e in CT.watch_entries(contract["raw"]).items()},
+                  "proposals": [{k: p[k] for k in ("id", "text", "action")} for p in CT.proposals(contract["raw"])],
+                  "codex_goal": codex_goal},
         "compute": {"alloc_ch": round(tot_alloc, 1), "idle_ch": round(tot_idle, 1), "failed_ch": round(tot_failed, 1), "lost_ch": round(tot_lost, 1),
                     "waste_pct": None if waste_pct is None else round(waste_pct, 1), "gpu_h": round(gpu_h, 1),
                     "running_cores": running_cores},
@@ -1550,6 +1793,78 @@ def analyze_goal(gdesc, shared):
         "referee": {"text": referee, "mtime": ref_mtime}, "git": (ndoc or {}).get("git"),
     }
     return snap
+
+
+def contract_card_html(s):
+    """The contract inside the Scientific integrity card: what it protects, where the rules came from, and buttons to change them."""
+    cc, k = s.get("ccard") or {}, s["key"]
+    rules = cc.get("rules") or {}
+    o = ['<div class="ccard" data-ckey="%s">' % esc(k)]
+    meta = []
+    if cc.get("codes"):
+        meta.append("codes in use: " + ", ".join("%s (%d file%s)" % (c, n, "s" if n != 1 else "") for c, n in sorted(cc["codes"].items(), key=lambda kv: -kv[1])))
+    if cc.get("specs"):
+        meta.append("rules read from " + ", ".join("%s (%s)" % (n, hm(t)) for n, t in cc["specs"]))
+    o.append('<div class="small mut">Contract <span class="mono">%s</span>%s. Automatic changes only add or tighten rules; anything looser waits for your OK.</div>' % (
+        esc(cc.get("path") or ""), (" \u00b7 " + esc(" \u00b7 ".join(meta))) if meta else ""))
+    cp = cc.get("compute") or {}
+    bits = []
+    if cp.get("allowed"):
+        bits.append("allowed: " + ", ".join(cp["allowed"]))
+    if cp.get("forbid"):
+        bits.append("not allowed: " + ", ".join(cp["forbid"]))
+    if cp.get("budget"):
+        bits.append("budget %s %s" % ("{:,.0f}".format(cp["budget"][0]), cp["budget"][1]))
+    for h, pct in sorted((cp.get("cpu_cap") or {}).items()):
+        bits.append("%s CPU \u2264 %g%%" % (h, pct))
+    if bits:
+        o.append('<div class="small" style="margin-top:6px"><b>Compute</b> \u00b7 %s</div>' % esc(" \u00b7 ".join(bits)))
+    pt = s["params"]["table"]
+    if pt:
+        o.append('<div class="tscroll"><table style="margin-top:8px"><tr><th>Parameter</th><th>Rule</th><th>Values in recent input files</th><th></th></tr>')
+        for row in pt:
+            vals = ", ".join(('<span class="%s" title="%s">%s \u00d7%d</span>' % ("bad-t" if v["bad"] else "", esc(v["ex"]), esc(v["v"]), v["n"])) for v in row["values"][:6]) \
+                or '<span class="mut">none in recent files</span>'
+            r = rules.get(row["name"]) or {}
+            acts = []
+            if r.get("op"):
+                if r.get("auto"):
+                    acts.append({"label": "Keep", "op": "keep", "name": row["name"], "confirm": "Keep %s %s %s as your own rule?" % (row["name"], r["op"], r["val"])})
+                acts.append({"label": "Unlock", "op": "unlock", "name": row["name"], "danger": True,
+                             "confirm": "Unlock %s (now %s %s)? Changes are still shown, but no value breaks the contract." % (row["name"], r["op"], r["val"])})
+            elif row["values"]:
+                acts.append({"label": "Lock to %s" % row["values"][0]["v"], "op": "set", "name": row["name"], "rule_op": "==", "val": row["values"][0]["v"],
+                             "confirm": "Lock %s to %s?" % (row["name"], row["values"][0]["v"])})
+            src = ('<div class="small mut">%s</div>' % esc(r["tag"])) if r.get("auto") and r.get("tag") else ""
+            o.append('<tr><td class=mono>%s</td><td class=mut>%s%s</td><td>%s</td><td class="cacts" data-ckey="%s">%s</td></tr>' % (
+                esc(row["name"]), esc(row["rule"]), src, vals, esc(k), "".join(act_btn(a, "btn2 sm") for a in acts)))
+        o.append("</table></div>")
+    o.append('<div class="cform" data-ckey="%s"><span class="small mut">Add a rule</span>'
+             '<input name="name" placeholder="ENCUT" maxlength="40" autocapitalize="characters" list="cnames-%s">'
+             '<select name="rule_op"><option>==</option><option>&lt;=</option><option>&gt;=</option><option value="in">in (A|B)</option></select>'
+             '<input name="val" placeholder="520" maxlength="80"><button type="button" class="btn2 sm" data-cop="set" data-cconfirm="Add this rule?">Add</button>'
+             '<datalist id="cnames-%s">%s</datalist><div class="actmsg"></div></div>' % (
+                 esc(k), esc(k), esc(k), "".join('<option value="%s">' % esc(n) for n in CT.SCAN_NAMES if n != "POT_*")))
+    crit = cc.get("criteria") or []
+    o.append('<div class="small" style="margin-top:10px"><b>Acceptance criteria</b></div>')
+    if crit:
+        o.append('<ul class="clist">%s</ul>' % "".join(
+            '<li>%s <span class="cacts" data-ckey="%s">%s</span></li>' % (esc(t), esc(k), act_btn(
+                {"label": "Remove", "op": "uncriterion", "text": t, "danger": True, "confirm": "Remove this criterion?\n\n" + t}, "btn2 sm")) for t in crit))
+    else:
+        o.append('<div class="small mut">None yet. They let the checks tell finished from unfinished work.</div>')
+    o.append('<div class="cform" data-ckey="%s"><input name="text" class="wide" placeholder="Force error on the test set <= 30 meV/A" maxlength="300">'
+             '<button type="button" class="btn2 sm" data-cop="criterion" data-cconfirm="Add this criterion?">Add criterion</button><div class="actmsg"></div></div>' % esc(k))
+    if cc.get("log"):
+        o.append('<details class="clog"><summary class="small mut">Recent contract changes</summary><ul class="clist small">%s</ul></details>' % "".join(
+            "<li><span class=mut>%s</span> %s</li>" % (esc(hm(x.get("t"))), esc(x.get("x"))) for x in cc["log"]))
+    if not (s.get("tmux") or {}).get("notmux"):
+        o.append('<div class="cacts" data-ckey="%s" style="margin-top:10px">%s<span class="small mut"> sends the agent the protected settings '
+                 'and how to ask before changing one (its requests then show up here with Approve and Reject).</span><div class="actmsg"></div></div>' % (
+                     esc(k), act_btn({"label": "Tell the agent how to ask", "op": "tell",
+                                      "confirm": "Send the agent the contract's protected settings and how to ask before changing one?"}, "btn2 sm")))
+    o.append("</div>")
+    return "".join(o)
 
 
 # ---------------------------------------------------------------- full conversations
@@ -2324,6 +2639,10 @@ def analyze():
     except Exception as e:
         sys.stderr.write("conflict copies: %s\n" % e)
     goals = discover_goals(shared)
+    try:
+        tidy_contracts(goals)
+    except Exception as e:
+        sys.stderr.write("tidy contracts: %s\n" % e)
     for d in (os.path.join(STATE, "goals"), os.path.join(MC_DIR, "goals")):
         os.makedirs(d, exist_ok=True)
     if not goals:  # no agent sessions anywhere: still compute shared resources for the overview
@@ -2763,6 +3082,12 @@ border:1px solid var(--line);border-radius:8px;padding:6px 8px}
 .qa{margin-top:10px}.qa .qctx{font-size:12px;color:var(--mut);overflow-wrap:anywhere;margin:2px 0}
 .qbtns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.qbtns .btn2{text-align:left;white-space:normal;max-width:100%;border-radius:12px}
 .qa .actmsg{text-align:left;margin-top:6px}.qa .sendscr{margin-top:8px}
+.cacts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}td.cacts{margin:0;display:table-cell;white-space:nowrap}
+.cacts .actmsg,.cform .actmsg{flex-basis:100%;text-align:left}.btn2.sm{padding:3px 10px;font-size:12px}
+.cform{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.cform input,.cform select{background:var(--chatbg,#0a0c11);color:inherit;
+border:1px solid var(--line,#2a3142);border-radius:8px;padding:4px 8px;font:inherit;font-size:13px;min-width:0}.cform input[name=name]{width:110px}
+.cform input[name=val]{width:110px}.cform input.wide{flex:1 1 240px}.clist{margin:6px 0 0 18px;padding:0}.clist li{margin:3px 0}
+.clist .cacts{display:inline-flex;margin:0 0 0 6px}.tscroll{overflow-x:auto}.clog{margin-top:8px}
 .bell{cursor:pointer;font:inherit;font-size:12px;border:1px solid var(--line);background:none;color:var(--mut)}.bell.on{color:var(--grn);border-color:var(--grn)}
 /* every session tab stays visible: the bar wraps onto a second row when they don't fit (phones scroll instead) */
 .appbar .in{height:auto;min-height:48px}.sw{flex-wrap:wrap;overflow-x:visible;row-gap:6px}
@@ -2811,10 +3136,23 @@ def question_html(q):
             for o in q["options"])))
 
 
+def act_btn(a, cls="btn2"):
+    """A button that changes the contract (see cmd_contract_edit); its fields travel as data-c* attributes."""
+    attrs = "".join(' data-c%s="%s"' % (k.replace("_", ""), esc(str(v))) for k, v in a.items() if k not in ("label", "danger", "key"))
+    return '<button type="button" class="%s%s"%s>%s</button>' % (cls, " dng" if a.get("danger") else "", attrs, esc(a["label"]))
+
+
+def acts_html(acts, gkey):
+    if not acts:
+        return ""
+    return '<div class="cacts" data-ckey="%s">%s<div class="actmsg"></div></div>' % (esc(gkey), "".join(act_btn(a) for a in acts))
+
+
 def flag_html(f):
-    return ('<div class="flag %s"><div class="t">%s</div>%s%s%s</div>' % (
+    return ('<div class="flag %s"><div class="t">%s</div>%s%s%s%s</div>' % (
         f["sev"], esc(f["title"]), ('<div class="d">%s</div>' % esc(f["detail"])) if f["detail"] else "",
-        ('<div class="a">%s</div>' % esc(f["action"])) if f["action"] else "", question_html(f.get("q"))))
+        ('<div class="a">%s</div>' % esc(f["action"])) if f["action"] else "", question_html(f.get("q")),
+        acts_html(f.get("acts"), f.get("gkey") or "")))
 
 
 KIND_PILL = {"submit": ("submit", "ok"), "cancel": ("cancel", "warn"), "alloc": ("srun", "ok"), "delete": ("delete", "bad"),
@@ -2960,6 +3298,10 @@ function send(force){var t=ta.value;if(!t.trim())return;btn.disabled=true;window
   if(d.ok){var sent=ta.value;ta.value='';ta.style.height='';
    if(box.getAttribute('data-compact')==='1')res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+'</div>'+(scr?'<details class="scr"><summary class="small">The agent\u2019s screen a few seconds later</summary>'+scr+'</details>':'');
    else res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+'. The agent\u2019s screen a few seconds later:</div>'+scr;
+   var bk=box.getAttribute('data-key');if(bk&&sent.trim()){var bd=document.createElement('div');bd.className='cacts';bd.setAttribute('data-ckey',bk);
+    var bb=document.createElement('button');bb.type='button';bb.className='btn2 sm';bb.textContent='Make this binding';bb.setAttribute('data-cop','amend');
+    bb.setAttribute('data-ctext',sent.trim().slice(0,1200));bb.setAttribute('data-cconfirm','Add this message to the contract as an amendment, so later checks hold the agent to it?');
+    var bm=document.createElement('div');bm.className='actmsg';bd.appendChild(bb);bd.appendChild(bm);res.insertBefore(bd,res.firstChild.nextSibling);}
    try{document.dispatchEvent(new CustomEvent('mc-sent',{detail:{text:sent}}));}catch(e){}}
   else if(d.code===3){var q=d.question,qa='';
    if(q&&q.options&&q.options.length){qa='<div class="qa" data-key="'+esc(box.getAttribute('data-key'))+'" data-sig="'+esc(q.sig)+'">'+(q.context||[]).map(function(c){return '<div class="qctx mono">'+esc(c)+'</div>';}).join('')+'<div class="qbtns">'+
@@ -3067,6 +3409,21 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  if(a==='end'){var t=prompt('End '+name+'?\n\nThis closes its tmux session and stops the agent. Its conversation stays in its logs (codex resume / claude --resume).\n\nType the session name to confirm:');
   if(t===null)return;if(t.trim()!==name){say('Not ended: the name didn’t match.','bad');return;}say('Ending '+name+'…','');
   post('/api/end',{key:key,confirm:t.trim()}).then(function(j){say(j.message||'',j.ok?'ok':'bad');}).catch(function(){say('Couldn’t reach the mission control server.','bad');});}});
+// change the contract: buttons and small forms carry the change in data-c* attributes (lib/contract.py does the work)
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('button[data-cop]');if(!b)return;
+ var box=b.closest('[data-ckey]');if(!box)return;var o=box.querySelector('.actmsg')||(box.parentNode&&box.parentNode.querySelector('.actmsg'));
+ var say=function(t,c){if(o){o.className='actmsg '+(c||'');o.textContent=t;}else if(c==='bad')alert(t);};
+ if(!served){say('Open the dashboard with mctl (http://localhost:8765) to change the contract from here.','bad');return;}
+ var body={key:box.getAttribute('data-ckey'),op:b.getAttribute('data-cop')},map={cname:'name',cvalue:'value',cruleop:'rule_op',cval:'val',cpid:'pid',cuid:'uid',ctext:'text'};
+ for(var a in map){var v=b.getAttribute('data-'+a);if(v!==null)body[map[a]]=v;}
+ var form=b.closest('.cform');if(form){var ins=form.querySelectorAll('input,select');for(var i=0;i<ins.length;i++)body[ins[i].name]=ins[i].value;
+  if(body.op==='set'&&(!body.name||!body.val)){say('Fill in the name and the value.','bad');return;}
+  if(body.op==='criterion'&&!(body.text||'').trim()){say('Write the criterion first.','bad');return;}}
+ var q=b.getAttribute('data-cconfirm');if(form&&body.op==='set')q='Add the rule '+body.name.toUpperCase()+' '+body.rule_op+' '+body.val+'?';
+ if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say('Saving\u2026','');
+ post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
+  if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)ins2[i].value='';}})
+ .catch(function(){window.MC_BUSY=false;b.disabled=false;say('Couldn\u2019t reach the mission control server.','bad');});});
 // answer a question on the agent's screen: the button types that answer into the session (after you confirm)
 document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('.qa button[data-ans]');if(!b)return;
  var qa=b.closest('.qa'),o=qa.querySelector('.actmsg'),say=function(t,c){if(o){o.className='actmsg '+(c||'');o.textContent=t;}};
@@ -3336,13 +3693,7 @@ def render(s):
         o.extend(flag_html(f) for f in integ)
     elif not any(f["area"] == "integrity" for f in s["flags"]):
         o.append('<div class="empty">No contract breaks, unexplained parameter changes or shortcut wording found.</div>')
-    pt = s["params"]["table"]
-    if pt:
-        o.append('<table style="margin-top:8px"><tr><th>Parameter</th><th>Rule</th><th>Values in recent input files</th></tr>')
-        for row in pt:
-            vals = ", ".join(('<span class="%s" title="%s">%s \u00d7%d</span>' % ("bad-t" if v["bad"] else "", esc(v["ex"]), esc(v["v"]), v["n"])) for v in row["values"][:6])
-            o.append("<tr><td class=mono>%s</td><td class=mut>%s</td><td>%s</td></tr>" % (esc(row["name"]), esc(row["rule"]), vals))
-        o.append("</table>")
+    o.append(contract_card_html(s))
     sc = s["params"]["scan"]
     o.append('<div class="small mut" style="margin-top:8px">Input scan: %s file(s) changed in the last %g h under %s%s. Rules live in <span class=mono>contract/goal_contract.md</span>.</div>' % (
         sc.get("files") or 0, CFG["scan_hours"], esc(", ".join(sc.get("roots") or []) or "the goal folder"), " (scan cut short)" if sc.get("truncated") else ""))
@@ -3375,13 +3726,15 @@ def render(s):
     o.append("</div></section>")
 
     # instructions
-    o.append('<section class="card"' + sec("g", "instructions") + '><h2>Your instructions to the agents</h2><div class="small mut" style="margin-bottom:6px">Captured from the session logs. Make one binding with <span class=mono>mctl promote &lt;ID&gt;</span>.</div>')
+    o.append('<section class="card"' + sec("g", "instructions") + '><h2>Your instructions to the agents</h2><div class="small mut" style="margin-bottom:6px">Captured from the session logs. Make binding adds one to the contract as an amendment, so later checks hold the agents to it.</div>')
     if s["instructions"]:
         o.append("<table><tr><th>ID</th><th>When</th><th>To</th><th>Instruction</th></tr>")
         for u in s["instructions"][:25]:
-            o.append('<tr><td class=mono>%s%s</td><td class=mut style="white-space:nowrap">%s</td><td class=mut>%s</td><td>%s</td></tr>' % (
+            o.append('<tr><td class=mono>%s%s</td><td class=mut style="white-space:nowrap">%s</td><td class=mut>%s</td><td>%s%s</td></tr>' % (
                 esc(u["id"]), ' <span class="pill ok">in contract</span>' if u["promoted"] else "", esc(hm(iso_epoch(u.get("ts")))),
-                esc(u.get("who")), esc(trunc(u["text"], 400))))
+                esc(u.get("who")), esc(trunc(u["text"], 400)), "" if u["promoted"] else '<div class="cacts" data-ckey="%s">%s<div class="actmsg"></div></div>' % (
+                    esc(s["key"]), act_btn({"label": "Make binding", "op": "bind", "uid": u["id"],
+                                            "confirm": "Add this instruction to the contract as an amendment?\n\n" + trunc(u["text"], 300)}, "btn2 sm"))))
         o.append("</table>")
     else:
         o.append('<div class="empty">None captured yet.</div>')
@@ -3805,6 +4158,8 @@ def main():
     elif a[0] == "goal-info":
         gg = resolve_goal(a[1] if len(a) > 1 else goal_arg)
         print("%s\t%s\t%s" % (gg["node"], gg.get("target") or gg["name"], gg["key"]))
+    elif a[0] == "contract-edit":
+        sys.exit(cmd_contract_edit(a[1], json.loads(sys.stdin.read() or "{}")))
     elif a[0] == "relay-run":
         cmd_relay_run(a[1], a[2])
     elif a[0] == "digest-config":

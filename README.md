@@ -144,8 +144,8 @@ when you start a new tmux session.
   reasoning level that wrote it. Click the goal or the folder in the header to see them in full.
   "Full conversation" shows the whole history, colour-coded: you, the agent, sub-agents, events and
   Codex's approval reviewer (hidden by default). Search and filters sit at the top.
-- Each goal has its own contract, `contract/<tmux session name>.md`. Its goal text and rules are filled in
-  from that goal on first sight.
+- Each goal has its own contract, `contract/<tmux session name>.md`. It keeps itself up to date (see
+  "The contract keeps itself current" below).
 - To watch only some sessions, set `GOALS="MY_GOAL OTHER"` instead of `auto`.
   `LOGIN_DIGESTS=0` and `AUTO_NODES=0` turn off the login-node and auto-node searches.
 - If a node goes down, its goals stay on the overview as "node unreachable" until it's back.
@@ -172,6 +172,39 @@ when you start a new tmux session.
   `mctl hide screen watchdog` or `mctl hide "codex in my-folder"` hides them on every machine;
   `mctl unhide NAME` undoes it.
 
+## The contract keeps itself current
+
+Every collection, each goal's contract is brought up to date by itself, under one rule: **automatic
+changes only add or tighten**. Anything that would loosen a rule waits under "Waiting for your OK" and in
+the "Needs you" card, with Approve and Reject buttons.
+- **The goal's own instructions**: `START_GOAL.md`, `START_TASK.md` or `GOAL.md` in the agent's folder,
+  and the Codex goal text, are read every cycle. Settings (`ENCUT = 520`, `PREC = Accurate`), allowed and
+  forbidden clusters ("Rockfish Slurm only", "no Skipjack"), budgets ("100,000 SU ceiling"), CPU caps
+  ("node CPU at or below 50%") and result targets ("below 2 meV/atom") become contract lines tagged
+  `# from START_GOAL.md`.
+- **The run files**: the input files are scanned for VASP (INCAR, POTCAR pseudopotentials), DeePMD
+  (training input.json) and LAMMPS settings. A value every recent input file agrees on (5 files or more,
+  over two collections) is locked, tagged `# learned`. Settings that differ by structure are left alone.
+- **The goal text** follows the Codex goal while it is the auto-filled copy; one you wrote yourself is
+  kept, with a note when the Codex goal changes.
+- **Compute** always lists the hosts mission control watches and the ones it never contacts.
+- **Old copies** (contracts of sessions gone for 3 days) move to `contract/old/` and come back if the
+  session returns.
+- Breaks of an automatic rule show amber with "Keep the rule" and "Allow" buttons; breaks of your own
+  rules show red. Jobs on a cluster the contract doesn't allow, budget use and CPU caps are checked too.
+
+Changing it from the page, in the Scientific integrity card: Lock, Unlock or Keep each setting, add a
+rule or an acceptance criterion, and press "Make binding" next to any instruction you sent (or right after
+sending one). A rule you unlock or remove is never locked again automatically.
+
+**The agent asks permission**: "Tell the agent how to ask" sends it the protected settings and the way to
+ask: one JSON line in `.mc/requests.jsonl` in its folder, e.g.
+`{"id": "R1", "param": "ENCUT", "value": "600", "why": "cutoff convergence check"}`. The request shows up
+in "Needs you" with Approve and Reject; either way the agent gets a message with your answer.
+
+You can still edit the file by hand any time (the OneDrive phone app works too); remove a line's `# ...`
+tag to make it yours.
+
 ## Daily use
 
 | Command | What it does |
@@ -193,8 +226,8 @@ With a single goal running, you can leave out `--goal`.
 - **Goal**: Is the agent alive in tmux? Is it waiting for your approval, quiet, or stalled?
   It also shows the agent's own plan, context compactions (a known cause of goal drift),
   quota and token budget.
-- **Science**: Each goal's contract lists watched parameters. On the first run, settings stated in your
-  goal (for example "ENCUT 520", "EDIFF 1e-6") become rules. Mission control then flags:
+- **Science**: Each goal's contract lists watched parameters, kept current from the goal's instructions
+  and its run files (see above). Mission control then flags:
   - every agent edit that breaks a rule
   - every recent input file that breaks a rule
   - "shortcut" wording such as "to save time", "placeholder" or "loosened"
