@@ -14,6 +14,9 @@ import re
 import socket
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import question as QN  # noqa: E402  (finds a question or approval prompt on an agent's screen)
 import zlib
 import signal
 import urllib.request
@@ -553,7 +556,7 @@ def cmd_promote(uid):
 
 
 # ---------------------------------------------------------------- digest config
-def cmd_digest_config(local=False, login=None):
+def cmd_digest_config(local=False, login=None, probe=False):
     watch, customs = [], []
     for p in contract_files() or [None]:
         c = parse_contract(p) if p else parse_contract(os.path.join(CONTRACT_DIR, "_none_.md"))
@@ -584,6 +587,7 @@ def cmd_digest_config(local=False, login=None):
         cfg.update({"live_only": True, "login": True, "report_masters": login.startswith("rockfish")})
     if local:
         cfg["cache"] = "~/.cache/mission-control/digest_cache_local.json"
+        cfg["probe"] = probe   # which agents, accounts and models this PC has (New session): only when publishing to other PCs
     sys.stdout.write(base64.b64encode(json.dumps(cfg).encode()).decode())
 
 
@@ -689,9 +693,9 @@ class Flags:
     def __init__(self):
         self.items = []
 
-    def add(self, key, sev, area, title, detail="", action="", needs_you=False):
+    def add(self, key, sev, area, title, detail="", action="", needs_you=False, q=None):
         self.items.append({"key": key, "sev": sev, "area": area, "title": title, "detail": detail,
-                           "action": action, "needs_you": needs_you or sev == "red"})
+                           "action": action, "needs_you": needs_you or sev == "red", "q": q})
 
     def sorted(self):
         return sorted(self.items, key=lambda f: (SEV_ORDER.get(f["sev"], 3), f["area"]))
@@ -833,6 +837,19 @@ def load_shared():
         doc = rjson(os.path.join(LATEST, "node_%s.json" % n), None)
         err = rd(os.path.join(LATEST, "node_%s.err" % n), "") or ""
         nodes[n] = {"doc": doc, "err": err}
+    # Your other PCs (laptops that stand by) publish their own sessions to the shared folder
+    pcdir = os.path.join(STATE, "pcs")
+    try:
+        for fn in sorted(os.listdir(pcdir)):
+            mm = re.match(r"([a-z0-9][a-z0-9._-]{0,60})\.json$", fn)
+            fp = os.path.join(pcdir, fn)
+            if not mm or mm.group(1) == LOCAL_NAME or mm.group(1) in nodes or time.time() - os.path.getmtime(fp) > 1800:
+                continue
+            doc = rjson(fp, None)
+            if doc and doc.get("ok", True) and doc.get("tmux"):   # only a PC with agent sessions shows up
+                nodes[mm.group(1)] = {"doc": doc, "err": ""}
+    except OSError:
+        pass
     local = rjson(os.path.join(LATEST, "local.json"), None)
     clusters = []
     for name, host in (("Rockfish", CFG["rf"]), ("Skipjack", CFG["sj"])):
@@ -1006,21 +1023,20 @@ def analyze_goal(gdesc, shared):
             flags.add("agent:notrunning", "red", "goal", "No Codex or Claude process is running in %s" % gname,
                       "The tmux session exists but the agent has exited.", "Open the session and resume the goal.")
     tail = tm.get("pane_tail", [])
-    # a status line with "esc to interrupt" means the agent is busy (e.g. "Reviewing approval request" by Codex's own
-    # reviewer), not asking you anything
-    tail_txt = "\n".join(l for l in tail[-25:] if "esc to interrupt" not in l)
+    # "Reviewing approval request" is Codex's own reviewer at work (the agent is busy), not a question for you
     rv = re.search(r"Reviewing approval request \((?:(\d+)h )?(\d+)m", "\n".join(tail[-6:]))
     if rv and int(rv.group(1) or 0) * 60 + int(rv.group(2)) >= 15:
         flags.add("pane:review-slow", "amber", "goal", "Codex's approval reviewer has been checking one request for %s"
                   % ("%sh %sm" % (rv.group(1), rv.group(2)) if rv.group(1) else "%s min" % rv.group(2)),
                   "The agent waits until the reviewer decides. It isn't asking you anything.",
                   "If it stays stuck, press Esc in the session (mctl peek %s to look first)." % gkey)
-    m = re.search(r"(Allow (this|command)|Approve|approval|Do you want to|\[y/N\]|\(y/n\)|Press enter to continue|"
-                  r"waiting for (your )?(input|approval)|Run this command\?|Proceed\?)", tail_txt, re.I)
+    m = QN.find(tail) if tail else None
     if m:
-        line = next((l for l in reversed(tail[-25:]) if m.group(0).lower() in l.lower()), m.group(0))
-        flags.add("pane:approval", "red", "goal", "The agent is waiting for you", trunc(line.strip(), 220),
-                  "Open the tmux session to answer. Peek with: mctl peek %s" % gkey)
+        m["key"] = gkey
+        flags.add("pane:approval", "red", "goal", "The agent is asking you something", trunc(m["text"], 220),
+                  ("Pick an answer below. It is typed into the session for you." if m["options"] else
+                   "Type your answer in the message box and use Send anyway.") if not tm.get("notmux") else
+                  "Answer it in the agent's terminal (mctl peek %s to look first)." % gkey, q=None if tm.get("notmux") else m)
     last_act = main.get("last_epoch") if main else None
     full_tail = "\n".join(tail[-12:])
     ctx_m = re.search(r"Context (\d+)% left", full_tail)
@@ -2023,26 +2039,9 @@ def codex_label(home):
     return "default" if b == ".codex" else (b[len(".codex-"):] if b.startswith(".codex-") else b)
 
 
-def launch_info(shared, snaps):
-    hosts = [n for n in CFG["nodes"].split() if n]
-    for n, nd in shared["nodes"].items():
-        if n not in hosts and (nd.get("doc") or {}).get("ok"):
-            hosts.append(n)
-    hosts = [h for h in hosts if not any(w in h.lower() for w in NEVER)]
-    host = os.environ.get("SAIPH_HOST") or (hosts[0] if hosts else "")
-    pr = ((shared["nodes"].get(host) or {}).get("doc") or {}).get("probe") or {}
-    roots = {}
-    for x in snaps:
-        c = (x.get("goal") or {}).get("cwd") or ""
-        if "/WORK/" in c:
-            r = c[:c.index("/WORK/") + 5]
-            roots[r] = roots.get(r, 0) + 1
-    root = os.environ.get("LAUNCH_ROOT") or (max(roots, key=roots.get) if roots else "~")
-    homes, base_models = [], []
-    usage = usage_info(shared)
-    # the home plain `codex` uses: CODEX_HOME if your shell sets it, otherwise the one your running sessions write to
-    dflt = pr.get("codex_home_env") or next((u["home"] for u in usage["codex"]), "") or os.path.join(pr.get("home") or "~", ".codex")
-    byhome = {}
+def _host_launch(pr, root, dflt):
+    """Launch options for one host, from its agent probe: Codex accounts (your codex_* commands) and models, Claude."""
+    homes, base_models, byhome = [], [], {}
     for h in pr.get("codex_homes") or []:
         models = [{"slug": m["slug"], "name": m.get("name") or m["slug"], "levels": m.get("levels") or [], "default": m.get("default"),
                    "desc": m.get("desc") or ""} for m in h.get("models") or [] if m.get("slug") and m.get("visibility") != "hide"]
@@ -2070,12 +2069,38 @@ def launch_info(shared, snaps):
     cset = pr.get("claude_settings") or {}
     cmodels = [{"slug": a, "name": n} for a, n in (("fable", "Fable (latest)"), ("opus", "Opus (latest)"), ("sonnet", "Sonnet (latest)"),
                                                    ("haiku", "Haiku (latest)"))]
-    info = {"hosts": hosts, "host": host, "root": root, "probed": pr.get("ts"),
+    return {"root": root, "probed": pr.get("ts"),
             "codex": {"available": bool((pr.get("codex") or {}).get("path")), "version": (pr.get("codex") or {}).get("version"),
                       "homes": homes, "goals": True},
             "claude": {"available": bool((pr.get("claude") or {}).get("path")), "version": (pr.get("claude") or {}).get("version"),
-                       "models": cmodels, "levels": clevels, "model": cset.get("model") or "", "effort": cset.get("effortLevel") or ""},
-            "usage": usage}
+                       "models": cmodels, "levels": clevels, "model": cset.get("model") or "", "effort": cset.get("effortLevel") or ""}}
+
+
+def launch_info(shared, snaps):
+    hosts = [n for n in CFG["nodes"].split() if n]
+    docs = dict((n, nd.get("doc") or {}) for n, nd in shared["nodes"].items())
+    for n, d in docs.items():
+        if n not in hosts and d.get("ok"):
+            hosts.append(n)
+    hosts = [h for h in hosts if not any(w in h.lower() for w in NEVER)]
+    host = os.environ.get("SAIPH_HOST") or (hosts[0] if hosts else "")
+    usage = usage_info(shared)
+    per = {}
+    for h in hosts:
+        pr = docs.get(h, {}).get("probe") or {}
+        roots = {}
+        for x in snaps:   # the folder your sessions on that host work in (.../WORK/...)
+            c = (x.get("goal") or {}).get("cwd") or ""
+            if x.get("node_name", x.get("node")) == h and "/WORK/" in c:
+                r = c[:c.index("/WORK/") + 5]
+                roots[r] = roots.get(r, 0) + 1
+        root = (os.environ.get("LAUNCH_ROOT") if h == host else "") or (max(roots, key=roots.get) if roots else (pr.get("home") or "~"))
+        # the home plain `codex` uses: CODEX_HOME if your shell sets it, otherwise the one your running sessions write to
+        dflt = pr.get("codex_home_env") or (next((u["home"] for u in usage["codex"]), "") if h == host else "") \
+            or os.path.join(pr.get("home") or "~", ".codex")
+        per[h] = _host_launch(pr, root, dflt)
+    info = dict(per.get(host) or _host_launch({}, os.environ.get("LAUNCH_ROOT") or "~", "~/.codex"))
+    info.update({"hosts": hosts, "host": host, "usage": usage, "per": per})
     return info
 
 
@@ -2735,6 +2760,9 @@ border:1px solid var(--line);border-radius:8px;padding:6px 8px}
 .acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center;justify-content:flex-end;max-width:420px}
 .actmsg{flex-basis:100%;text-align:right;font-size:12px;color:var(--mut);overflow-wrap:anywhere}.actmsg.ok{color:var(--grn)}.actmsg.bad{color:var(--red)}
 @media (max-width:640px){.acts{justify-content:flex-start}.actmsg{text-align:left}}
+.qa{margin-top:10px}.qa .qctx{font-size:12px;color:var(--mut);overflow-wrap:anywhere;margin:2px 0}
+.qbtns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.qbtns .btn2{text-align:left;white-space:normal;max-width:100%;border-radius:12px}
+.qa .actmsg{text-align:left;margin-top:6px}.qa .sendscr{margin-top:8px}
 .bell{cursor:pointer;font:inherit;font-size:12px;border:1px solid var(--line);background:none;color:var(--mut)}.bell.on{color:var(--grn);border-color:var(--grn)}
 /* every session tab stays visible: the bar wraps onto a second row when they don't fit (phones scroll instead) */
 .appbar .in{height:auto;min-height:48px}.sw{flex-wrap:wrap;overflow-x:visible;row-gap:6px}
@@ -2770,10 +2798,23 @@ def bar(frac, cls=""):
     return '<div class="bar"><i class="%s" style="width:%.0f%%;--bs:%.0f%%"></i></div>' % (cls, frac * 100, 100 / max(frac, .01))
 
 
+def question_html(q):
+    """Answer buttons for a question on the agent's screen (each one types that answer into the session)."""
+    if not q or not q.get("options"):
+        return ""
+    ctx = "".join('<div class="qctx mono">%s</div>' % esc(c) for c in q.get("context") or [])
+    return ('<div class="qa" data-key="%s" data-sig="%s">%s<div class="qbtns">%s</div><div class="actmsg"></div></div>' % (
+        esc(q.get("key", "")), esc(q["sig"]), ctx, "".join(
+            '<button type="button" class="btn2%s" data-ans="%s">%s</button>' % (
+                " dng" if str(o["label"]).lower().startswith("no") else "", esc(str(o["n"])),
+                esc(("%s. %s" % (o["n"], o["label"])) if q["kind"] == "menu" else o["label"]))
+            for o in q["options"])))
+
+
 def flag_html(f):
-    return ('<div class="flag %s"><div class="t">%s</div>%s%s</div>' % (
+    return ('<div class="flag %s"><div class="t">%s</div>%s%s%s</div>' % (
         f["sev"], esc(f["title"]), ('<div class="d">%s</div>' % esc(f["detail"])) if f["detail"] else "",
-        ('<div class="a">%s</div>' % esc(f["action"])) if f["action"] else ""))
+        ('<div class="a">%s</div>' % esc(f["action"])) if f["action"] else "", question_html(f.get("q"))))
 
 
 KIND_PILL = {"submit": ("submit", "ok"), "cancel": ("cancel", "warn"), "alloc": ("srun", "ok"), "delete": ("delete", "bad"),
@@ -2920,7 +2961,10 @@ function send(force){var t=ta.value;if(!t.trim())return;btn.disabled=true;window
    if(box.getAttribute('data-compact')==='1')res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+'</div>'+(scr?'<details class="scr"><summary class="small">The agent\u2019s screen a few seconds later</summary>'+scr+'</details>':'');
    else res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+'. The agent\u2019s screen a few seconds later:</div>'+scr;
    try{document.dispatchEvent(new CustomEvent('mc-sent',{detail:{text:sent}}));}catch(e){}}
-  else if(d.code===3){res.innerHTML='<div class="flag amber"><div class="t">Not sent yet</div><div class="d">'+esc(d.message)+'</div><div class="a"><button type="button" class="more" id="sendforce">Send anyway</button></div></div>'+scr;
+  else if(d.code===3){var q=d.question,qa='';
+   if(q&&q.options&&q.options.length){qa='<div class="qa" data-key="'+esc(box.getAttribute('data-key'))+'" data-sig="'+esc(q.sig)+'">'+(q.context||[]).map(function(c){return '<div class="qctx mono">'+esc(c)+'</div>';}).join('')+'<div class="qbtns">'+
+    q.options.map(function(o){return '<button type="button" class="btn2'+(/^no/i.test(o.label)?' dng':'')+'" data-ans="'+esc(o.n)+'">'+esc(q.kind==='menu'?o.n+'. '+o.label:o.label)+'</button>';}).join('')+'</div><div class="actmsg"></div></div>';}
+   res.innerHTML='<div class="flag amber"><div class="t">Not sent yet</div><div class="d">'+esc(d.message)+(q&&q.text?'<br><b>'+esc(q.text)+'</b>':'')+'</div>'+qa+'<div class="a"><button type="button" class="more" id="sendforce">'+(q&&q.kind==='text'?'Send my message as the answer':'Send anyway')+'</button></div></div>'+scr;
    document.getElementById('sendforce').onclick=function(){send(true);};}
   else{res.innerHTML='<div class="flag red"><div class="t">Not sent</div><div class="d">'+esc(d.message||'failed')+'</div></div>'+scr;}})
  .catch(function(e){btn.disabled=false;window.MC_BUSY=false;res.innerHTML='<div class="flag red"><div class="t">Not sent</div><div class="d">The local mission control server didn\u2019t answer. Type mctl in WSL to restart it.</div></div>';});}
@@ -2967,22 +3011,23 @@ if(dlg&&nb){
   opt($('l-model'),items,items.some(function(i){return i[0]===cur;})?cur:d);fillLevels();};
  var sync=function(){var a=agent();$('l-homerow').hidden=a!=='codex'||homes().length<2;$('l-goalrow').hidden=a!=='codex';fillModels('');usage();};
  var dirDefault=function(){if(!dirTouched)$('l-dir').value=String(L.root||'~').replace(/\/$/,'')+'/'+$('l-name').value.trim();};
- var init=function(){
+ var base=L,onHost=function(h){L=Object.assign({},base,(base.per||{})[h]||{});L.host=h;};
+ var init=function(first){
+  if(first){var hs=base.hosts||[];onHost(hs.indexOf(pref.host)>=0?pref.host:base.host);opt($('l-host'),hs.map(function(h){return [h,h];}),L.host);
+   $('l-host').hidden=hs.length<2;$('l-onhost').textContent=hs.length<2?'on '+(L.host||''):'on';}
   opt($('l-home'),homes().map(function(h){return [h.cmd,h.label+(h.default?' (used by your running sessions)':'')];}),pref.cmd||((homes()[0]||{}).cmd));
-  var hs=L.hosts||[];opt($('l-host'),hs.map(function(h){return [h,h];}),hs.indexOf(pref.host)>=0?pref.host:L.host);
-  $('l-host').hidden=hs.length<2;$('l-onhost').textContent=hs.length<2?'on '+(L.host||''):'on';
   [['codex',(L.codex||{}).available],['claude',(L.claude||{}).available]].forEach(function(p){var r=dlg.querySelector('input[name=agent][value='+p[0]+']');
    if(r){r.disabled=!p[1];r.parentNode.title=p[1]?'':'Not found on '+(L.host||'the node');}});
   var want=pref.agent&&!(dlg.querySelector('input[name=agent][value='+pref.agent+']')||{}).disabled?pref.agent:'codex';
   (dlg.querySelector('input[name=agent][value='+want+']')||{}).checked=true;
   sync();if(pref.agent===agent()){fillModels(pref.model||'');fillLevels(pref.effort||'');}dirDefault();};
- init();
- dlg.addEventListener('change',function(e){var t=e.target;if(t.name==='agent')sync();else if(t.id==='l-home'){fillModels();usage();}else if(t.id==='l-model')fillLevels('');});
+ init(true);
+ dlg.addEventListener('change',function(e){var t=e.target;if(t.id==='l-host'){onHost(t.value);if(!dirTouched)dirDefault();init(false);}else if(t.name==='agent')sync();else if(t.id==='l-home'){fillModels();usage();}else if(t.id==='l-model')fillLevels('');});
  $('l-name').addEventListener('input',dirDefault);$('l-dir').addEventListener('input',function(){dirTouched=true;});
  var msg=function(t,c){var m=$('l-msg');m.textContent=t;m.className='lmsg '+(c||'');};
  nb.addEventListener('click',function(){
-  if(served)fetch('/api/launch-info',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){if(j&&j.hosts){var a=agent(),m=$('l-model').value,ef=$('l-effort').value;L=j;
-   init();(dlg.querySelector('input[name=agent][value='+a+']')||{}).checked=true;sync();fillModels(m);fillLevels(ef);}}).catch(function(){});
+  if(served)fetch('/api/launch-info',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){if(j&&j.hosts){var a=agent(),m=$('l-model').value,ef=$('l-effort').value;pref.host=$('l-host').value||pref.host;base=j;
+   init(true);(dlg.querySelector('input[name=agent][value='+a+']')||{}).checked=true;sync();fillModels(m);fillLevels(ef);}}).catch(function(){});
   msg(served?'':'Open the dashboard with mctl (http://localhost:8765) or on your phone to start sessions.',served?'':'bad');
   if(dlg.showModal)dlg.showModal();else dlg.setAttribute('open','');setTimeout(function(){$('l-name').focus();},60);});
  dlg.querySelector('[data-close]').addEventListener('click',function(){dlg.close();});
@@ -3022,6 +3067,16 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  if(a==='end'){var t=prompt('End '+name+'?\n\nThis closes its tmux session and stops the agent. Its conversation stays in its logs (codex resume / claude --resume).\n\nType the session name to confirm:');
   if(t===null)return;if(t.trim()!==name){say('Not ended: the name didn’t match.','bad');return;}say('Ending '+name+'…','');
   post('/api/end',{key:key,confirm:t.trim()}).then(function(j){say(j.message||'',j.ok?'ok':'bad');}).catch(function(){say('Couldn’t reach the mission control server.','bad');});}});
+// answer a question on the agent's screen: the button types that answer into the session (after you confirm)
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('.qa button[data-ans]');if(!b)return;
+ var qa=b.closest('.qa'),o=qa.querySelector('.actmsg'),say=function(t,c){if(o){o.className='actmsg '+(c||'');o.textContent=t;}};
+ if(!served){say('Open the dashboard with mctl (http://localhost:8765) to answer from here.','bad');return;}
+ if(!confirm('Answer "'+b.textContent+'"?\n\nThis is typed into the agent\u2019s session now.'))return;
+ var all=qa.querySelectorAll('button');for(var i=0;i<all.length;i++)all[i].disabled=true;window.MC_BUSY=true;say('Answering\u2026','');
+ post('/api/answer',{key:qa.getAttribute('data-key'),choice:b.getAttribute('data-ans'),sig:qa.getAttribute('data-sig')}).then(function(j){window.MC_BUSY=false;
+  say(j.message||'',j.ok?'ok':'bad');if(!j.ok)for(var i=0;i<all.length;i++)all[i].disabled=false;
+  if(j.screen){var p=document.createElement('pre');p.className='sendscr';p.textContent=j.screen;qa.appendChild(p);}})
+ .catch(function(){window.MC_BUSY=false;say('Couldn\u2019t reach the mission control server.','bad');for(var i=0;i<all.length;i++)all[i].disabled=false;});});
 // desktop alerts for new red items (works while any mission control page is open in a tab)
 var bell=document.getElementById('mc-bell');
 var on=function(){try{return localStorage.getItem('mc-alerts')==='1'&&!!window.Notification&&Notification.permission==='granted';}catch(_){return false;}};
@@ -3446,8 +3501,19 @@ def _ssh_masters():
         final = re.sub(r"\.[A-Za-z0-9]{16}$", "", path)  # ssh binds a temporary name, then renames it
         if final != path and os.path.exists(final):
             path = final
-        cmd = (rd("/proc/%s/cmdline" % d, "") or "").replace("\0", " ")
-        out.append((path, int(d), _proc_peer_ips(int(d)), cmd))
+        argv = (rd("/proc/%s/cmdline" % d, "") or "").split("\0")
+        own, skip = [], False   # the master's own command, without the jump host it travels through (ProxyCommand/-J)
+        for i, x in enumerate(argv):
+            if skip:
+                skip = False
+                continue
+            if x == "-J" or (x == "-o" and i + 1 < len(argv) and re.match(r"(?i)\s*proxy(command|jump)\b", argv[i + 1])):
+                skip = True
+                continue
+            if re.match(r"(?i)(-o)?\s*proxy(command|jump)\b", x):
+                continue
+            own.append(x)
+        out.append((path, int(d), _proc_peer_ips(int(d)), " ".join(own).strip()))
     # A ProxyJump master talks to its target through a separate `ssh -W [host]:port jump` process over pipes.
     # That process's command names the real target; find it by the pipes the two share (or by parentage).
     def fd_links(pid):
@@ -3482,7 +3548,7 @@ def _ssh_masters():
     for path, pid, ips, cmd in out:
         mine = {x for x in fd_links(pid) if x.startswith("pipe:") or x.startswith("socket:")}
         extra = " ".join(c for pp, links, c in proxies if pp == pid or (links & mine))
-        res.append((path, pid, ips, (cmd + " " + extra).strip()))
+        res.append((path, pid, ips, (cmd + (" ||via|| " + extra if extra else "")).strip()))
     return res
 
 
@@ -3518,7 +3584,8 @@ def cmd_discover(args):
             g = subprocess.run(["ssh", "-G", h], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5).stdout
         except Exception:
             g = ""
-        if excl_rx.search(h) or never_rx.search(g) or h.lower() in excl_words:
+        g_own = "\n".join(ln for ln in g.splitlines() if not re.match(r"(?i)proxy(command|jump)\s", ln))   # a jump host isn't the host
+        if excl_rx.search(h) or never_rx.search(g_own) or h.lower() in excl_words:
             hn_x = next((ln.split(None, 1)[1].strip() for ln in g.splitlines() if ln.lower().startswith("hostname ")), h)
             try:
                 for ai in so.getaddrinfo(hn_x, None):
@@ -3527,8 +3594,10 @@ def cmd_discover(args):
                 pass
             excl_words.append(h.lower())
             excl_rx = word_rx(excl_words)
-    blocked = {path for path, pid, ips, cmd in found if (set(ips) & excl_ips) or excl_rx.search(os.path.basename(path)) or excl_rx.search(cmd)
-               or never_rx.search(os.path.basename(path))}
+    # Judged on the connection itself: a connection that only travels through a never-contact host (its ProxyCommand or
+    # -J) is to another host and is allowed; the never-contact host's own connection is never used.
+    blocked = {path for path, pid, ips, cmd in found if (set(ips) & excl_ips) or excl_rx.search(os.path.basename(path))
+               or excl_rx.search(cmd.split(" ||via|| ")[0]) or never_rx.search(os.path.basename(path))}
     found = [x for x in found if x[0] not in blocked]
     masters = {path: ips for path, pid, ips, cmd in found}
     cmds = {path: cmd for path, pid, ips, cmd in found}
@@ -3581,6 +3650,43 @@ def cmd_discover(args):
         sys.stderr.write("  %s (%s): %s\n" % (a, hn, ("using " + hit) if hit else "no live shared connection found"))
         if hit:
             print("%s=%s" % (a, hit))
+
+
+def cmd_relay_run(path, outdir):
+    """Answer one request handed over from another of your PCs through the shared folder (see relay in mctl): run its
+    script here, or on the node it names through this PC's connections, and write the result for the asker."""
+    import subprocess
+    req = rjson(path, None)
+    rid = str((req or {}).get("id") or "")
+    if not isinstance(req, dict) or not re.match(r"^[0-9]{6,12}-[0-9]{1,12}$", rid):
+        print("relay: ignored %s (not a request)" % os.path.basename(path))
+        return
+    node = str(req.get("node") or "")
+    res = {"id": rid, "rc": 2, "out": "", "err": ""}
+    try:
+        age = time.time() - float(req.get("time") or 0)
+    except (TypeError, ValueError):
+        age = 1e9
+    if age > 180:   # it waited too long in the shared folder: the asker has given up, and the moment has passed
+        res["err"] = "The request reached %s %d s late, so it was not run.\n" % (LOCAL_NAME, age)
+    elif node and not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,60}$", node):
+        res["err"] = "relay: bad node name\n"
+    else:
+        try:
+            script = base64.b64decode(str(req.get("stdin") or ""))
+            cmd = ["bash", os.path.join(MC_DIR, "mctl"), "run-on", node] if node else ["bash", "-s"]
+            p = subprocess.run(cmd, input=script, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=170)
+            res.update(rc=p.returncode, out=p.stdout.decode("utf-8", "replace"), err=p.stderr.decode("utf-8", "replace"))
+        except subprocess.TimeoutExpired:
+            res.update(rc=124, err="timed out on %s\n" % LOCAL_NAME)
+        except (ValueError, OSError) as e:
+            res.update(rc=1, err="relay: %s\n" % e)
+    os.makedirs(outdir, exist_ok=True)
+    tmp = os.path.join(outdir, ".%s.tmp" % rid)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(res, f)
+    os.replace(tmp, os.path.join(outdir, rid + ".json"))
+    print("%s relay %s from %s%s: rc %s" % (time.strftime("%F %T"), rid, req.get("from"), (" for " + node) if node else "", res["rc"]))
 
 
 # ---------------------------------------------------------------- CLI
@@ -3699,8 +3805,11 @@ def main():
     elif a[0] == "goal-info":
         gg = resolve_goal(a[1] if len(a) > 1 else goal_arg)
         print("%s\t%s\t%s" % (gg["node"], gg.get("target") or gg["name"], gg["key"]))
+    elif a[0] == "relay-run":
+        cmd_relay_run(a[1], a[2])
     elif a[0] == "digest-config":
-        cmd_digest_config("--local" in a, a[a.index("--login") + 1] if "--login" in a and a.index("--login") + 1 < len(a) else None)
+        cmd_digest_config("--local" in a, a[a.index("--login") + 1] if "--login" in a and a.index("--login") + 1 < len(a) else None,
+                          "--probe" in a)
     elif a[0] == "amend":
         if len(a) < 2:
             sys.exit("usage: mctl amend [--goal NAME] \"text\"")

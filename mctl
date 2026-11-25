@@ -81,6 +81,30 @@ nested_cmd() {
   printf 'exec ssh -T -o BatchMode=yes -o ProxyCommand=/bin/false -o ControlMaster=no -S "$S" %s %s' "$n" "$cmd"
 }
 NODES="${NODES:-${SAIPH_HOST:-}}"   # SAIPH_HOST: historical name for the first agent node
+# More places to watch (config.env HOSTS): "name" is an ssh alias with a shared connection on this PC, "name@jump" a
+# machine reached from host jump (the way the compute nodes are reached from Rockfish), "/15" checks it every 15 minutes.
+# These are optional: one that is offline (e.g. its VPN is down) shows as offline, without alarms.
+EXTRA_NODES=""
+hkey() { echo "$1" | tr -c 'A-Za-z0-9_\n' '_'; }
+parse_hosts() {
+  local h n e j
+  EXTRA_NODES=""
+  for h in ${HOSTS:-}; do
+    n="${h%%/*}"; e=""; [ "$n" != "$h" ] && e="${h#*/}"
+    j=""; case "$n" in *@*) j="${n#*@}"; n="${n%%@*}" ;; esac
+    [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,60}$ ]] || continue
+    is_never "$n" && continue
+    EXTRA_NODES="$EXTRA_NODES $n"
+    printf -v "ROUTE_$(hkey "$n")" '%s' "$([ -n "$j" ] && echo "via:$j" || echo direct)"
+    [[ "$e" =~ ^[0-9]+$ ]] && printf -v "EVERY_$(hkey "$n")" '%s' "$e"
+  done
+  return 0
+}
+parse_hosts
+host_every() { local v; v="EVERY_$(hkey "$1")"; echo "${!v:-0}"; }
+# Your other PCs (each publishes its own tmux sessions to state/pcs/ in the shared folder)
+pc_names() { local f; for f in "$STATE"/pcs/*.json; do [ -f "$f" ] && basename "$f" .json; done; }
+is_pc() { [ -f "$STATE/pcs/$1.json" ] && [ "$1" != "$(echo "$MC_HOST" | tr 'A-Z' 'a-z')" ]; }
 node_route() {  # nested (through Rockfish), direct (own ssh alias), or local (this WSL)
   local n="$1" v
   v="ROUTE_$(echo "$n" | tr -c 'A-Za-z0-9_\n' '_')"
@@ -89,26 +113,69 @@ node_route() {  # nested (through Rockfish), direct (own ssh alias), or local (t
   else echo nested; fi
 }
 run_node() {  # run_node NODE cmd...   (stdin passes through to the command on the node)
-  local n="$1"; shift
+  local n="$1" vr; shift
   case "$n" in  # agents on a login node or on this PC (found automatically)
     rockfish-login) rssh "$RF_HOST" "$@"; return ;;
     skipjack-login) rssh "$SJ_HOST" "$@"; return ;;
     "$(echo "$MC_HOST" | tr 'A-Z' 'a-z')") timeout 170 "$@"; return ;;
   esac
+  if is_pc "$n"; then relay "$n" "$@"; return; fi
   if [ -n "${NODE_CP[$n]:-}" ]; then  # the connection script keeps its own connection to this node (e.g. via ProxyJump)
     timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" -o "ControlPath=${NODE_CP[$n]//%/%%}" -o ControlMaster=no "$n" "$@"
     return
   fi
   case "$(node_route "$n")" in
     local) timeout 170 "$@" ;;
-    direct) has_master "$n" || { no_master "$n"; return 255; }
+    direct) if ! has_master "$n"; then via_collector "$@"; vr=$?; [ $vr -eq 199 ] || return $vr; no_master "$n"; return 255; fi
             hopts "$n"; timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" "${HOPTS[@]}" "$n" "$@" ;;
-    *) has_master "$RF_HOST" || { no_master "$RF_HOST"; return 255; }
+    via:*) local j="$(node_route "$n")"; j="${j#via:}"
+           if ! has_master "$j"; then via_collector "$@"; vr=$?; [ $vr -eq 199 ] || return $vr; no_master "$j"; return 255; fi
+           hopts "$j"; timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" "${HOPTS[@]}" "$j" "$(nested_cmd "$n" "$@")" ;;
+    *) if ! has_master "$RF_HOST"; then via_collector "$@"; vr=$?; [ $vr -eq 199 ] || return $vr; no_master "$RF_HOST"; return 255; fi
        hopts "$RF_HOST"
        timeout 170 ssh "${SSHO[@]}" "${NOLOGIN[@]}" "${HOPTS[@]}" "$RF_HOST" "$(nested_cmd "$n" "$@")" ;;
   esac
 }
 run_saiph() { run_node "${SAIPH_HOST:-${NODES%% *}}" "$@"; }
+
+# A message, key press or new session asked for on a machine without the needed connection (a laptop dashboard, your
+# phone through it): hand it to the machine that is collecting, through the shared folder. Only scripts (bash -s) go.
+RELAYING=""
+via_collector() {
+  [ "$*" = "bash -s" ] && [ -z "$RELAYING" ] || return 199   # 199: not handed over (any other code is the script's own)
+  active_elsewhere || return 199
+  RELAYING=1 relay "$(echo "$ACTIVE_HOST" | tr 'A-Z' 'a-z')" "$@" "$n"   # n: the caller's node
+}
+relay() {  # relay PC bash -s [node]: run a script on another of your PCs through the shared folder (stdin is the script)
+  local pc="$1" id inp t0 rc tgt="${4:-}"
+  shift
+  [ "$1 $2" = "bash -s" ] || { echo "relay: only scripts can be handed over" >&2; return 2; }
+  id="$(date +%s)-$RANDOM$RANDOM"; inp=$(base64 -w0)
+  mkdir -p "$STATE/inbox/$pc" "$STATE/outbox" || return 1
+  printf '{"id": "%s", "from": "%s", "time": %s, "node": "%s", "stdin": "%s"}\n' "$id" "$MC_HOST" "$(date +%s)" "$tgt" "$inp" > "$STATE/inbox/$pc/$id.tmp" \
+    && mv "$STATE/inbox/$pc/$id.tmp" "$STATE/inbox/$pc/$id.json" || return 1
+  t0=$SECONDS
+  while [ $((SECONDS - t0)) -lt "${RELAY_WAIT:-150}" ]; do
+    if [ -f "$STATE/outbox/$id.json" ]; then
+      $PY -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.stdout.write(r.get("out","")); sys.stderr.write(r.get("err","")); sys.exit(int(r.get("rc",1)))' "$STATE/outbox/$id.json"
+      rc=$?; rm -f "$STATE/outbox/$id.json"; return $rc
+    fi
+    sleep 2
+  done
+  rm -f "$STATE/inbox/$pc/$id.json"
+  echo "$pc didn't answer within $((SECONDS - t0)) s through the shared folder (asleep, offline, or OneDrive hasn't synced yet)." >&2
+  return 124
+}
+# Requests from your other machines (see relay): run each script, on this PC or on the node it names, and answer.
+serve_inbox() {
+  local me f
+  me=$(echo "$MC_HOST" | tr 'A-Z' 'a-z')
+  for f in "$STATE/inbox/$me"/*.json; do
+    [ -f "$f" ] || continue
+    $PY "$MC_DIR/lib/mc.py" relay-run "$f" "$STATE/outbox" >> "$ARCHIVE/relay.log" 2>&1
+    rm -f "$f"
+  done
+}
 
 c48_script() {  # the script behind your CONNECT_CMD alias, read for socket locations (never run)
   local t
@@ -127,7 +194,7 @@ discover() {
   local out k v log="${1:-/dev/null}" c48 n
   RF_CP=""; SJ_CP=""; SC_CP=""; NODE_CP=()
   c48=$(c48_script)
-  out=$($PY "$MC_DIR/lib/mc.py" discover "${c48:--}" ${RF_HOST:-} ${SJ_HOST:-} ${SCYTHE_HOST:-} --nodes $NODES 2>> "$log")
+  out=$($PY "$MC_DIR/lib/mc.py" discover "${c48:--}" ${RF_HOST:-} ${SJ_HOST:-} ${SCYTHE_HOST:-} --nodes $NODES $EXTRA_NODES 2>> "$log")
   while IFS='=' read -r k v; do
     [ -z "$k" ] && continue
     case "$k" in
@@ -135,7 +202,7 @@ discover() {
       "${SJ_HOST:-#}") SJ_CP="$v" ;;
       "${SCYTHE_HOST:-#}") SC_CP="$v" ;;
     esac
-    for n in $NODES; do [ "$k" = "$n" ] && NODE_CP[$n]="$v"; done
+    for n in $NODES $EXTRA_NODES; do [ "$k" = "$n" ] && NODE_CP[$n]="$v"; done
   done <<< "$out"
   {
     echo "connection script: ${c48:-not found}"
@@ -226,7 +293,7 @@ collect() {
   : > "$dir/status"
   # Agent nodes: the configured ones plus any node your connection script keeps a shared connection to on the Rockfish
   # login node (found last cycle, private address, ssh answering). New tmux sessions need no configuration.
-  local n an nested="" probe=""
+  local n an nested="" probe="" every rc
   if [ "${AUTO_NODES:-1}" = 1 ]; then
     for an in $(cat "$STATE/auto_nodes" 2>/dev/null); do
       case " $NODES " in *" $an "*) ;; *) NODES="$NODES $an" ;; esac
@@ -236,12 +303,19 @@ collect() {
   discover "$dir/conn.txt"
   cfg=$($PY "$MC_DIR/lib/mc.py" digest-config) || cfg=""
   for an in $probe; do case " $NODES " in *" $an "*) ;; *) nested="$nested $an" ;; esac; done
-  for n in $NODES; do
+  for n in $NODES $EXTRA_NODES; do
     [ "$(node_route "$n")" = nested ] && nested="$nested $n"
+    every=$(host_every "$n")
+    if [ "$every" -gt 0 ] && [ -s "$LATEST/node_$n.json" ] && [ -f "$STATE/last_$n" ] \
+       && [ $(( $(date +%s) - $(cat "$STATE/last_$n" 2> /dev/null || echo 0) )) -lt $(( every * 60 - 45 )) ]; then
+      cp "$LATEST/node_$n.json" "$dir/node_$n.json"; : > "$dir/node_$n.err"   # checked less often: keep its last reading
+      echo "node:$n 0 0" >> "$dir/status"; continue
+    fi
     (
       t=$SECONDS
       run_node "$n" python3 - "$cfg" < "$MC_DIR/lib/remote_digest.py" > "$dir/node_$n.json" 2> "$dir/node_$n.err"
-      echo "node:$n $? $((SECONDS - t))" >> "$dir/status"
+      rc=$?; [ $rc -eq 0 ] && date +%s > "$STATE/last_$n"
+      echo "node:$n $rc $((SECONDS - t))" >> "$dir/status"
     ) &
   done
   if [ -n "${RF_HOST:-}" ]; then
@@ -356,6 +430,7 @@ referee() {  # referee [goal]   (no goal: every goal)
 nap() {
   local end=$((SECONDS + $1))
   while [ $SECONDS -lt $end ]; do
+    serve_inbox
     if [ -f "$ARCHIVE/collect.now" ]; then
       rm -f "$ARCHIVE/collect.now"
       log "collecting now: asked from a page" >> "$ARCHIVE/loop.log"
@@ -363,6 +438,18 @@ nap() {
     fi
     sleep 5
   done
+}
+
+# A machine that stands by still shows its own tmux sessions: it reads them locally (no network) and leaves the
+# result in the shared folder for the collecting machine to include.
+publish_pc() {
+  [ "${PUBLISH_PC:-1}" = 1 ] || return 0
+  local me lcfg
+  me=$(echo "$MC_HOST" | tr 'A-Z' 'a-z')
+  mkdir -p "$STATE/pcs" || return 0
+  lcfg=$($PY "$MC_DIR/lib/mc.py" digest-config --local --probe) || return 0
+  timeout 240 $PY "$MC_DIR/lib/remote_digest.py" "$lcfg" > "$STATE/pcs/.$me.tmp" 2> /dev/null && mv "$STATE/pcs/.$me.tmp" "$STATE/pcs/$me.json"
+  rm -f "$STATE/pcs/.$me.tmp"
 }
 
 loop() {
@@ -375,18 +462,18 @@ loop() {
       log "mctl was updated; restarting the collector with the new version" >> "$ARCHIVE/loop.log"
       exec bash "$MC_DIR/mctl" loop
     fi
-    load_cfg
+    load_cfg; parse_hosts
     ensure_server
     if active_elsewhere; then
       log "standby: $ACTIVE_HOST is collecting" >> "$ARCHIVE/loop.log"
-      sleep $(( ${INTERVAL_MIN:-5} * 60 )); continue
+      publish_pc; nap $(( ${INTERVAL_MIN:-5} * 60 )); continue
     fi
     if [ "$(echo "${PRIMARY_HOST:-}" | tr 'A-Z' 'a-z')" != "$(echo "$MC_HOST" | tr 'A-Z' 'a-z')" ]; then
       discover /dev/null
       if [ -z "$RF_CP$SJ_CP$SC_CP" ] && [ "${#NODE_CP[@]}" -eq 0 ]; then
         # no shared connections on this machine: keep the other machine's last dashboard rather than an all-red one
         log "standby: ${PRIMARY_HOST:-the primary} is quiet but this machine has no shared connections (run $C48 here to take over)" >> "$ARCHIVE/loop.log"
-        sleep $(( ${INTERVAL_MIN:-5} * 60 )); continue
+        publish_pc; nap $(( ${INTERVAL_MIN:-5} * 60 )); continue
       fi
     fi
     run_once >> "$ARCHIVE/loop.log" 2>&1
@@ -537,12 +624,20 @@ send_msg() {  # mctl send [--goal NAME] [--force] [--file F | "message"]: type a
   discover /dev/null
   # The message travels base64-encoded on stdin and is pasted as one block (bracketed paste, so line
   # breaks don't submit early), then Enter is pressed: the same as typing it in the agent's terminal.
-  script=$(printf 'P=%q; F=%q; B=%q\n' "$pane" "$force" "$b64"; cat <<'EOS'
+  script=$(printf 'P=%q; F=%q; B=%q; Q=%q\n' "$pane" "$force" "$b64" "$(base64 -w0 < "$MC_DIR/lib/question.py")"; cat <<'EOS'
 f=$(mktemp) || exit 1
 printf '%s' "$B" | base64 -d > "$f"
 scr=$(tmux capture-pane -p -J -t "$P" -S -25 2> /dev/null) || { rm -f "$f"; echo "tmux pane $P not found on $(hostname -s)" >&2; exit 4; }
-if [ "$F" != 1 ] && printf '%s\n' "$scr" | tail -n 25 | grep -v 'esc to interrupt' | grep -Eiq 'Allow (this|command)|Approve|approval|Do you want to|\[y/N\]|\(y/n\)|Press enter to continue|waiting for (your )?(input|approval)|Run this command\?|Proceed\?'; then
-  rm -f "$f"; echo "---screen---"; printf '%s\n' "$scr" | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'; exit 3
+if [ "$F" != 1 ]; then
+  # A question or approval prompt on the screen? (lib/question.py: the bottom of the screen, the agent's own words skipped)
+  qj=$(printf '%s\n' "$scr" | python3 -c "$(printf '%s' "$Q" | base64 -d)" check 2> /dev/null); qrc=$?
+  if [ $qrc -ne 0 ] && [ $qrc -ne 3 ]; then   # no python3 here: a narrower check on the last lines
+    printf '%s\n' "$scr" | awk 'NF' | tail -n 8 | grep -Eiq '\[y/N\]|\[Y/n\]|\(y/n\)|Do you want to proceed|Would you like to (run|make|apply)|Press enter to (confirm|continue)' && qrc=3
+  fi
+  if [ $qrc -eq 3 ]; then
+    rm -f "$f"; echo "---question---"; printf '%s\n' "$qj"
+    echo "---screen---"; printf '%s\n' "$scr" | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'; exit 3
+  fi
 fi
 tmux load-buffer -b mc-send "$f" && tmux paste-buffer -p -d -b mc-send -t "$P" && sleep 0.7 && tmux send-keys -t "$P" Enter
 rc=$?; rm -f "$f"
@@ -572,8 +667,8 @@ launch() {  # mctl launch --name N [--host H] [--dir D] [--agent codex|claude] [
   done
   [ -z "$host" ] && host="${SAIPH_HOST:-${NODES%% *}}"
   ok=0
-  for a in $NODES $(cat "$STATE/auto_nodes" 2> /dev/null); do [ "$a" = "$host" ] && ok=1; done
-  { [ "$ok" = 1 ] && ! is_never "$host"; } || { echo "Sessions can only be started on your compute nodes ($NODES)." >&2; return 2; }
+  for a in $NODES $EXTRA_NODES $(cat "$STATE/auto_nodes" 2> /dev/null) $(pc_names) "$(echo "$MC_HOST" | tr 'A-Z' 'a-z')"; do [ "$a" = "$host" ] && ok=1; done
+  { [ "$ok" = 1 ] && ! is_never "$host"; } || { echo "Sessions can only be started on hosts mission control watches." >&2; return 2; }
   [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,59}$ ]] || { echo "Use a name of letters, digits, - and _ (up to 60)." >&2; return 2; }
   [[ "$agent" =~ ^(codex|claude)$ ]] || { echo "The agent is codex or claude." >&2; return 2; }
   local re_model='^[]A-Za-z0-9._:[-]{0,80}$' re_word='^(codex([_-][A-Za-z0-9_-]{1,30})?)?$' re_dir='^(/|~/)[A-Za-z0-9._/+@%,=~-]{1,400}$'
@@ -671,6 +766,30 @@ press_key() {  # mctl key --goal NAME esc
     | run_node "$node" bash -s
 }
 
+# Answer a question or approval prompt on the agent's screen with one of the answers shown there (the dashboard's answer
+# buttons). The screen is read again first: if the question changed since the page showed it, nothing is pressed.
+answer_q() {  # mctl answer --goal NAME --choice N|y|n|enter --sig SIG
+  local goal="" choice="" sig="" info node pane key notmux
+  while [ $# -gt 0 ]; do
+    case "$1" in --goal) goal="${2:-}"; shift 2 ;; --choice) choice="${2:-}"; shift 2 ;; --sig) sig="${2:-}"; shift 2 ;; *) shift ;; esac
+  done
+  [[ "$choice" =~ ^([0-9]{1,2}|y|n|enter)$ ]] && [[ "$sig" =~ ^[0-9a-f]{10}$ ]] \
+    || { echo "usage: mctl answer --goal NAME --choice N|y|n|enter --sig SIG (the dashboard's answer buttons fill these in)" >&2; return 2; }
+  info=$($PY "$MC_DIR/lib/mc.py" send-target ${goal:+"$goal"}) || return 1
+  IFS=$'\t' read -r node pane key notmux <<< "$info"
+  [ "$notmux" = 1 ] && { echo "$key runs outside tmux, so mission control can't type into it." >&2; return 5; }
+  discover /dev/null
+  { printf 'P=%q; C=%q; G=%q; Q=%q\n' "$pane" "$choice" "$sig" "$(base64 -w0 < "$MC_DIR/lib/question.py")"; cat <<'EOS'
+scr=$(tmux capture-pane -p -J -t "$P" -S -25 2> /dev/null) || { echo "tmux pane $P not found on $(hostname -s)" >&2; exit 4; }
+k=$(printf '%s\n' "$scr" | python3 -c "$(printf '%s' "$Q" | base64 -d)" keys "$C" "$G") || exit 3
+for x in $k; do tmux send-keys -t "$P" "$x" || exit 4; sleep 0.3; done
+sleep 2
+echo "---screen---"
+tmux capture-pane -p -J -t "$P" -S -30 | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'
+EOS
+  } | run_node "$node" bash -s
+}
+
 # End a session: closes its tmux session (all terminals of its group), which stops the agent. Its conversation stays in
 # the agent's own logs (codex resume / claude --resume can pick it up again).
 end_session() {  # mctl end --goal NAME --confirm NAME
@@ -744,6 +863,41 @@ server_url() {  # prints http://localhost:PORT/dashboard.html if this machine's 
   return 1
 }
 
+hosts_cmd() {  # mctl hosts [add NAME[@JUMP][/MIN] | remove NAME]
+  local mode="${1:-}" spec="${2:-}" cur n x
+  if [ "$mode" = add ] || [ "$mode" = remove ]; then
+    [ -n "$spec" ] || { echo "usage: mctl hosts add NAME[@JUMP][/MINUTES]   |   mctl hosts remove NAME" >&2; return 2; }
+    n="${spec%%[@/]*}"
+    [[ "$spec" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,60}(@[A-Za-z0-9][A-Za-z0-9._-]{0,60})?(/[0-9]{1,4})?$ ]] \
+      || { echo "Write it as NAME, NAME@JUMP, and optionally /MINUTES (e.g. myserver, node12@gateway, bigbox/15)." >&2; return 2; }
+    is_never "$n" && { echo "$n is on your NEVER_CONTACT list in config.env; remove it there first if you really want it watched." >&2; return 2; }
+    cur=""
+    for x in ${HOSTS:-}; do [ "${x%%[@/]*}" = "$n" ] || cur="$cur $x"; done
+    [ "$mode" = add ] && cur="$cur $spec"
+    cur=$(echo $cur)
+    if grep -q '^HOSTS=' "$MC_DIR/config.env"; then
+      sed -i "s|^HOSTS=.*|HOSTS=\"$cur\"   # more machines to watch: mctl hosts add / remove|" "$MC_DIR/config.env"
+    else
+      printf '\nHOSTS="%s"   # more machines to watch: mctl hosts add / remove\n' "$cur" >> "$MC_DIR/config.env"
+    fi
+    HOSTS="$cur"; parse_hosts
+    echo "Watching as well: ${cur:-nothing}. The collector picks this up on its next cycle."
+    return 0
+  fi
+  echo "Compute nodes:   ${NODES:-none}$( [ -s "$STATE/auto_nodes" ] && echo " (found automatically: $(tr '\n' ' ' < "$STATE/auto_nodes"))")"
+  echo "More hosts:      ${HOSTS:-none}"
+  for n in $EXTRA_NODES; do
+    x=$(grep -E "^node:$n " "$LATEST/status" 2> /dev/null | awk '{print ($2 == 0) ? "ok" : "offline"}')
+    echo "  $n: $(node_route "$n")$( [ "$(host_every "$n")" -gt 0 ] && echo ", every $(host_every "$n") min"), ${x:-not checked yet}"
+  done
+  echo "Your PCs:        $(echo "$MC_HOST" | tr 'A-Z' 'a-z') (this one)$(for x in $(pc_names); do is_pc "$x" && printf ', %s' "$x"; done)"
+  echo "Never contacted: ${NEVER_CONTACT:-nothing}"
+  if [ -f "$LATEST/conn.txt" ]; then
+    echo "Live shared connections on the collecting PC (any of these can be added):"
+    grep -E '^  /.*\.sock ->' "$LATEST/conn.txt" | sed -E 's|^  .*/([^/ ]+) -> (.*)$|  \1  (\2)|'
+  fi
+}
+
 set_hidden() {  # set_hidden add|remove NAME...   (config.env is shared, so this applies on every machine)
   local mode="$1" cur n k known
   shift
@@ -783,6 +937,8 @@ Commands that act on one goal take --goal NAME (or a unique prefix) when several
   mctl run             collect now and refresh the dashboard
   mctl goals           list the goals mission control sees
   mctl send [--goal G] "text"   type a message into an agent's tmux pane and press Enter (same as the Send box)
+  mctl answer --goal G --choice N --sig S   pick answer N of the question on the agent's screen (the answer buttons)
+  mctl hosts [add|remove NAME]  more machines to watch (HOSTS in config.env) and the connections you could add
   mctl phone           use the dashboard (and chat) from your phone, privately over Tailscale
   mctl hide [NAME...]  hide blocks on every machine (no NAME: list them); mctl unhide NAME... brings them back.
                        To hide something in one browser only, hover over it and click its x.
@@ -831,7 +987,10 @@ case "$cmd" in
   peek) peek "$@" ;;
   send) send_msg "$@" ;;
   launch) launch "$@" ;;
+  hosts) hosts_cmd "$@" ;;
+  run-on) RELAYING=1; discover /dev/null < /dev/null; run_node "${1:?node}" bash -s ;;   # for relayed requests: run the script (stdin) on that node
   key) press_key "$@" ;;
+  answer) answer_q "$@" ;;
   end) end_session "$@" ;;
   phone) phone ;;
   serve) MC_ARCHIVE_DIR="$ARCHIVE" MC_PORT="${WEB_PORT:-8765}" exec $PY "$MC_DIR/lib/server.py" ;;

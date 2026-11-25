@@ -67,7 +67,9 @@ presses Enter, then shows the agent's screen a few seconds later. It works for C
   from the shared folder is read-only.
 - It goes through the machine's own shared connections, so a machine without them can't send.
 - If the agent's screen shows an approval or y/n question, it holds the message (typing could answer
-  the question) and offers "Send anyway".
+  the question), shows the question with its answers as buttons, and offers "Send anyway". Only the
+  bottom of the screen counts and the agent's own words are skipped, so "approved" in something the
+  agent wrote doesn't hold your message.
 - From WSL: `mctl send --goal NAME "please continue"`. Every message sent is logged in
   ~/.local/state/mission-control/sent.log on that machine.
 - Safety: the page server listens only on this machine and every send needs a secret key that only its
@@ -92,6 +94,15 @@ Click **+ New session** in the top bar (on the dashboard opened with `mctl`, or 
   node, starts the agent, waits until it is ready and types your first message. If the agent asks something
   first (trusting a new folder, signing in, an update), its screen shows in the dialog and you answer there.
 - From WSL: `mctl launch --name NAME --agent codex --cmd codex_chat --model gpt-6.2-astra --effort high --check`
+
+## Answer the agent's questions
+
+When an agent asks something (Codex or Claude approval prompts, a numbered menu, a y/n question), the
+session's "Needs you" card shows the question and one button per answer. Pressing one (and confirming)
+types that answer into the session: the arrow keys to the option, then Enter. The screen is read again
+first, so if the question changed in the meantime nothing is pressed. Questions that need a typed answer:
+write it in the message box and use "Send anyway". From WSL: `mctl answer --goal NAME --choice 2 --sig SIG`
+(the page fills in the question's signature).
 
 ## Session buttons
 
@@ -138,6 +149,24 @@ when you start a new tmux session.
 - To watch only some sessions, set `GOALS="MY_GOAL OTHER"` instead of `auto`.
   `LOGIN_DIGESTS=0` and `AUTO_NODES=0` turn off the login-node and auto-node searches.
 - If a node goes down, its goals stay on the overview as "node unreachable" until it's back.
+
+## More machines: other servers, HPC nodes, your PCs
+
+`HOSTS` in config.env adds machines to watch, the same way as the Rockfish nodes:
+- `HOSTS="myserver"`: an ssh alias your connection script keeps a shared connection to on this PC.
+- `HOSTS="node12@gateway"`: a machine reached from another host (here `gateway`) through the shared
+  connection your script left there, the way the Rockfish nodes are reached from the login node.
+- `/15` after a name checks it only every 15 minutes, e.g. `HOSTS="myserver/15 node12@gateway"`.
+- These are optional: one that is offline (say its VPN is down) just doesn't show, with no alarms.
+- `mctl hosts` lists what is watched and the live shared connections you could add;
+  `mctl hosts add NAME` and `mctl hosts remove NAME` edit `HOSTS` for every machine.
+- Your other PCs: a PC that stands by (not collecting) publishes its own WSL sessions to the shared folder
+  (`state/pcs/`), so your laptops' sessions show up on the dashboard too, and you can message,
+  answer, interrupt and start sessions on them. Those requests travel through the shared folder
+  (`state/inbox/` and `state/outbox/`) and the other PC runs them within a few seconds of OneDrive syncing.
+  The same route lets a laptop's dashboard act through the PC that has the connections.
+  `PUBLISH_PC=0` in a machine's config turns publishing off.
+- New session lists every watched host with its own accounts, models and starting folder.
 - Hide anything you don't need: hover over a block and click its x (that browser only; the
   "Hidden here" bar at the top brings it back). `mctl hide` lists the block names, and
   `mctl hide screen watchdog` or `mctl hide "codex in my-folder"` hides them on every machine;

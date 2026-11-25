@@ -253,10 +253,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
             return {"ok": False, "message": "Unknown session."}
         if path == "/api/key":
-            rc, out, err = self._mctl(["key", "--goal", key, "esc"], timeout=60)
+            rc, out, err = self._mctl(["key", "--goal", key, "esc"], timeout=180)
             self._log({"key": key, "press": "esc", "rc": rc})
+        elif path == "/api/answer":
+            choice, sig = str(req.get("choice") or ""), str(req.get("sig") or "")
+            if not re.match(r"^([0-9]{1,2}|y|n|enter)$", choice) or not re.match(r"^[0-9a-f]{10}$", sig):
+                return {"ok": False, "message": "That answer isn't one the page offered."}
+            rc, out, err = self._mctl(["answer", "--goal", key, "--choice", choice, "--sig", sig], timeout=180)
+            self._log({"key": key, "answer": choice, "rc": rc})
+            screen = out.split("---screen---", 1)[1].strip("\n") if "---screen---" in out else ""
+            if rc == 0:
+                return {"ok": True, "message": "Answered. The page shows the change on its next update.", "screen": screen}
+            msg = (err.strip().splitlines() or [""])[-1] or "Couldn't answer."
+            return {"ok": False, "message": msg if rc != 124 else "The session didn't answer in time.", "screen": screen}
         else:
-            rc, out, err = self._mctl(["end", "--goal", key, "--confirm", str(req.get("confirm") or "")], timeout=60)
+            rc, out, err = self._mctl(["end", "--goal", key, "--confirm", str(req.get("confirm") or "")], timeout=180)
             self._log({"key": key, "end": True, "rc": rc})
         screen = out.split("---screen---", 1)[1].strip("\n") if "---screen---" in out else ""
         msg = (err.strip().splitlines() or [""])[-1] or (out.strip().splitlines() or [""])[0]
@@ -285,7 +296,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path not in ("/api/send", "/api/collect", "/api/launch", "/api/key", "/api/end"):
+        if path not in ("/api/send", "/api/collect", "/api/launch", "/api/key", "/api/end", "/api/answer"):
             return self._reply(404, "not found", "text/plain")
         origin = self.headers.get("Origin", "").lower()
         if (self.headers.get("Host", "").lower() not in self._allowed_hosts() or not self._remote_ok()
@@ -301,7 +312,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "message": "Bad request."})
         if path == "/api/launch":
             return self._json(200, self._launch(req))
-        if path in ("/api/key", "/api/end"):
+        if path in ("/api/key", "/api/end", "/api/answer"):
             return self._json(200, self._session_action(path, req))
         key, text, force = str(req.get("key") or ""), str(req.get("text") or ""), bool(req.get("force"))
         if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
@@ -315,7 +326,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tmp = f.name
         try:
             cmd = ["bash", os.path.join(MC_DIR, "mctl"), "send", "--goal", key, "--file", tmp] + (["--force"] if force else [])
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=200)
             rc, out, err = p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
             rc, out, err = 124, "", "timed out reaching the session"
@@ -330,9 +341,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if rc == 0:
             return self._json(200, {"ok": True, "screen": screen})
         msg = (err.strip().splitlines() or [""])[-1] or (out.strip().splitlines() or ["failed"])[0]
+        question = None
         if rc == 3:
-            msg = "The agent's screen shows a question or approval prompt, so typing now could answer it. Answer it in the terminal, or send anyway."
-        return self._json(200, {"ok": False, "code": rc, "message": msg, "screen": screen})
+            try:
+                question = json.loads(out.split("---question---", 1)[1].split("---screen---", 1)[0].strip() or "null")
+            except (IndexError, ValueError):
+                question = None
+            msg = ("The agent is asking something, so typing now could answer it. Pick an answer here first, or send your message anyway:"
+                   if question and question.get("options") else
+                   "The agent's screen shows a question, so your message would be taken as the answer. If it is the answer, send it anyway:")
+        return self._json(200, {"ok": False, "code": rc, "message": msg, "screen": screen, "question": question})
 
 
 def main():
