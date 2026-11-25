@@ -1536,9 +1536,8 @@ def analyze_goal(gdesc, shared):
                 flags.add("param-mixed:%s" % k, "amber", "integrity",
                           "%s has %d different values in recent inputs" % (k, len(row["values"])),
                           ", ".join("%s \u00d7%d" % (x["v"], x["n"]) for x in row["values"][:4]),
-                          "If only one value is valid, lock it.",
-                          acts=[{"label": "Lock to %s" % row["values"][0]["v"], "op": "set", "name": k, "rule_op": "==", "val": row["values"][0]["v"],
-                                 "confirm": "Lock %s to %s? Other values then break the contract." % (k, row["values"][0]["v"])}])
+                          "Pick what's valid: one value, any of these, a bound, or your own rule.",
+                          acts=lock_acts(k, [x["v"] for x in row["values"]]))
     changes = []
     for s in sessions:
         for p in s.get("patches", []):
@@ -1833,10 +1832,9 @@ def contract_card_html(s):
                 acts.append({"label": "Unlock", "op": "unlock", "name": row["name"], "danger": True,
                              "confirm": "Unlock %s (now %s %s)? Changes are still shown, but no value breaks the contract." % (row["name"], r["op"], r["val"])})
             elif row["values"]:
-                acts.append({"label": "Lock to %s" % row["values"][0]["v"], "op": "set", "name": row["name"], "rule_op": "==", "val": row["values"][0]["v"],
-                             "confirm": "Lock %s to %s?" % (row["name"], row["values"][0]["v"])})
-            src = ('<div class="small mut">%s</div>' % esc(r["tag"])) if r.get("auto") and r.get("tag") else ""
-            o.append('<tr><td class=mono>%s</td><td class=mut>%s%s</td><td>%s</td><td class="cacts" data-ckey="%s">%s</td></tr>' % (
+                acts = lock_acts(row["name"], [x["v"] for x in row["values"]], cls_form=False)
+            src = ('<div class="small mut" title="%s">%s</div>' % (esc(r["tag"]), esc(r["tag"].split(":")[0]))) if r.get("auto") and r.get("tag") else ""
+            o.append('<tr><td class=mono>%s</td><td class=mut>%s%s</td><td>%s</td><td><div class="cacts tight" data-ckey="%s">%s<div class="actmsg"></div></div></td></tr>' % (
                 esc(row["name"]), esc(row["rule"]), src, vals, esc(k), "".join(act_btn(a, "btn2 sm") for a in acts)))
         o.append("</table></div>")
     o.append('<div class="cform" data-ckey="%s"><span class="small mut">Add a rule</span>'
@@ -3082,7 +3080,8 @@ border:1px solid var(--line);border-radius:8px;padding:6px 8px}
 .qa{margin-top:10px}.qa .qctx{font-size:12px;color:var(--mut);overflow-wrap:anywhere;margin:2px 0}
 .qbtns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.qbtns .btn2{text-align:left;white-space:normal;max-width:100%;border-radius:12px}
 .qa .actmsg{text-align:left;margin-top:6px}.qa .sendscr{margin-top:8px}
-.cacts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}td.cacts{margin:0;display:table-cell;white-space:nowrap}
+.cacts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.cacts.tight{margin:0;min-width:120px}
+.cacts .cform{margin:0;display:inline-flex;gap:6px;flex-wrap:wrap}.cacts .cform input[name=val]{width:100px}
 .cacts .actmsg,.cform .actmsg{flex-basis:100%;text-align:left}.btn2.sm{padding:3px 10px;font-size:12px}
 .cform{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.cform input,.cform select{background:var(--chatbg,#0a0c11);color:inherit;
 border:1px solid var(--line,#2a3142);border-radius:8px;padding:4px 8px;font:inherit;font-size:13px;min-width:0}.cform input[name=name]{width:110px}
@@ -3142,10 +3141,44 @@ def act_btn(a, cls="btn2"):
     return '<button type="button" class="%s%s"%s>%s</button>' % (cls, " dng" if a.get("danger") else "", attrs, esc(a["label"]))
 
 
+def lock_acts(name, values, cls_form=True):
+    """Ways to lock a setting seen with these values: one of them, any of them, a bound (for settings where more is more
+    accurate, e.g. ENCUT at least the smallest), or a rule of your own (the small form)."""
+    vals = [str(v) for v in values][:5]
+    acts = [{"label": "Only %s" % v, "op": "set", "name": name, "rule_op": "==", "val": v,
+             "confirm": "Lock %s to %s? Other values then break the contract." % (name, v)} for v in vals]
+    if len(vals) > 1:
+        acts.append({"label": "Any of these %d" % len(vals), "op": "set", "name": name, "rule_op": "in", "val": "|".join(vals),
+                     "confirm": "Allow %s to be %s, and nothing else?" % (name, " or ".join(vals))})
+    nums = [num(v) for v in vals]
+    op = IMPLICIT_OPS.get(name)
+    if op and nums and all(x is not None for x in nums):
+        if op == ">=":
+            b, word = min(nums), "At least"
+        elif op == "abs<=":
+            b, word = max(abs(x) for x in nums), "At most |x|"
+        else:
+            b, word = max(nums), "At most"
+        acts.append({"label": "%s %g" % (word, b), "op": "set", "name": name, "rule_op": op, "val": "%g" % b,
+                     "confirm": "Lock %s to %s %g (the more accurate side stays allowed)?" % (name, op, b)})
+    if cls_form:
+        acts.append({"form": True, "name": name})
+    return acts
+
+
 def acts_html(acts, gkey):
     if not acts:
         return ""
-    return '<div class="cacts" data-ckey="%s">%s<div class="actmsg"></div></div>' % (esc(gkey), "".join(act_btn(a) for a in acts))
+    btns = []
+    for a in acts:
+        if a.get("form"):   # a rule of your own for this setting
+            btns.append('<span class="cform"><input type="hidden" name="name" value="%s"><select name="rule_op"><option>==</option>'
+                        '<option>&gt;=</option><option>&lt;=</option><option value="in">in (A|B)</option></select>'
+                        '<input name="val" placeholder="other value" maxlength="80"><button type="button" class="btn2" data-cop="set">Set</button></span>'
+                        % esc(a["name"]))
+        else:
+            btns.append(act_btn(a))
+    return '<div class="cacts" data-ckey="%s">%s<div class="actmsg"></div></div>' % (esc(gkey), "".join(btns))
 
 
 def flag_html(f):
@@ -3422,7 +3455,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  var q=b.getAttribute('data-cconfirm');if(form&&body.op==='set')q='Add the rule '+body.name.toUpperCase()+' '+body.rule_op+' '+body.val+'?';
  if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say('Saving\u2026','');
  post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
-  if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)ins2[i].value='';}})
+  if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)if(ins2[i].type!=='hidden')ins2[i].value='';}})
  .catch(function(){window.MC_BUSY=false;b.disabled=false;say('Couldn\u2019t reach the mission control server.','bad');});});
 // answer a question on the agent's screen: the button types that answer into the session (after you confirm)
 document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('.qa button[data-ans]');if(!b)return;
