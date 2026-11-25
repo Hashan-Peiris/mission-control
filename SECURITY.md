@@ -42,6 +42,12 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
   Every one of these is logged in `sent.log`.
 - When starting a session it never answers the agent's own questions (folder trust, sign-in, updates):
   you answer them in the dialog.
+- Answer buttons type only an answer the agent's screen itself offers (arrow keys and Enter, or y/n), after
+  you confirm, and only if the screen still shows the same question.
+- Requests between your own PCs go through the shared OneDrive folder (`state/inbox/<pc>/`, answers in
+  `state/outbox/`): only scripts mission control wrote for one of the actions above, run by the other PC's
+  collector loop, and dropped if they arrive more than 3 minutes late. Anyone who can write to that folder
+  can already change mission control's code, so this adds no new way in; keep the folder private.
 - It never submits or cancels jobs.
 - To report Claude's usage it gives sessions it starts a status line script
   (`~/.cache/mission-control/claude_statusline.py`) that saves the usage numbers and then runs your own

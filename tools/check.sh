@@ -9,8 +9,9 @@ import ast, sys
 for f in sys.argv[1:]:
     src = open(f, encoding="utf-8").read()
     compile(src, f, "exec")
-# remote_digest.py runs on the cluster nodes, which have Python 3.6
-ast.parse(open("lib/remote_digest.py", encoding="utf-8").read(), feature_version=(3, 6))
+# remote_digest.py and question.py run on the cluster nodes, which have Python 3.6
+for f in ("lib/remote_digest.py", "lib/question.py"):   # these run on the nodes too
+    ast.parse(open(f, encoding="utf-8").read(), feature_version=(3, 6))
 EOF
 if python3 -m pyflakes --version > /dev/null 2>&1; then
   python3 -m pyflakes lib/*.py
