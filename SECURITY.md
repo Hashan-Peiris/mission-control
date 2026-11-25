@@ -35,9 +35,17 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
   already opened. It never logs in by itself (every ssh call uses `ProxyCommand=/bin/false` and
   `BatchMode=yes`, so a missing connection fails instead of connecting) and never contacts a host
   matching `NEVER_CONTACT`.
-- The only thing it types is a message you send from a session page or with `mctl send`, into that
-  session's tmux pane. It holds a message when the agent's screen shows an approval or y/n prompt.
+- It acts only when you press a button on one of its pages or run the matching `mctl` command: it types a
+  message you send into a session's tmux pane (held when the agent's screen shows an approval or y/n
+  prompt), presses Esc for Interrupt, starts a session you set up (a login shell in tmux on one of your
+  configured compute nodes, then the agent command), or ends a session after you type its exact name.
+  Every one of these is logged in `sent.log`.
+- When starting a session it never answers the agent's own questions (folder trust, sign-in, updates):
+  you answer them in the dialog.
 - It never submits or cancels jobs.
+- To report Claude's usage it gives sessions it starts a status line script
+  (`~/.cache/mission-control/claude_statusline.py`) that saves the usage numbers and then runs your own
+  status line. It never reads credential files.
 
 ## The web page server
 

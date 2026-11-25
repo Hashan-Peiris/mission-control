@@ -872,6 +872,124 @@ def goal_state(codex_home, extra_dirs=()):
     return out
 
 
+PROBE_V = 5
+SECRETISH = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|(?:key|token|secret|password)\s*=\s*\S+|[A-Za-z0-9_\-]{40,})", re.I)
+
+
+def redact(t):
+    return SECRETISH.sub("[redacted]", t or "")
+
+
+def agent_probe(cache, codex_home):
+    """What a new session can be started with on this host: how an interactive shell runs codex/claude (aliases
+    included), their versions and options, Codex's model list with its reasoning levels, and the defaults set in
+    their settings. Read-only; refreshed every 6 h. Only specific settings keys are read, never credentials."""
+    pr = cache.get("probe") or {}
+    if pr.get("v") == PROBE_V and time.time() - pr.get("ts", 0) < 6 * 3600:
+        return pr
+    home = os.path.expanduser("~")
+    pr = {"v": PROBE_V, "ts": time.time(), "host": HOSTNAME, "home": home, "shell": os.environ.get("SHELL", "")}
+    rc, o, e = run(["bash", "-ic", "type codex; type claude; type tmux; alias 2>/dev/null | grep -E 'codex|claude'; "
+                    "echo \"MC_CODEX_HOME=${CODEX_HOME:-}\"; echo \"MC_CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-}\""], timeout=25, inp="")
+    pr["resolve"] = redact(trunc(o, 3000))
+    mm = re.search(r"MC_CODEX_HOME=(.*)", o or "")
+    pr["codex_home_env"] = os.path.expanduser(mm.group(1).strip()) if mm and mm.group(1).strip() else ""
+    for tool in ("codex", "claude", "tmux"):
+        rc, o, e = run(["bash", "-c", "command -v %s" % tool], timeout=10)
+        path = o.strip().splitlines()[0] if rc == 0 and o.strip() else ""
+        info = {"path": path}
+        if path:
+            rc, o, e = run([path, "-V" if tool == "tmux" else "--version"], timeout=20)
+            info["version"] = trunc((o or e).strip(), 200)
+            if tool != "tmux":
+                rc, o, e = run([path, "--help"], timeout=25)
+                info["help"] = trunc(o or e, 9000)
+        if path and tool != "tmux":  # a wrapper script (e.g. one that picks which Codex home to use)
+            try:
+                info["real"] = os.path.realpath(path)
+                info["size"] = os.path.getsize(path)
+                if os.path.getsize(path) < 60000:
+                    with open(path, "rb") as f:
+                        head = f.read(60000)
+                    if head.startswith(b"#!") and b"\0" not in head:
+                        info["wrapper"] = redact(head.decode("utf-8", "replace"))[:16000]
+            except OSError:
+                pass
+        pr[tool] = info
+    for d in ("~/.local/bin", "~/bin", "~/.codex-common/bin"):
+        try:
+            pr.setdefault("bins", {})[d] = sorted(x for x in os.listdir(os.path.expanduser(d)) if re.search(r"codex|claude", x, re.I))[:40]
+        except OSError:
+            pass
+    # wrapper commands such as codex_chat / codex_api: which Codex home each one uses (only the relevant lines are kept)
+    pr["wrappers"] = {}
+    bindir = os.path.expanduser("~/.local/bin")
+    for x in (pr.get("bins") or {}).get("~/.local/bin") or []:
+        if not re.match(r"^codex[_-][A-Za-z0-9_-]+$", x):
+            continue
+        fp = os.path.join(bindir, x)
+        try:
+            if os.path.getsize(fp) > 60000:
+                continue
+            with open(fp, "rb") as f:
+                txt = f.read(60000).decode("utf-8", "replace")
+            if not txt.startswith("#!"):
+                continue
+            keep = [redact(l.strip())[:300] for l in txt.splitlines() if re.search(r"CODEX_HOME|exec|sqlite|codex", l) and not l.strip().startswith("#")]
+            mm = re.search(r"CODEX_HOME=[\"']?([^\"'\s;]+)", txt)
+            pr["wrappers"][x] = {"home": os.path.expanduser(mm.group(1).replace("$HOME", "~").replace("${HOME}", "~")) if mm else "",
+                                 "lines": keep[:12]}
+        except OSError:
+            pass
+    homes = []
+    for h in [os.environ.get("CODEX_HOME"), codex_home, os.path.join(home, ".codex")] + sorted(glob.glob(os.path.join(home, ".codex*"))):
+        if h and os.path.isdir(h) and h not in homes:
+            homes.append(h)
+    pr["codex_homes"] = []
+    for h in homes[:6]:
+        ent = {"dir": h}
+        try:
+            mc = json.load(open(os.path.join(h, "models_cache.json")))
+            lst = mc.get("models") if isinstance(mc, dict) else mc
+            models = []
+            for m in lst or []:
+                if not isinstance(m, dict):
+                    continue
+                lv = []
+                for x in m.get("supported_reasoning_levels") or m.get("reasoning_levels") or []:
+                    lv.append(x.get("effort") if isinstance(x, dict) else x)
+                models.append({"slug": m.get("slug") or m.get("id"), "name": m.get("display_name") or m.get("slug"),
+                               "levels": [x for x in lv if x], "default": m.get("default_reasoning_level"),
+                               "visibility": m.get("visibility"), "desc": trunc(m.get("description") or "", 160)})
+            ent["models"] = models
+            ent["models_mtime"] = os.path.getmtime(os.path.join(h, "models_cache.json"))
+        except Exception as ex:  # noqa
+            ent["models_error"] = str(ex)[:200]
+        try:
+            txt = open(os.path.join(h, "config.toml")).read()
+            conf = {}
+            for k in ("model", "model_reasoning_effort", "profile", "approval_policy", "sandbox_mode"):
+                mm = re.search(r"(?m)^\s*%s\s*=\s*\"?([^\"\n#]+)" % k, txt)
+                if mm:
+                    conf[k] = mm.group(1).strip()
+            mm = re.search(r"(?ms)^\[features\][^\[]*?^\s*goals\s*=\s*(true|false)", txt)
+            if mm:
+                conf["goals"] = mm.group(1)
+            ent["config"] = conf
+        except Exception:  # noqa
+            pass
+        pr["codex_homes"].append(ent)
+    try:
+        st = json.load(open(os.path.join(home, ".claude", "settings.json")))
+        pr["claude_settings"] = {k: st.get(k) for k in ("model", "effortLevel", "alwaysThinkingEnabled") if k in st}
+        sl = st.get("statusLine")
+        pr["claude_settings"]["statusLine"] = redact(json.dumps(sl))[:600] if sl else None
+    except Exception:  # noqa
+        pr["claude_settings"] = None
+    cache["probe"] = pr
+    return pr
+
+
 def node_info():
     d = {"host": socket.gethostname(), "ncpu": os.cpu_count()}
     try:
@@ -1234,6 +1352,17 @@ def main():
             sq_dirs.add(os.path.expanduser(mm.group(1)))
     out["goal_db"] = goal_state(codex_home, sorted(sq_dirs))
     out["node"] = node_info()
+    try:  # Claude's usage limits, as reported to the status line of sessions mission control started
+        cu = json.load(open(os.path.expanduser("~/.cache/mission-control/claude_usage.json")))
+        if isinstance(cu, dict):
+            out["claude_usage"] = {"t": cu.get("t"), "model": cu.get("model"), "rate_limits": cu.get("rate_limits")}
+    except Exception:  # noqa
+        pass
+    if LABEL == "node" or CFG.get("probe"):
+        try:
+            out["probe"] = agent_probe(cache, codex_home)
+        except Exception as e:  # noqa
+            out["probe"] = {"error": str(e)[:300]}
     roots = SCAN_ROOTS or cwds[:8]
     out["params"] = {"by_root": {r: param_scan([r], cache) for r in roots}}
     dec = []

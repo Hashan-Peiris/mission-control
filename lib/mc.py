@@ -1903,8 +1903,205 @@ def appbar(nav, cur=None, where="root", conv=False, collected=None):
             parts.append('<a class="np%s%s" style="%s" href="%s" title="%s on %s"><span class="dot %s"></span>%s</a>' % (
                 " cur" if n["key"] == cur else "", " dim" if n.get("dim") else "", hue(n["key"]), esc(href), esc(n["name"]), esc(h), dot,
                 esc(trunc(n["name"], 30))))
-    return ('<div class="appbar"><div class="in"><a class="brand" href="%s"><i></i><span>Mission control</span></a><nav class="sw">%s</nav>%s</div></div>' % (
-        home, "".join(parts) or '<span class="small mut">no agent sessions found</span>', fresh_pill(collected) if collected is not None else ""))
+    newb = ('<button class="pill newb" id="mc-new" type="button" title="Start a new agent session in tmux">+ New session</button>'
+            if LAUNCH.get("hosts") else "")
+    return ('<div class="appbar"><div class="in"><a class="brand" href="%s"><i></i><span>Mission control</span></a><nav class="sw">%s</nav>%s%s</div></div>%s' % (
+        home, "".join(parts) or '<span class="small mut">no agent sessions found</span>', newb,
+        fresh_pill(collected) if collected is not None else "", launch_dialog() if newb else ""))
+
+
+def reds_json():
+    return '<script type="application/json" id="mc-reds">%s</script>' % json.dumps(REDS).replace("</", "<\\/")
+
+
+def attach_cmd(s):
+    """The command that opens this session's terminal from your WSL, the way mission control reaches the node."""
+    node, target = s.get("node_name") or "", (s.get("tmux") or {}).get("target") or s["session"]
+    if node == LOCAL_NAME:
+        return "tmux attach -t %s" % target
+    route = os.environ.get("ROUTE_" + re.sub(r"[^A-Za-z0-9_]", "_", node)) or (
+        os.environ.get("SAIPH_ROUTE") if node == os.environ.get("SAIPH_HOST") else "") or ("nested" if CFG["rf"] else "direct")
+    if node in LOGIN_HOSTS:
+        host = CFG["rf"] if node.startswith("rockfish") else CFG["sj"]
+        return "ssh -t %s tmux attach -t %s" % (host or node, target)
+    if route == "direct" or not CFG["rf"]:
+        return "ssh -t %s tmux attach -t %s" % (node, target)
+    return "ssh -t %s ssh -t %s tmux attach -t %s" % (CFG["rf"], node, target)
+
+
+def session_actions(s, g):
+    if g.get("notmux"):
+        return ""
+    ended = bool(s.get("ended") or s.get("unreachable"))
+    return ('<div class="acts" id="acts" data-key="%s" data-name="%s">'
+            '<button type="button" class="btn2" data-act="esc" title="Press Esc in the agent\u2019s terminal: it stops what it is doing and waits for you"%s>Interrupt</button>'
+            '<button type="button" class="btn2" data-act="copy" data-cmd="%s" title="%s">Copy terminal command</button>'
+            '<button type="button" class="btn2 dng" data-act="end" title="Close this tmux session (stops the agent; its conversation stays in its logs)"%s>End session\u2026</button>'
+            '<div class="actmsg" id="actmsg"></div></div>' % (
+                esc(s["key"]), esc(s["session"]), " disabled" if ended else "", esc(attach_cmd(s)),
+                esc("Copies: " + attach_cmd(s)), " disabled" if ended else ""))
+
+
+def launch_dialog():
+    return ('<dialog id="mc-launch" class="mcdlg"><form method="dialog" class="lf" onsubmit="return false">'
+            '<div class="lh"><h2>New session</h2><button class="x" type="button" data-close aria-label="Close">\u00d7</button></div>'
+            '<div class="lrow"><span class="ll">Agent</span><div class="seg" role="radiogroup">'
+            '<label><input type="radio" name="agent" value="codex" checked><span>Codex</span></label>'
+            '<label><input type="radio" name="agent" value="claude"><span>Claude</span></label></div></div>'
+            '<div class="lusage" id="l-usage"></div>'
+            '<div class="lrow" id="l-homerow"><label class="ll" for="l-home">Command</label><select id="l-home" title="Which Codex command (and so which account) starts the agent"></select></div>'
+            '<div class="lrow"><label class="ll" for="l-model">Model</label><select id="l-model"></select>'
+            '<label class="ll2" for="l-effort">Thinking</label><select id="l-effort"></select></div>'
+            '<div class="lrow"><label class="ll" for="l-name">Name</label><input id="l-name" autocomplete="off" spellcheck="false" placeholder="e.g. phase3-hcp" maxlength="60">'
+            '<span class="ll2" id="l-onhost"></span><select id="l-host"></select></div>'
+            '<div class="lrow"><label class="ll" for="l-dir">Folder</label><input id="l-dir" autocomplete="off" spellcheck="false"></div>'
+            '<div class="lnote">Created if it doesn\u2019t exist. Your first message can send the agent anywhere else.</div>'
+            '<label class="ll" for="l-text">First message <span class="mut">(optional)</span></label>'
+            '<textarea id="l-text" rows="5" placeholder="What should the agent do? Long instructions are saved in the folder as START_TASK.md (START_GOAL.md for a goal) and the agent is asked to read them."></textarea>'
+            '<label class="lgoal" id="l-goalrow"><input type="checkbox" id="l-goal"> Make it a Codex goal (/goal): it keeps working toward it across turns</label>'
+            '<div class="lbtns"><span class="lmsg" id="l-msg"></span><button type="button" class="btn2" id="l-check">Check</button>'
+            '<button type="button" class="sendbtn" id="l-go">Start session</button></div>'
+            '<div class="lreply" id="l-reply" hidden><input id="l-ans" autocomplete="off" placeholder="Your answer, as you would type it (e.g. 1 or y)" maxlength="200">'
+            '<button type="button" class="btn2" id="l-ansgo">Send answer</button><button type="button" class="btn2" id="l-enter">Press Enter</button></div>'
+            '<pre class="screen lscr" id="l-scr" hidden></pre></form>'
+            '<script type="application/json" id="mc-launch-data">%s</script></dialog>' % json.dumps(LAUNCH).replace("</", "<\\/"))
+
+
+LAUNCH = {}   # what the "New session" dialog offers (also written to state/launch.json for open pages)
+REDS = []     # every red alert right now, for desktop notifications
+
+
+def _windows(rl_items, t):
+    out = []
+    for lab0, w in rl_items:
+        if not isinstance(w, dict):
+            continue
+        used = w.get("used_percent", w.get("used_percentage"))
+        if used is None:
+            continue
+        wm = w.get("window_minutes") or 0
+        lab = {"five_hour": "5 h", "seven_day": "week"}.get(lab0) or (
+            "week" if wm >= 7 * 1440 - 60 else ("%d h" % round(wm / 60) if wm else lab0))
+        rs = w.get("resets_at")
+        if isinstance(rs, str):
+            try:
+                rs = dt.datetime.fromisoformat(rs.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                rs = None
+        if not rs and w.get("resets_in_seconds"):
+            rs = t + float(w["resets_in_seconds"])
+        out.append({"label": lab, "used": round(float(used), 1), "resets": rs})
+    return out
+
+
+def usage_info(shared):
+    """Remaining Codex usage (newest session log of each Codex home) and Claude usage (what Claude reported to the
+    status line of a session started from the dashboard)."""
+    docs = [nd.get("doc") or {} for nd in shared["nodes"].values()] + [(x.get("doc") or {}) for x in shared["logins"].values()]
+    docs.append(shared.get("local") or {})
+    codex, claude = {}, None
+    for doc in docs:
+        for s in doc.get("sessions") or []:
+            rl, path, t = s.get("rate"), s.get("path") or "", s.get("mtime") or 0
+            if not isinstance(rl, dict) or "/sessions/" not in path:
+                continue
+            home = path.split("/sessions/")[0]
+            if home in codex and codex[home]["t"] >= t:
+                continue
+            codex[home] = {"home": home, "label": codex_label(home), "plan": rl.get("plan_type"), "t": t,
+                           "windows": _windows([(k, rl.get(k)) for k in ("primary", "secondary")], t),
+                           "reached": rl.get("rate_limit_reached_type")}
+        cu = doc.get("claude_usage")
+        if isinstance(cu, dict) and isinstance(cu.get("rate_limits"), dict) and (claude is None or (cu.get("t") or 0) > claude["t"]):
+            claude = {"t": cu.get("t") or 0, "model": cu.get("model"),
+                      "windows": _windows(sorted(cu["rate_limits"].items(), key=lambda kv: kv[0] != "five_hour"), cu.get("t") or 0)}
+    return {"codex": sorted(codex.values(), key=lambda u: -u["t"]), "claude": claude}
+
+
+def codex_label(home):
+    b = os.path.basename(home.rstrip("/"))
+    return "default" if b == ".codex" else (b[len(".codex-"):] if b.startswith(".codex-") else b)
+
+
+def launch_info(shared, snaps):
+    hosts = [n for n in CFG["nodes"].split() if n]
+    for n, nd in shared["nodes"].items():
+        if n not in hosts and (nd.get("doc") or {}).get("ok"):
+            hosts.append(n)
+    hosts = [h for h in hosts if not any(w in h.lower() for w in NEVER)]
+    host = os.environ.get("SAIPH_HOST") or (hosts[0] if hosts else "")
+    pr = ((shared["nodes"].get(host) or {}).get("doc") or {}).get("probe") or {}
+    roots = {}
+    for x in snaps:
+        c = (x.get("goal") or {}).get("cwd") or ""
+        if "/WORK/" in c:
+            r = c[:c.index("/WORK/") + 5]
+            roots[r] = roots.get(r, 0) + 1
+    root = os.environ.get("LAUNCH_ROOT") or (max(roots, key=roots.get) if roots else "~")
+    homes, base_models = [], []
+    usage = usage_info(shared)
+    # the home plain `codex` uses: CODEX_HOME if your shell sets it, otherwise the one your running sessions write to
+    dflt = pr.get("codex_home_env") or next((u["home"] for u in usage["codex"]), "") or os.path.join(pr.get("home") or "~", ".codex")
+    byhome = {}
+    for h in pr.get("codex_homes") or []:
+        models = [{"slug": m["slug"], "name": m.get("name") or m["slug"], "levels": m.get("levels") or [], "default": m.get("default"),
+                   "desc": m.get("desc") or ""} for m in h.get("models") or [] if m.get("slug") and m.get("visibility") != "hide"]
+        byhome[h["dir"]] = {"models": models, "model": (h.get("config") or {}).get("model"),
+                            "effort": (h.get("config") or {}).get("model_reasoning_effort")}
+        if h["dir"] == dflt or not base_models:
+            base_models = models or base_models
+    # your own commands (codex_chat, codex_api, ...) each pick an account; plain `codex` uses ~/.codex
+    home_dir = pr.get("home") or "~"
+    cmds = [("codex", os.path.join(home_dir, ".codex"))]
+    for w, wi in sorted((pr.get("wrappers") or {}).items()):
+        hd = (wi or {}).get("home") or os.path.join(home_dir, ".codex-" + re.split(r"[_-]", w, maxsplit=1)[1])
+        cmds.append((w, hd.replace("~", home_dir, 1) if hd.startswith("~") else hd))
+    for w, hd in cmds:
+        hi = byhome.get(hd) or {}
+        homes.append({"cmd": w, "dir": hd, "label": w + (" (plain, uses ~/.codex)" if w == "codex" else ""), "default": False,
+                      "models": hi.get("models") or base_models, "model": hi.get("model"), "effort": hi.get("effort")})
+    pick = next((h for h in homes if h["dir"] == dflt and h["cmd"] != "codex"), None) or next((h for h in homes if h["dir"] == dflt), None)
+    if pick:
+        pick["default"] = True
+    homes.sort(key=lambda h: (not h["default"], h["cmd"] != "codex", h["cmd"]))
+    chelp = (pr.get("claude") or {}).get("help") or ""
+    mm = re.search(r"--effort <level>[\s\S]{0,200}?\(([a-z, ]+)\)", chelp)
+    clevels = [x.strip() for x in mm.group(1).split(",")] if mm else []
+    cset = pr.get("claude_settings") or {}
+    cmodels = [{"slug": a, "name": n} for a, n in (("fable", "Fable (latest)"), ("opus", "Opus (latest)"), ("sonnet", "Sonnet (latest)"),
+                                                   ("haiku", "Haiku (latest)"))]
+    info = {"hosts": hosts, "host": host, "root": root, "probed": pr.get("ts"),
+            "codex": {"available": bool((pr.get("codex") or {}).get("path")), "version": (pr.get("codex") or {}).get("version"),
+                      "homes": homes, "goals": True},
+            "claude": {"available": bool((pr.get("claude") or {}).get("path")), "version": (pr.get("claude") or {}).get("version"),
+                       "models": cmodels, "levels": clevels, "model": cset.get("model") or "", "effort": cset.get("effortLevel") or ""},
+            "usage": usage}
+    return info
+
+
+def usage_html(u):
+    """One line per agent: how much of each usage window is left and when it resets."""
+    def wins(ws):
+        out = []
+        for w in ws:
+            left = max(0, 100 - w["used"])
+            cls = "bad-t" if left < 10 else ("warn-t" if left < 25 else "ok-t")
+            rs = (" · resets %s" % time.strftime("%a %-I:%M %p", time.localtime(w["resets"]))) if w.get("resets") else ""
+            out.append('<b class="%s">%d%%</b> of the %s left%s' % (cls, left, esc(w["label"]), rs))
+        return "; ".join(out)
+    parts = []
+    for c in (u or {}).get("codex") or []:
+        if c["windows"]:
+            parts.append('<span class="ug"><span class="kind codex">Codex%s</span> %s%s</span>' % (
+                (" " + esc(c["label"])) if c["label"] not in ("default", "chat") or len(u["codex"]) > 1 else "",
+                wins(c["windows"]), (" · <span class='bad-t'>limit reached</span>" if c.get("reached") else "")))
+    cl = (u or {}).get("claude")
+    if cl and cl["windows"]:
+        parts.append('<span class="ug"><span class="kind claude">Claude</span> %s <span class="mut">(as of %s)</span></span>' % (wins(cl["windows"]), esc(ago(cl["t"]))))
+    else:
+        parts.append('<span class="ug"><span class="kind claude">Claude</span> <span class="mut">not reported yet: it shows once a Claude session '
+                     'started from here replies</span></span>')
+    return '<div class="usage">%s</div>' % "".join(parts)
 
 
 def write_conv_data(gkey, msgs):
@@ -1939,7 +2136,7 @@ def write_conv_page(snap, nav):
             '<div id="list" class="chat"></div><div class="composer">%s</div></main>%s<script>%s</script>%s</body></html>') % (
         HEAD_META, esc(gname), CSS, CONV_CSS, esc(gkey), hue(gkey), appbar(nav, gkey, "goals", True, snap.get("collected")), esc(gname),
         esc((snap["goal"].get("agent_kind") or "agent").capitalize()), esc(LOGIN_HOSTS.get(snap.get("node_name"), snap.get("node_name") or "?")),
-        esc(gkey), chips, send_box(snap, compact=True), scripts, CONV_JS, SEND_JS + REFRESH_JS)
+        esc(gkey), chips, send_box(snap, compact=True), scripts, CONV_JS, SEND_JS + REFRESH_JS + TOOLS_JS)
     fp = os.path.join(MC_DIR, "goals", gkey + ".conversation.html")
     if rd(fp) != page:
         with open(fp, "w", encoding="utf-8") as f:
@@ -2118,6 +2315,18 @@ def analyze():
     nav = [{"key": x["key"], "name": x["session"], "node": x["node_name"], "sev": goal_sev(x["flags"]),
             "dim": bool(x.get("ended") or x.get("unreachable")), "conv": bool((x.get("conv") or {}).get("page"))} for x in real]
     assign_hues([n["key"] for n in nav])
+    global LAUNCH, REDS
+    try:
+        LAUNCH = launch_info(shared, real)
+    except Exception as e:  # the dialog is optional; never let it break the dashboard
+        sys.stderr.write("launch options: %s\n" % e)
+        LAUNCH = {}
+    try:
+        wjson(os.path.join(STATE, "launch.json"), LAUNCH)
+    except OSError:
+        pass
+    REDS = [{"k": x["key"] + ":" + f["key"], "t": "%s: %s" % (x["session"], f["title"])} for x in real for f in x["flags"] if f["sev"] == "red"]
+    REDS += [{"k": f["key"], "t": f["title"]} for f in shared["conn_flags"] if f.get("sev") == "red"]
     for x in real:
         x["nav"] = nav
         wjson(os.path.join(STATE, "goals", x["key"] + ".json"), x)
@@ -2255,7 +2464,7 @@ def render_overview(ov):
     o = ['<!doctype html><html lang="en"><head>%s<title>%smission control</title><style>%s</style>%s</head><body class="ov">' % (
              HEAD_META, ("(%d) " % len(reds)) if reds else "", CSS, hide_css())]
     o.append(appbar(ov.get("nav") or [], None, "root", False, ov.get("collected")))
-    o.append("<main>")
+    o.append("<main>" + reds_json())
     needs = [f for f in ov["flags"] if f.get("needs_you")]
     hosts_with = []
     for g in goals:
@@ -2264,9 +2473,12 @@ def render_overview(ov):
     live = [g for g in goals if not g["unreachable"] and not g["ended"]]
     chips = "".join('<span class="hc" title="%s"><span class="dot %s"></span>%s</span>' % (
         esc(h.get("detail") or ""), "" if h["ok"] else "red", esc(h["name"])) for h in ov["hosts"])
-    o.append('<header><div><h1>Mission control</h1><p class="sub">%d agent session%s running on %s%s</p></div><div class="chips">%s</div></header>' % (
+    o.append('<header><div><h1>Mission control</h1><p class="sub">%d agent session%s running on %s%s</p>%s</div><div class="chips">%s'
+             '<button type="button" class="pill bell" id="mc-bell" title="Desktop alerts for new red items while a mission control page is open">'
+             'Desktop alerts: off</button></div></header>' % (
         len(live), "" if len(live) == 1 else "s", esc(", ".join(LOGIN_HOSTS.get(h, h) for h in hosts_with)) or "no hosts",
-        (" \u00b7 <b class='bad-t'>%d need%s you</b>" % (len(needs), "s" if len(needs) == 1 else "")) if needs else "", chips))
+        (" \u00b7 <b class='bad-t'>%d need%s you</b>" % (len(needs), "s" if len(needs) == 1 else "")) if needs else "",
+        usage_html(LAUNCH.get("usage")) if LAUNCH else "", chips))
     o.append('<div id="hidden-bar" class="hbar" style="display:none"></div>')
     if needs:
         o.append('<section class="card"%s><h2>Needs you</h2>' % sec("o", "needs"))
@@ -2309,7 +2521,7 @@ def render_overview(ov):
              '(tmux or not) on the watched nodes, the Rockfish and Skipjack login nodes and this PC<br>'
              'Mission control types into a session only when you press Send on its page%s.<br>'
              'Hover over any block and click its \u00d7 to hide it in this browser; <span class="mono">mctl hide NAME</span> hides it on every machine.%s</footer></main>%s</body></html>' % (
-                 hs, esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(ov["collected"]))) if ov.get("collected") else "never", CFG["interval"], never_note(), hidden_note(), HIDE_JS + REFRESH_JS))
+                 hs, esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(ov["collected"]))) if ov.get("collected") else "never", CFG["interval"], never_note(), hidden_note(), HIDE_JS + REFRESH_JS + TOOLS_JS))
     return "\n".join(o)
 
 
@@ -2493,6 +2705,37 @@ button.fresh svg{opacity:.7;flex:none}button.fresh:hover{border-color:currentCol
 button.fresh:focus-visible{outline:2px solid currentColor;outline-offset:2px}
 .fresh.spin svg{opacity:1;animation:mcspin .9s linear infinite}@keyframes mcspin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.fresh.spin svg{animation-duration:2.5s}}
+.newb{flex:none;cursor:pointer;font:inherit;font-size:12px;font-weight:600;border:1px solid color-mix(in srgb,var(--lime) 45%,transparent);
+background:color-mix(in srgb,var(--lime) 14%,transparent);color:color-mix(in srgb,var(--lime) 80%,var(--fg));margin-right:2px}
+.newb:hover{border-color:var(--lime)}
+.mcdlg{border:1px solid var(--line);border-radius:16px;background:var(--card);color:var(--fg);padding:0;width:min(640px,94vw);max-height:92vh}
+.mcdlg::backdrop{background:rgba(5,7,12,.62)}
+.lf{display:flex;flex-direction:column;gap:9px;padding:16px 18px 18px}.lh{display:flex;align-items:center;justify-content:space-between}
+.lh h2{margin:0;font-size:17px}.lh .x{border:none;background:none;color:var(--mut);font-size:22px;cursor:pointer;line-height:1}
+.lrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.lrow[hidden],.lgoal[hidden]{display:none}
+.ll{min-width:62px;font-size:12.5px;color:var(--mut);font-weight:600}.ll2{font-size:12.5px;color:var(--mut);margin-left:6px}
+.lf select,.lf input[type=text],.lf input:not([type]),.lf textarea{font:inherit;font-size:13.5px;color:var(--fg);background:var(--bg);
+border:1px solid var(--line);border-radius:8px;padding:6px 8px}
+.lf input:not([type]){flex:1;min-width:140px}#l-dir{flex:1;font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+.lf textarea{width:100%;resize:vertical;min-height:90px;line-height:1.5}.lf select:focus,.lf input:focus,.lf textarea:focus{outline:2px solid var(--h);outline-offset:1px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:999px;overflow:hidden}.seg label{cursor:pointer}
+.seg input{position:absolute;opacity:0;pointer-events:none}.seg span{display:inline-block;padding:5px 16px;font-size:13px;color:var(--mut)}
+.seg input:checked+span{background:color-mix(in srgb,var(--violet) 28%,transparent);color:var(--fg);font-weight:600}
+.seg input:disabled+span{opacity:.4;cursor:not-allowed}.seg input:focus-visible+span{outline:2px solid var(--h)}
+.lusage{font-size:12.5px;color:var(--mut);background:var(--bg);border-radius:8px;padding:7px 10px;line-height:1.6}
+.lnote{font-size:12px;color:var(--faint);margin:-4px 0 2px 70px}.lgoal{font-size:12.5px;color:var(--mut);display:flex;gap:7px;align-items:center}
+.lbtns{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap;margin-top:4px}
+.lmsg{flex:1;font-size:12.5px;color:var(--mut);min-width:160px}.lmsg.ok{color:var(--grn)}.lmsg.bad{color:var(--red)}
+.btn2{font:inherit;font-size:12.5px;padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:none;color:var(--fg);cursor:pointer}
+.btn2:hover{border-color:var(--h)}.btn2:disabled{opacity:.45;cursor:not-allowed}.btn2.dng{color:var(--rose)}
+.lscr{max-height:260px;margin:0}.lreply{display:flex;gap:8px;flex-wrap:wrap}.lreply[hidden]{display:none}.lreply input{flex:1;min-width:180px}
+@media (max-width:640px){.mcdlg{width:100vw;max-width:100vw;max-height:100vh;height:100%;border-radius:0;margin:0}.lnote{margin-left:0}}
+.usage{display:flex;flex-direction:column;gap:3px;margin-top:6px;font-size:12.5px;color:var(--mut)}.ug .kind{margin-right:6px}
+.ok-t{color:var(--grn)}.warn-t{color:var(--amb)}
+.acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center;justify-content:flex-end;max-width:420px}
+.actmsg{flex-basis:100%;text-align:right;font-size:12px;color:var(--mut);overflow-wrap:anywhere}.actmsg.ok{color:var(--grn)}.actmsg.bad{color:var(--red)}
+@media (max-width:640px){.acts{justify-content:flex-start}.actmsg{text-align:left}}
+.bell{cursor:pointer;font:inherit;font-size:12px;border:1px solid var(--line);background:none;color:var(--mut)}.bell.on{color:var(--grn);border-color:var(--grn)}
 /* every session tab stays visible: the bar wraps onto a second row when they don't fit (phones scroll instead) */
 .appbar .in{height:auto;min-height:48px}.sw{flex-wrap:wrap;overflow-x:visible;row-gap:6px}
 @media (max-width:640px){.appbar .in{flex-wrap:wrap;column-gap:10px;padding-top:6px}.appbar .brand span{display:inline}
@@ -2633,7 +2876,7 @@ function swap(h){
  [].forEach.call(nm.querySelectorAll('details'),function(x,i){var k=x.getAttribute('data-sec')||('#'+i);if(k in open)x.open=open[k];});
  var sb=document.getElementById('sendbox'),nsb=nm.querySelector('#sendbox');if(sb&&nsb)nsb.parentNode.replaceChild(sb,nsb);   // keeps what you typed
  om.parentNode.replaceChild(nm,om);
- applyX();if(window.mcHideScan)window.mcHideScan();window.scrollTo(0,y);
+ applyX();if(window.mcHideScan)window.mcHideScan();if(window.mcNotify)window.mcNotify();window.scrollTo(0,y);
  if(aid){var e=document.getElementById(aid);if(e&&document.activeElement!==e){try{e.focus({preventScroll:true});if(s0!==null)e.setSelectionRange(s0,s1);}catch(_){}}}
  return true;}
 function pull(){if(inflight)return inflight;
@@ -2687,8 +2930,118 @@ ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey&&!e.is
 })();
 </script>"""
 
+TOOLS_JS = r"""<script>
+(function(){
+// New-session dialog, session actions (interrupt / copy terminal command / end) and desktop alerts.
+var S=window.MC_SEND||null,served=!!(S&&/^https?:/.test(location.protocol));
+function post(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-MC-Token':S.token},body:JSON.stringify(b)}).then(function(r){return r.json();});}
+function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function rs(t){return t?' · resets '+new Date(t*1000).toLocaleString([],{weekday:'short',hour:'numeric',minute:'2-digit'}):'';}
+function wins(ws){return (ws||[]).map(function(w){var l=Math.max(0,Math.round(100-w.used)),c=l<10?'bad-t':(l<25?'warn-t':'ok-t');
+ return '<b class="'+c+'">'+l+'%</b> of the '+esc(w.label)+' left'+rs(w.resets);}).join('; ');}
+function ago(t){var s=Date.now()/1000-t;return s<90?'just now':s<5400?Math.round(s/60)+' min ago':s<172800?Math.round(s/3600)+' h ago':Math.round(s/86400)+' d ago';}
+var dlg=document.getElementById('mc-launch'),nb=document.getElementById('mc-new');
+if(dlg&&nb){
+ var L={},pref={},dirTouched=false,$=function(id){return document.getElementById(id);};
+ try{L=JSON.parse($('mc-launch-data').textContent)||{};}catch(_){}
+ try{pref=JSON.parse(localStorage.getItem('mc-launch')||'{}')||{};}catch(_){}
+ var agent=function(){var r=dlg.querySelector('input[name=agent]:checked');return r?r.value:'codex';};
+ var opt=function(sel,items,val){sel.innerHTML=items.map(function(i){return '<option value="'+esc(i[0])+'">'+esc(i[1])+'</option>';}).join('');
+  if(items.some(function(i){return i[0]===val;}))sel.value=val;};
+ var homes=function(){return (L.codex||{}).homes||[];};
+ var home=function(){return homes().filter(function(h){return h.cmd===$('l-home').value;})[0]||homes()[0]||{models:[]};};
+ var models=function(){return agent()==='codex'?(home().models||[]):((L.claude||{}).models||[]);};
+ var usage=function(){var u=L.usage||{},h;
+  if(agent()==='codex'){var c=(u.codex||[]).filter(function(x){return x.home===home().dir;})[0]||(u.codex||[])[0];
+   h=c&&c.windows&&c.windows.length?'<span class="kind codex">Codex'+(c.plan?' '+esc(c.plan):'')+'</span> '+wins(c.windows)+(c.reached?' · <b class="bad-t">limit reached</b>':''):'Codex usage hasn’t been reported yet.';}
+  else{var cl=u.claude;h=cl&&cl.windows&&cl.windows.length?'<span class="kind claude">Claude</span> '+wins(cl.windows)+' <span class="mut">(as of '+ago(cl.t)+')</span>':
+   'Claude’s remaining usage shows here once a Claude session started from here has replied.';}
+  $('l-usage').innerHTML=h;};
+ var fillLevels=function(keep){var a=agent(),m=models().filter(function(x){return x.slug===$('l-model').value;})[0],cur=keep!=null?keep:$('l-effort').value;
+  var lv=a==='codex'?((m&&m.levels)||[]):((L.claude||{}).levels||[]);
+  var d=a==='codex'?(($('l-model').value===(home().model||'')||!$('l-model').value)&&home().effort?home().effort:(m&&m.default)||''):((L.claude||{}).effort||'');
+  opt($('l-effort'),[['','Default'+(d?' ('+d+')':'')]].concat(lv.map(function(l){return [l,l];})),cur);};
+ var fillModels=function(keep){var a=agent(),cur=keep!=null?keep:$('l-model').value;
+  var items=(a==='claude'?[['','Your default'+((L.claude||{}).model?' ('+L.claude.model+')':'')]]:[]).concat(models().map(function(m){return [m.slug,m.name];}));
+  var d=a==='codex'?(home().model||''):'';
+  opt($('l-model'),items,items.some(function(i){return i[0]===cur;})?cur:d);fillLevels();};
+ var sync=function(){var a=agent();$('l-homerow').hidden=a!=='codex'||homes().length<2;$('l-goalrow').hidden=a!=='codex';fillModels('');usage();};
+ var dirDefault=function(){if(!dirTouched)$('l-dir').value=String(L.root||'~').replace(/\/$/,'')+'/'+$('l-name').value.trim();};
+ var init=function(){
+  opt($('l-home'),homes().map(function(h){return [h.cmd,h.label+(h.default?' (used by your running sessions)':'')];}),pref.cmd||((homes()[0]||{}).cmd));
+  var hs=L.hosts||[];opt($('l-host'),hs.map(function(h){return [h,h];}),hs.indexOf(pref.host)>=0?pref.host:L.host);
+  $('l-host').hidden=hs.length<2;$('l-onhost').textContent=hs.length<2?'on '+(L.host||''):'on';
+  [['codex',(L.codex||{}).available],['claude',(L.claude||{}).available]].forEach(function(p){var r=dlg.querySelector('input[name=agent][value='+p[0]+']');
+   if(r){r.disabled=!p[1];r.parentNode.title=p[1]?'':'Not found on '+(L.host||'the node');}});
+  var want=pref.agent&&!(dlg.querySelector('input[name=agent][value='+pref.agent+']')||{}).disabled?pref.agent:'codex';
+  (dlg.querySelector('input[name=agent][value='+want+']')||{}).checked=true;
+  sync();if(pref.agent===agent()){fillModels(pref.model||'');fillLevels(pref.effort||'');}dirDefault();};
+ init();
+ dlg.addEventListener('change',function(e){var t=e.target;if(t.name==='agent')sync();else if(t.id==='l-home'){fillModels();usage();}else if(t.id==='l-model')fillLevels('');});
+ $('l-name').addEventListener('input',dirDefault);$('l-dir').addEventListener('input',function(){dirTouched=true;});
+ var msg=function(t,c){var m=$('l-msg');m.textContent=t;m.className='lmsg '+(c||'');};
+ nb.addEventListener('click',function(){
+  if(served)fetch('/api/launch-info',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){if(j&&j.hosts){var a=agent(),m=$('l-model').value,ef=$('l-effort').value;L=j;
+   init();(dlg.querySelector('input[name=agent][value='+a+']')||{}).checked=true;sync();fillModels(m);fillLevels(ef);}}).catch(function(){});
+  msg(served?'':'Open the dashboard with mctl (http://localhost:8765) or on your phone to start sessions.',served?'':'bad');
+  if(dlg.showModal)dlg.showModal();else dlg.setAttribute('open','');setTimeout(function(){$('l-name').focus();},60);});
+ dlg.querySelector('[data-close]').addEventListener('click',function(){dlg.close();});
+ var req=function(check){var name=$('l-name').value.trim();
+  if(!/^[A-Za-z0-9][A-Za-z0-9_-]{0,59}$/.test(name)){msg('Give it a name: letters, digits, - and _ (no spaces).','bad');$('l-name').focus();return null;}
+  return {check:check,host:$('l-host').value||L.host,name:name,dir:$('l-dir').value.trim(),agent:agent(),model:$('l-model').value,effort:$('l-effort').value,
+   cmd:agent()==='codex'?(home().cmd||''):'',goal:agent()==='codex'&&$('l-goal').checked,text:$('l-text').value};};
+ var busy=function(on){$('l-go').disabled=on;$('l-check').disabled=on;window.MC_BUSY=on;};
+ var fail=function(){busy(false);msg('Couldn’t reach the mission control server.','bad');};
+ $('l-check').addEventListener('click',function(){if(!served)return;var r=req(true);if(!r)return;busy(true);msg('Checking on '+r.host+'…','');
+  post('/api/launch',r).then(function(j){busy(false);msg(j.message||'',j.ok?'ok':'bad');}).catch(fail);});
+ $('l-go').addEventListener('click',function(){if(!served)return;var r=req(false);if(!r)return;busy(true);$('l-scr').hidden=true;
+  msg('Starting '+r.name+' on '+r.host+'… this takes up to a minute.','');
+  try{localStorage.setItem('mc-launch',JSON.stringify({agent:r.agent,cmd:home().cmd,model:r.model,effort:r.effort,host:r.host}));}catch(_){}
+  post('/api/launch',r).then(function(j){show(j,{host:r.host,name:r.name,line:j.line||''});
+   if(j.ok){$('l-text').value='';$('l-name').value='';$('l-goal').checked=false;dirTouched=false;dirDefault();}}).catch(fail);});
+ var last=null;
+ var show=function(j,ctx){busy(false);msg(j.message||'',j.ok?'ok':'bad');
+  if(j.screen){$('l-scr').textContent=j.screen;$('l-scr').hidden=false;}
+  last=ctx;$('l-reply').hidden=!(j.state&&!j.ok&&(j.code===8||j.code===9));if(!$('l-reply').hidden)setTimeout(function(){$('l-ans').focus();},50);};
+ var answer=function(a){if(!last||!served)return;busy(true);msg('Answering\u2026 then waiting for the agent (up to a minute).','');
+  post('/api/launch',{continue:true,host:last.host,name:last.name,answer:a,line:last.line}).then(function(j){
+   if(j.ok)last.line='';show(j,last);$('l-ans').value='';}).catch(fail);};
+ $('l-ansgo').addEventListener('click',function(){var a=$('l-ans').value;if(a.trim())answer(a);});
+ $('l-ans').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();var a=$('l-ans').value;if(a.trim())answer(a);}});
+ $('l-enter').addEventListener('click',function(){answer('<enter>');});
+}
+// session actions (delegated: the page content is swapped in place on updates)
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('#acts button[data-act]');if(!b)return;
+ var acts=document.getElementById('acts'),a=b.getAttribute('data-act'),key=acts.getAttribute('data-key'),name=acts.getAttribute('data-name');
+ var say=function(t,c){var o=document.getElementById('actmsg');if(o){o.className='actmsg '+(c||'');o.textContent=t;}};
+ if(a==='copy'){var c=b.getAttribute('data-cmd');var ok=function(){say('Copied. Paste it in WSL: '+c,'ok');};
+  if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(c).then(ok,function(){say(c,'');});else say(c,'');return;}
+ if(!served){say('Open the dashboard with mctl (http://localhost:8765) to do this.','bad');return;}
+ if(a==='esc'){if(!confirm('Press Esc in '+name+'?\n\nThe agent stops what it is doing and waits for you. Nothing is lost.'))return;say('Pressing Esc…','');
+  post('/api/key',{key:key}).then(function(j){say(j.message||'',j.ok?'ok':'bad');}).catch(function(){say('Couldn’t reach the mission control server.','bad');});return;}
+ if(a==='end'){var t=prompt('End '+name+'?\n\nThis closes its tmux session and stops the agent. Its conversation stays in its logs (codex resume / claude --resume).\n\nType the session name to confirm:');
+  if(t===null)return;if(t.trim()!==name){say('Not ended: the name didn’t match.','bad');return;}say('Ending '+name+'…','');
+  post('/api/end',{key:key,confirm:t.trim()}).then(function(j){say(j.message||'',j.ok?'ok':'bad');}).catch(function(){say('Couldn’t reach the mission control server.','bad');});}});
+// desktop alerts for new red items (works while any mission control page is open in a tab)
+var bell=document.getElementById('mc-bell');
+var on=function(){try{return localStorage.getItem('mc-alerts')==='1'&&!!window.Notification&&Notification.permission==='granted';}catch(_){return false;}};
+var reds=function(){try{return JSON.parse((document.getElementById('mc-reds')||{}).textContent||'[]');}catch(_){return [];}};
+var mark=function(l){try{localStorage.setItem('mc-reds-seen',JSON.stringify(l.map(function(r){return r.k;})));}catch(_){}};
+var paint=function(){if(bell){bell.textContent='Desktop alerts: '+(on()?'on':'off');bell.classList.toggle('on',on());}};
+if(bell){bell.addEventListener('click',function(){
+ if(!window.Notification||!window.isSecureContext){bell.title='Desktop alerts need the dashboard opened with mctl (http://localhost:8765).';bell.textContent='Desktop alerts: open with mctl';return;}
+ if(on()){localStorage.setItem('mc-alerts','0');paint();return;}
+ Notification.requestPermission().then(function(p){if(p==='granted'){localStorage.setItem('mc-alerts','1');mark(reds());
+  try{new Notification('Mission control',{body:'Desktop alerts are on: you’ll hear about new red items while a dashboard tab is open.'});}catch(_){}}paint();});});paint();}
+window.mcNotify=function(){if(!on()||!document.getElementById('mc-reds'))return;var cur=reds(),old=[];try{old=JSON.parse(localStorage.getItem('mc-reds-seen')||'[]');}catch(_){}
+ var fresh=cur.filter(function(r){return old.indexOf(r.k)<0;});mark(cur);
+ fresh.slice(0,3).forEach(function(r){try{var n=new Notification('Mission control needs you',{body:r.t,tag:r.k});n.onclick=function(){window.focus();};}catch(_){}});};
+window.mcNotify();
+})();
+</script>"""
+
 # Pages carry a fingerprint of their code, so an open page reloads fully (rather than swapping content) after an update.
-BUILD = hashlib.md5((CSS + CONV_CSS + CONV_JS + HIDE_JS + FRESH_JS + REFRESH_JS + SEND_JS).encode("utf-8")).hexdigest()[:12]
+BUILD = hashlib.md5((CSS + CONV_CSS + CONV_JS + HIDE_JS + FRESH_JS + REFRESH_JS + SEND_JS + TOOLS_JS).encode("utf-8")).hexdigest()[:12]
 HEAD_META += '<meta name="mc-build" content="%s">' % BUILD
 
 
@@ -2760,7 +3113,7 @@ def render(s):
     o.append('<!doctype html><html lang="en"><head>%s<title>%s%s \u00b7 mission control</title><style>%s</style>%s</head><body style="%s">'
              % (HEAD_META, ("(%d) " % len(reds)) if reds else "", esc(s["session"]), CSS, hide_css(), hue(s.get("key"))))
     o.append(appbar(s.get("nav") or [], s.get("key"), "goals", False, s.get("collected")))
-    o.append("<main>")
+    o.append("<main>" + reds_json())
     stxt, scls = session_state(g, [f["key"] for f in s["flags"]], s.get("unreachable"), s.get("ended"), s.get("node_name"), s.get("last_seen"))
     where = LOGIN_HOSTS.get(s.get("node_name"), s.get("node_name") or "?")
     meta = ["%s on %s" % ("no tmux (pid %s)" % esc((s.get("tmux") or {}).get("pid") or "?") if g.get("notmux") else "tmux " + esc(s["session"]), esc(where))]
@@ -2786,7 +3139,7 @@ def render(s):
                  esc(s["session"]), kind_badge(g.get("agent_kind")), scls, esc(stxt), " \u00b7 ".join(meta),
                  ('<p class="objective" id="x-goal" data-x title="Click to show the whole goal"><b>Goal:</b> %s</p>' % esc(trunc(goal_full, 20000)))
                  if goal_full and goal_full != s["session"] else "",
-                 ""))
+                 session_actions(s, g)))
     cv = s.get("conv") or {}
     words = s.get("agent_words") or []
     o.append('<div id="hidden-bar" class="hbar" style="display:none"></div>')
@@ -3018,7 +3371,7 @@ def render(s):
              'Hover over any block and click its \u00d7 to hide it in this browser; <span class="mono">mctl hide NAME</span> hides it on every machine.%s</footer>' % (
                  hs, esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(s["collected"]))) if s.get("collected") else "never",
                  esc(time.strftime("%H:%M", time.localtime(s["generated"]))), CFG["interval"], never_note(), hidden_note()))
-    o.append("</main>%s%s%s</body></html>" % (HIDE_JS, SEND_JS, REFRESH_JS))
+    o.append("</main>%s%s%s%s</body></html>" % (HIDE_JS, SEND_JS, REFRESH_JS, TOOLS_JS))
     return "\n".join(o)
 
 

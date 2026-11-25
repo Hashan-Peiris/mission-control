@@ -74,6 +74,37 @@ presses Enter, then shows the agent's screen a few seconds later. It works for C
   own pages carry, so no website or other program can type into your sessions. `WEB_SERVER=0` in
   config.env turns it off.
 
+## Start a new session from the dashboard
+
+Click **+ New session** in the top bar (on the dashboard opened with `mctl`, or on your phone).
+- Pick the agent (Codex or Claude), then the model and thinking level. The lists come from the agents
+  installed on the node, so they stay current. For Codex you also pick the command that starts it: your
+  own launchers such as `codex_chat` or `codex_api` each use their own account. The one your running
+  sessions use is preselected.
+- How much of each agent's usage is left shows at the top: Codex from its own session logs, Claude from
+  what Claude Code reports to the status line of sessions started here (your own status line still shows).
+- Give it a name: that is the tmux session name. The folder defaults to a new folder of that name next to
+  your other sessions' folders (`LAUNCH_ROOT` in config.env changes that). Your first message can send the
+  agent anywhere else.
+- The first message is optional. Long ones are saved in the folder as `START_TASK.md` (or `START_GOAL.md`)
+  and the agent is asked to read it. Tick "Make it a Codex goal" to start it with `/goal`.
+- **Check** tests everything without starting anything. **Start session** opens a login shell in tmux on the
+  node, starts the agent, waits until it is ready and types your first message. If the agent asks something
+  first (trusting a new folder, signing in, an update), its screen shows in the dialog and you answer there.
+- From WSL: `mctl launch --name NAME --agent codex --cmd codex_chat --model gpt-6.2-astra --effort high --check`
+
+## Session buttons
+
+Each session page has **Interrupt** (presses Esc: the agent stops what it is doing and waits),
+**Copy terminal command** (the ssh/tmux command that opens the session in your own terminal) and
+**End session** (closes its tmux session after you type its name; the conversation stays in the agent's
+logs, so `codex resume` or `claude --resume` can continue it).
+
+## Desktop alerts
+
+Turn on **Desktop alerts** at the top of the dashboard: while any mission control tab is open, a new red item
+(an agent waiting for you, failing jobs, a lost connection) pops up as a notification.
+
 ## On your phone
 
 Phone access goes through Tailscale, a private network of only your own devices; nothing is opened to
@@ -174,9 +205,10 @@ With a single goal running, you can leave out `--goal`.
 ## Safety
 
 Mission control reads session logs, the tmux screen (`capture-pane`), `squeue`/`sacct`/`sinfo`
-and node load. The one thing it ever types is a message you send from a session page (or with
-`mctl send`), into that session's tmux pane. It never submits or cancels jobs, never logs in by itself
-and never contacts a host listed in `NEVER_CONTACT`. Each cycle sends a few hundred KB.
+and node load. It acts only when you press a button on its pages (or run the matching `mctl` command):
+it types a message you send, presses Esc for Interrupt, starts a session you set up in the New session
+dialog, or ends a session after you type its name. It never submits or cancels jobs, never logs in by
+itself and never contacts a host listed in `NEVER_CONTACT`. Each cycle sends a few hundred KB.
 
 ## Developing
 

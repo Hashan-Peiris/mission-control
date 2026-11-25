@@ -555,6 +555,140 @@ EOS
   printf '%s\n' "$script" | run_node "$node" bash -s
 }
 
+# Start a new agent session in tmux on a compute node, the way you would by hand: a login shell (so your own
+# environment and settings apply) in the chosen folder, then the agent command typed into it. The first message is
+# typed only once the agent is running and ready; a question on its screen (folder trust, sign-in, updates) is left
+# for you to answer. Nothing is started with --check.
+launch() {  # mctl launch --name N [--host H] [--dir D] [--agent codex|claude] [--cmd codex_chat] [--model M] [--effort E] [--goal] [--file F] [--check]
+  local host="" name="" dir="" agent="codex" model="" effort="" word="" goal=0 file="" check=0 b64="" cmd slb="" ok a script ans="" line="" cont=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host) host="${2:-}"; shift 2 ;; --name) name="${2:-}"; shift 2 ;; --dir) dir="${2:-}"; shift 2 ;;
+      --agent) agent="${2:-}"; shift 2 ;; --model) model="${2:-}"; shift 2 ;; --effort) effort="${2:-}"; shift 2 ;;
+      --cmd) word="${2:-}"; shift 2 ;; --goal) goal=1; shift ;;
+      --answer) ans="${2:-}"; cont=1; shift 2 ;; --line) line="${2:-}"; shift 2 ;; --continue) cont=1; shift ;; --file) file="${2:-}"; shift 2 ;; --check) check=1; shift ;;
+      *) echo "launch: unknown option $1" >&2; return 2 ;;
+    esac
+  done
+  [ -z "$host" ] && host="${SAIPH_HOST:-${NODES%% *}}"
+  ok=0
+  for a in $NODES $(cat "$STATE/auto_nodes" 2> /dev/null); do [ "$a" = "$host" ] && ok=1; done
+  { [ "$ok" = 1 ] && ! is_never "$host"; } || { echo "Sessions can only be started on your compute nodes ($NODES)." >&2; return 2; }
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,59}$ ]] || { echo "Use a name of letters, digits, - and _ (up to 60)." >&2; return 2; }
+  [[ "$agent" =~ ^(codex|claude)$ ]] || { echo "The agent is codex or claude." >&2; return 2; }
+  local re_model='^[]A-Za-z0-9._:[-]{0,80}$' re_word='^(codex([_-][A-Za-z0-9_-]{1,30})?)?$' re_dir='^(/|~/)[A-Za-z0-9._/+@%,=~-]{1,400}$'
+  [[ "$model" =~ $re_model && "$effort" =~ ^[a-z]{0,12}$ && "$word" =~ $re_word ]] \
+    || { echo "That model, thinking level or Codex command isn't valid." >&2; return 2; }
+  [ -z "$dir" ] && dir="~/$name"
+  [[ "$dir" =~ $re_dir && "$dir" != *..* ]] \
+    || { echo "The folder must be a full path (/... or ~/...) of letters, digits and ._/+@%,=~-" >&2; return 2; }
+  [ -n "$file" ] && b64=$(base64 -w0 < "$file")
+  if [ "$agent" = codex ]; then
+    word="${word:-codex}"; cmd="$word"   # e.g. codex_chat: your own wrapper that picks the account (Codex home)
+    [ -n "$model" ] && cmd="$cmd -m $model"
+    [ -n "$effort" ] && cmd="$cmd -c model_reasoning_effort=\"$effort\""
+  else
+    word=claude; cmd="claude"
+    [ -n "$model" ] && cmd="$cmd --model $model"
+    [ -n "$effort" ] && cmd="$cmd --effort $effort"
+    cmd="$cmd -n $name --settings '{\"statusLine\":{\"type\":\"command\",\"command\":\"python3 ~/.cache/mission-control/claude_statusline.py\",\"padding\":0}}'"
+    slb=$(base64 -w0 < "$MC_DIR/lib/claude_statusline.py")
+  fi
+  discover /dev/null
+  [ ${#ans} -le 200 ] && [ ${#line} -le 600 ] || { echo "That reply is too long." >&2; return 2; }
+  script=$(printf 'N=%q; D=%q; A=%q; C=%q; G=%q; B=%q; CHK=%q; SLB=%q; CONT=%q; ANS=%q; LINE0=%q\n' "$name" "$dir" "$word" "$cmd" "$goal" "$b64" \
+    "$check" "$slb" "$cont" "$ans" "$line"; cat <<'EOS'
+host=$(hostname -s)
+if [ "$CONT" = 1 ]; then   # answering the agent's start-up question, then typing the first message once it is ready
+  tmux has-session -t "=$N" 2> /dev/null || { echo "The tmux session $N isn't running on $host any more." >&2; exit 4; }
+  if [ "$ANS" = "<enter>" ]; then tmux send-keys -t "$N" Enter
+  elif [ -n "$ANS" ]; then tmux send-keys -t "$N" -l -- "$ANS" && sleep 0.4 && tmux send-keys -t "$N" Enter; fi
+  line="$LINE0" f=""; sleep 1
+else
+command -v tmux > /dev/null || { echo "tmux isn't installed on $host." >&2; exit 4; }
+if tmux has-session -t "=$N" 2> /dev/null; then echo "A tmux session called $N already exists on $host. Pick another name." >&2; exit 5; fi
+case "$D" in "~/"*) D="$HOME/${D#\~/}" ;; esac
+new=0
+if [ -d "$D" ]; then [ -w "$D" ] || { echo "$D exists but you can't write to it." >&2; exit 6; }
+else p=$(dirname "$D"); while [ ! -d "$p" ]; do p=$(dirname "$p"); done
+  [ -w "$p" ] || { echo "Can't create $D: $p isn't writable." >&2; exit 6; }; new=1; fi
+bash -lic "type $A" > /dev/null 2>&1 < /dev/null || { echo "$A isn't available in a login shell on $host." >&2; exit 7; }
+if [ "$CHK" = 1 ]; then
+  echo "Ready to start: tmux session $N on $host, $A, in $([ $new = 1 ] && echo 'a new folder' || echo 'the existing folder') $D"; exit 0
+fi
+mkdir -p -- "$D" || { echo "Couldn't create $D." >&2; exit 6; }
+if [ -n "$SLB" ]; then mkdir -p "$HOME/.cache/mission-control" && printf '%s' "$SLB" | base64 -d > "$HOME/.cache/mission-control/claude_statusline.py"; fi
+msg=$(printf '%s' "$B" | base64 -d); line="" f=""
+if [ -n "$msg" ]; then   # short first messages are typed; longer ones are saved in the folder for the agent to read
+  if [ ${#msg} -gt 400 ] || [ "$(printf '%s' "$msg" | wc -l)" -gt 0 ]; then
+    base=START_TASK; [ "$G" = 1 ] && base=START_GOAL
+    f="$D/$base.md"; [ -e "$f" ] && f="$D/${base}_$(date +%Y%m%d-%H%M%S).md"
+    printf '%s\n' "$msg" > "$f" || { echo "Couldn't write $f." >&2; exit 6; }
+    line="Read $(basename "$f") in this folder and carry it out as your instructions."
+  else line="$msg"; fi
+  [ "$G" = 1 ] && line="/goal $line"
+fi
+tmux new-session -d -s "$N" -c "$D" -x 200 -y 50 || { echo "tmux couldn't start the session." >&2; exit 6; }
+sleep 2
+tmux send-keys -t "$N" -l -- "$C" && tmux send-keys -t "$N" Enter
+fi
+q='Allow (this|command)|Approve|Do you want to|\[y/N\]|\(y/n\)|Press enter to continue|trust (the|this)|Yes, (proceed|continue)|sign in|log ?in to|Update available|Select (an option|a model)'
+mk='context left|Ask Codex|send|for shortcuts|Esc to interrupt|bypass permissions|accept edits'
+state=starting prev="" same=0
+for i in $(seq 1 45); do
+  sleep 1
+  scr=$(tmux capture-pane -p -J -t "$N" 2> /dev/null) || { state=gone; break; }   # what is on screen now
+  pc=$(tmux display -p -t "$N" '#{pane_current_command}' 2> /dev/null)
+  case "$pc" in bash|-bash|sh|zsh|dash|ksh|tcsh|csh|fish|login|"") agent_up=0 ;; *) agent_up=1 ;; esac
+  if printf '%s\n' "$scr" | tail -n 30 | grep -Eiq "$q"; then state=question; break; fi
+  [ "$scr" = "$prev" ] && same=$((same + 1)) || { same=0; prev="$scr"; }
+  if [ "$agent_up" = 1 ] && { printf '%s\n' "$scr" | grep -Eq "$mk" || { [ $i -ge 10 ] && [ $same -ge 3 ]; }; }; then state=ready; break; fi
+  [ "$agent_up" = 0 ] && [ $i -ge 15 ] && { state=noagent; break; }
+done
+if [ "$state" = ready ] && [ -n "$line" ]; then
+  tmux send-keys -t "$N" -l -- "$line" && sleep 0.6 && tmux send-keys -t "$N" Enter
+  sleep 4
+fi
+echo "---state:$state"; [ -n "$f" ] && echo "---file:$f"; [ -n "$line" ] && echo "---line:$line"
+echo "---screen---"
+tmux capture-pane -p -J -t "$N" -S -40 2> /dev/null | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'
+case "$state" in ready) exit 0 ;; question) exit 8 ;; noagent) exit 7 ;; *) exit 9 ;; esac
+EOS
+)
+  printf '%s\n' "$script" | run_node "$host" bash -s
+}
+
+# Press a key in an agent's tmux pane: Esc interrupts what the agent is doing (it keeps the session).
+press_key() {  # mctl key --goal NAME esc
+  local goal="" k="" info node pane key notmux
+  while [ $# -gt 0 ]; do case "$1" in --goal) goal="${2:-}"; shift 2 ;; *) k="$1"; shift ;; esac; done
+  [ "$k" = esc ] || { echo "usage: mctl key --goal NAME esc" >&2; return 2; }
+  info=$($PY "$MC_DIR/lib/mc.py" send-target ${goal:+"$goal"}) || return 1
+  IFS=$'\t' read -r node pane key notmux <<< "$info"
+  [ "$notmux" = 1 ] && { echo "$key runs outside tmux." >&2; return 5; }
+  discover /dev/null
+  printf 'P=%q\n%s\n' "$pane" 'tmux send-keys -t "$P" Escape || exit 4; sleep 2; echo "---screen---"; tmux capture-pane -p -J -t "$P" -S -30 | awk '"'"'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++)print l[i]}'"'"'' \
+    | run_node "$node" bash -s
+}
+
+# End a session: closes its tmux session (all terminals of its group), which stops the agent. Its conversation stays in
+# the agent's own logs (codex resume / claude --resume can pick it up again).
+end_session() {  # mctl end --goal NAME --confirm NAME
+  local goal="" conf="" info node pane key notmux
+  while [ $# -gt 0 ]; do case "$1" in --goal) goal="${2:-}"; shift 2 ;; --confirm) conf="${2:-}"; shift 2 ;; *) shift ;; esac; done
+  info=$($PY "$MC_DIR/lib/mc.py" send-target ${goal:+"$goal"}) || return 1
+  IFS=$'\t' read -r node pane key notmux <<< "$info"
+  [ "$notmux" = 1 ] && { echo "$key runs outside tmux, so mission control can't end it." >&2; return 5; }
+  [ "$conf" = "$key" ] || { echo "Type the session name exactly to confirm." >&2; return 2; }
+  discover /dev/null
+  printf 'P=%q\n%s\n' "$pane" 's=$(tmux display -p -t "$P" "#{session_name}") || { echo "That session is already gone." >&2; exit 4; }
+g=$(tmux display -p -t "$P" "#{session_group}"); n=0
+for x in $(tmux list-sessions -F "#{session_name}|#{session_group}"); do
+  [ "${x%%|*}" = "$s" ] || { [ -n "$g" ] && [ "${x#*|}" = "$g" ]; } && { tmux kill-session -t "=${x%%|*}" && n=$((n + 1)); }
+done
+echo "Ended tmux session $s ($n terminal(s))."' | run_node "$node" bash -s
+}
+
 ensure_server() {  # the local web page server (http://localhost:PORT) that lets the dashboard send messages
   [ "${WEB_SERVER:-1}" = 1 ] || return 0
   local mt
@@ -696,6 +830,9 @@ case "$cmd" in
   open) open_dash ;;
   peek) peek "$@" ;;
   send) send_msg "$@" ;;
+  launch) launch "$@" ;;
+  key) press_key "$@" ;;
+  end) end_session "$@" ;;
   phone) phone ;;
   serve) MC_ARCHIVE_DIR="$ARCHIVE" MC_PORT="${WEB_PORT:-8765}" exec $PY "$MC_DIR/lib/server.py" ;;
   goals) $PY "$MC_DIR/lib/mc.py" goals ;;
