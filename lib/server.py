@@ -29,6 +29,7 @@ ARCHIVE = os.environ.get("MC_ARCHIVE_DIR") or os.path.expanduser("~/.local/state
 PORT0 = int(os.environ.get("MC_PORT") or 8765)
 MY_HOST = (os.environ.get("MC_HOST") or "").lower()   # this machine's name in mission control
 LAST_NUDGE = [0.0]
+LAST_LAUNCH_NUDGE = [0.0]
 SERVE_EXT = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css",
              ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
 os.makedirs(ARCHIVE, exist_ok=True)
@@ -155,6 +156,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fp = self._file(urllib.parse.unquote((urllib.parse.parse_qs(u.query).get("p") or ["/"])[0]))
             host, t = self._collector()
             return self._json(200, {"mtime": os.path.getmtime(fp) if fp else 0, "collected": t, "by": host})
+        if path == "/api/launch-info":   # the New-session dialog's options, as of the last collection
+            try:
+                return self._json(200, json.load(open(os.path.join(MC_DIR, "state", "launch.json"))))
+            except (OSError, ValueError):
+                return self._json(200, {})
         fp = self._file(path)
         if not fp:
             return self._reply(404, "not found", "text/plain")
@@ -166,6 +172,96 @@ class Handler(http.server.BaseHTTPRequestHandler):
             inject = '<script>window.MC_SEND={"token":"%s","port":%d,"mtime":%.3f}</script></head>' % (TOKEN, PORT, mtime)
             data = data.replace(b"</head>", inject.encode(), 1)
         self._reply(200, data, SERVE_EXT[ext])
+
+    @staticmethod
+    def _mctl(args, timeout=120):
+        try:
+            p = subprocess.run(["bash", os.path.join(MC_DIR, "mctl")] + args, capture_output=True, text=True, timeout=timeout)
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", "timed out reaching the node"
+
+    @staticmethod
+    def _log(entry):
+        entry["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(ARCHIVE, "sent.log"), "a", encoding="utf-8") as lg:
+            lg.write(json.dumps(entry) + "\n")
+
+    def _launch(self, req):
+        """Start a new agent session in tmux (mctl launch); check=True only checks that it could start."""
+        f = {k: str(req.get(k) or "").strip() for k in ("host", "name", "dir", "agent", "model", "effort", "cmd")}
+        text, check, goal = str(req.get("text") or ""), bool(req.get("check")), bool(req.get("goal"))
+        cont = bool(req.get("continue"))
+        if cont:   # answer the agent's start-up question, then type the first message once it is ready
+            f = {"host": f["host"], "name": f["name"]}
+            text, check, goal = "", False, False
+            extra = ["--continue", "--answer", str(req.get("answer") or "")[:200], "--line", str(req.get("line") or "")[:600]]
+        else:
+            extra = []
+        if len(text) > 100000:
+            return {"ok": False, "message": "That first message is too long (100,000 characters at most)."}
+        args = ["launch"] + sum([["--" + k, v] for k, v in f.items() if v], []) + (["--goal"] if goal else []) + (["--check"] if check else []) + extra
+        tmp = None
+        if text.strip() and not check:
+            with tempfile.NamedTemporaryFile("w", delete=False, dir=ARCHIVE, prefix="launch-", suffix=".txt", encoding="utf-8") as fh:
+                fh.write(text)
+                tmp = fh.name
+            args += ["--file", tmp]
+        try:
+            rc, out, err = self._mctl(args, timeout=150)
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        if not check:
+            self._log({"launch": f, "goal": goal, "rc": rc, "text": text[:2000]})
+        info = {}
+        for line in out.splitlines():
+            mm = re.match(r"^---(state|file|line):(.*)$", line)
+            if mm:
+                info[mm.group(1)] = mm.group(2)
+        screen = out.split("---screen---", 1)[1].strip("\n") if "---screen---" in out else ""
+        msg = (err.strip().splitlines() or [""])[-1] or (out.strip().splitlines() or [""])[0]
+        if check:
+            return {"ok": rc == 0, "message": msg}
+        if rc in (0, 7, 8, 9) and info.get("state"):   # a new session: collect now so it shows up soon
+            host, t = self._collector()
+            if not (host and MY_HOST and host.lower() != MY_HOST) and time.time() - LAST_LAUNCH_NUDGE[0] > 60:
+                LAST_LAUNCH_NUDGE[0] = time.time()
+                with open(os.path.join(ARCHIVE, "collect.now"), "w") as fh:
+                    fh.write("launch")
+        state = info.get("state", "")
+        res = {"ok": rc == 0, "code": rc, "state": state, "screen": screen, "file": info.get("file", ""), "line": info.get("line", "")}
+        if rc == 0 and cont:
+            res["message"] = "Done: the agent is ready%s." % (" and has your first message" if info.get("line") else "")
+        elif rc == 0:
+            res["message"] = "Started %s. It appears in the tabs within about a minute." % f["name"]
+        elif rc == 8:
+            res["message"] = ("The agent is asking something before it starts (see its screen below). Answer it here"
+                              "%s." % (" and your first message goes in right after" if info.get("line") else ""))
+        elif rc in (7, 9) and state:
+            res["message"] = ("The session started, but the agent %s, so your first message wasn't typed." %
+                              ("didn't start (see the screen)" if rc == 7 else "wasn't ready in time"))
+        else:
+            res["message"] = msg or "Couldn't start the session."
+        return res
+
+    def _session_action(self, path, req):
+        key = str(req.get("key") or "")
+        if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
+            return {"ok": False, "message": "Unknown session."}
+        if path == "/api/key":
+            rc, out, err = self._mctl(["key", "--goal", key, "esc"], timeout=60)
+            self._log({"key": key, "press": "esc", "rc": rc})
+        else:
+            rc, out, err = self._mctl(["end", "--goal", key, "--confirm", str(req.get("confirm") or "")], timeout=60)
+            self._log({"key": key, "end": True, "rc": rc})
+        screen = out.split("---screen---", 1)[1].strip("\n") if "---screen---" in out else ""
+        msg = (err.strip().splitlines() or [""])[-1] or (out.strip().splitlines() or [""])[0]
+        return {"ok": rc == 0, "message": msg if rc else (out.strip().splitlines() or ["Done."])[-1] if path == "/api/end" else "Pressed Esc.",
+                "screen": screen}
 
     def _collect_now(self):
         """The refresh button: wake the collector for a cycle now (only on the machine that collects, at most once a minute)."""
@@ -189,7 +285,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path not in ("/api/send", "/api/collect"):
+        if path not in ("/api/send", "/api/collect", "/api/launch", "/api/key", "/api/end"):
             return self._reply(404, "not found", "text/plain")
         origin = self.headers.get("Origin", "").lower()
         if (self.headers.get("Host", "").lower() not in self._allowed_hosts() or not self._remote_ok()
@@ -203,6 +299,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(min(n, 200000)).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return self._json(400, {"ok": False, "message": "Bad request."})
+        if path == "/api/launch":
+            return self._json(200, self._launch(req))
+        if path in ("/api/key", "/api/end"):
+            return self._json(200, self._session_action(path, req))
         key, text, force = str(req.get("key") or ""), str(req.get("text") or ""), bool(req.get("force"))
         if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
             return self._json(400, {"ok": False, "message": "Unknown session."})
