@@ -1034,11 +1034,11 @@ def param_scan(roots, cache):
     scans = cache.setdefault("param_scans", {})
     ckey = "|".join(roots)
     last = scans.get(ckey)
-    if last and T0 - last.get("t", 0) < SCAN_EVERY_MIN * 60 and last.get("watch") == WATCH:
+    if last and T0 - last.get("t", 0) < SCAN_EVERY_MIN * 60 and last.get("watch") == WATCH and last.get("v") == 2:
         last["cached"] = True
         return last
     res = {"t": T0, "roots": roots, "watch": WATCH, "values": {}, "examples": {}, "files": 0, "dirs": 0, "truncated": False,
-           "metric_files": [], "train_inputs": []}
+           "metric_files": [], "train_inputs": [], "codes": {}, "v": 2}
     if not roots:
         res["note"] = "no scan roots or no watched parameters"
         scans[ckey] = res
@@ -1047,6 +1047,9 @@ def param_scan(roots, cache):
     names = set(PARAM_FILES)
     budget_end = time.time() + 25
     keys = set(WATCH)
+
+    def code(name):
+        res["codes"][name] = res["codes"].get(name, 0) + 1
 
     def note(k, v, path):
         res["values"].setdefault(k, {})
@@ -1064,6 +1067,38 @@ def param_scan(roots, cache):
                 break
             for fn in filenames:
                 low = fn.lower()
+                if fn == "INCAR":
+                    code("VASP")
+                if fn == "POTCAR" or low.startswith("in.") or low.endswith((".lmp", ".lammps")):
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        stt = os.stat(fp)
+                        if stt.st_mtime < cutoff or stt.st_size > 12e6:
+                            continue
+                        with open(fp, "r", errors="replace") as f:
+                            txt = f.read(12000000 if fn == "POTCAR" else 40000)
+                    except Exception:  # noqa
+                        continue
+                    if fn == "POTCAR":   # pseudopotentials: one per element, e.g. "TITEL = PAW_PBE Hf_pv 06Sep2000"
+                        for m in re.finditer(r"TITEL\s*=\s*(\S+)\s+(\S+)", txt):
+                            el = re.split(r"[_.]", m.group(2))[0]
+                            if "POT_" + el.upper() in keys or "POT_*" in keys:
+                                note("POT_" + el.upper(), m.group(2).upper(), fp)
+                            if "POT_SET" in keys:
+                                note("POT_SET", m.group(1).upper(), fp)
+                    elif re.search(r"^\s*pair_style\s", txt, re.M):   # a LAMMPS input
+                        code("LAMMPS")
+                        for k2, rx in (("LMP_PAIR_STYLE", r"^\s*pair_style\s+(\S+)"), ("LMP_UNITS", r"^\s*units\s+(\S+)"),
+                                       ("LMP_TIMESTEP", r"^\s*timestep\s+(\S+)")):
+                            m = re.search(rx, txt, re.M)
+                            if m and k2 in keys:
+                                v = m.group(1)
+                                try:
+                                    v = "%g" % float(v)
+                                except ValueError:
+                                    v = v.upper()[:40]
+                                note(k2, v, fp)
+                    continue
                 if fn not in names:
                     fp = os.path.join(dirpath, fn)
                     try:
@@ -1101,6 +1136,25 @@ def param_scan(roots, cache):
                             t_s, v_s = systems(tr.get("training_data")), systems(tr.get("validation_data"))
                             if t_s:
                                 res["train_inputs"].append({"file": fp, "mtime": stt.st_mtime, "train": t_s, "valid": v_s})
+                            mo = j.get("model") if isinstance(j, dict) else None
+                            if isinstance(mo, dict) and isinstance(mo.get("descriptor"), dict):   # a DeePMD training input
+                                code("DeePMD")
+                                de, lr, lo = mo["descriptor"], j.get("learning_rate") or {}, j.get("loss") or {}
+                                fit = mo.get("fitting_net") or {}
+                                for k2, v in (("DP_DESCRIPTOR", de.get("type")), ("DP_RCUT", de.get("rcut")), ("DP_RCUT_SMTH", de.get("rcut_smth")),
+                                              ("DP_SEL", de.get("sel")), ("DP_NEURON", de.get("neuron")), ("DP_FIT_NEURON", fit.get("neuron")),
+                                              ("DP_TYPE_MAP", mo.get("type_map")), ("DP_START_LR", lr.get("start_lr")), ("DP_STOP_LR", lr.get("stop_lr")),
+                                              ("DP_NUMB_STEPS", tr.get("numb_steps")), ("DP_START_PREF_E", lo.get("start_pref_e")),
+                                              ("DP_START_PREF_F", lo.get("start_pref_f")), ("DP_LIMIT_PREF_F", lo.get("limit_pref_f"))):
+                                    if v is None or k2 not in keys:
+                                        continue
+                                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                                        v = "%g" % v
+                                    elif isinstance(v, list):
+                                        v = ",".join(str(x) for x in v)[:60].upper()
+                                    else:
+                                        v = str(v).upper()[:40]
+                                    note(k2, v, fp)
                         except Exception:  # noqa
                             pass
                     continue
@@ -1372,6 +1426,28 @@ def main():
             if t:
                 dec.append({"file": os.path.join(c, name), "tail": [trunc(x, 400) for x in t]})
     out["decisions"] = dec
+    specs, reqs = {}, {}
+    for c in cwds[:8]:
+        for name in ("START_GOAL.md", "START_TASK.md", "GOAL.md"):   # the goal's own written instructions
+            fp = os.path.join(c, name)
+            try:
+                st = os.stat(fp)
+                if st.st_size > 400000:
+                    continue
+                with open(fp, "r", errors="replace") as f:
+                    specs.setdefault(c, {})[name] = {"text": f.read(80000), "mtime": st.st_mtime}
+            except Exception:  # noqa
+                continue
+        fp = os.path.join(c, ".mc", "requests.jsonl")   # the agent asking you to change a contract rule
+        for line in tail_file(fp, 40000, 60) or []:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict):
+                reqs.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("id", "param", "value", "why", "rule", "ts")})
+    out["specs"] = specs
+    out["requests"] = reqs
     out["git"] = {c: git_info(c) for c in cwds[:8]}
     out["elapsed_s"] = round(time.time() - T0, 2)
     try:
