@@ -162,9 +162,13 @@ when you start a new tmux session.
   `mctl hosts add NAME` and `mctl hosts remove NAME` edit `HOSTS` for every machine.
 - Your other PCs: a PC that stands by (not collecting) publishes its own WSL sessions to the shared folder
   (`state/pcs/`), so your laptops' sessions show up on the dashboard too, and you can message,
-  answer, interrupt and start sessions on them. Those requests travel through the shared folder
-  (`state/inbox/` and `state/outbox/`) and the other PC runs them within a few seconds of OneDrive syncing.
+  answer, interrupt and start sessions on them. Those requests go straight to the other PC over Tailscale
+  (under a second). When Tailscale can't get through (a VPN such as Proton or a university VPN in the way,
+  Tailscale off, the PC asleep), they go through the shared folder instead (`state/inbox/` and
+  `state/outbox/`, about a minute, as fast as OneDrive syncs). The reply says which way it went.
   The same route lets a laptop's dashboard act through the PC that has the connections.
+  Each PC's collector shares its server with your own Tailscale devices by itself (the same as
+  `mctl phone`); `RELAY_TAILSCALE=0` in config.env keeps everything on the shared folder.
   `PUBLISH_PC=0` in a machine's config turns publishing off.
 - New session lists every watched host with its own accounts, models and starting folder.
 - Hide anything you don't need: hover over a block and click its x (that browser only; the

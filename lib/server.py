@@ -12,6 +12,8 @@ requests here over your private tailnet and tags each with the Tailscale login i
 arriving that way are accepted only from your own Tailscale login; anything else from outside is refused,
 so even turning on Tailscale Funnel (public) by mistake would not expose the dashboard.
 """
+import hashlib
+import hmac
 import http.server
 import json
 import os
@@ -21,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -52,7 +55,9 @@ def load_token():
 
 TOKEN = load_token()
 PORT = PORT0
-_TS = {"t": 0, "name": "", "login": ""}
+_TS = {"t": 0, "name": "", "login": "", "ip": ""}
+SEEN_RELAY = {}   # relay ids already run (with when), so a request can't be replayed
+_ROUTE = threading.local()   # how this request's action reached another PC (Tailscale or the shared folder), for the reply
 
 
 def tailscale():
@@ -72,6 +77,10 @@ def tailscale():
         _TS["name"] = (me.get("DNSName") or "").rstrip(".").lower()
         user = (d.get("User") or {}).get(str(me.get("UserID")), {})
         _TS["login"] = (user.get("LoginName") or "").lower()
+        _TS["ip"] = next((x for x in me.get("TailscaleIPs") or [] if "." in x), "")
+        if _TS["name"] and _TS["ip"]:   # so your other PCs can reach this one (see relay in mctl)
+            subprocess.run([sys.executable, os.path.join(MC_DIR, "lib", "mc.py"), "ts-publish", _TS["name"], _TS["ip"]],
+                           capture_output=True, timeout=30)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return _TS
@@ -123,6 +132,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _json(self, code, obj):
+        note = getattr(_ROUTE, "note", "")
+        if note and isinstance(obj, dict):
+            obj.setdefault("route", note)
+        _ROUTE.note = ""
         self._reply(code, json.dumps(obj))
 
     @staticmethod
@@ -177,9 +190,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _mctl(args, timeout=120):
         try:
             p = subprocess.run(["bash", os.path.join(MC_DIR, "mctl")] + args, capture_output=True, text=True, timeout=timeout)
-            return p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
             return 124, "", "timed out reaching the node"
+        m = re.findall(r"^relay-route: (\w+) (\S+)$", p.stderr, re.M)
+        if m:
+            how, pc = m[-1]
+            _ROUTE.note = ("via Tailscale to %s" % pc) if how == "tailscale" else (
+                "via OneDrive to %s, slower: it wasn't reachable over Tailscale (a VPN, or Tailscale off)" % pc)
+        return p.returncode, p.stdout, re.sub(r"^relay-route: .*\n?", "", p.stderr, flags=re.M)
 
     @staticmethod
     def _log(entry):
@@ -324,8 +342,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
         return {"ok": True, "started": True, "message": "Collecting fresh data now (about a minute). The page updates when it arrives."}
 
+    def _relay_in(self):
+        """A request from another of your PCs (relay in mctl), over your tailnet: your own Tailscale login, a valid
+        signature with the shared key, a fresh timestamp and a new id. Runs it like the shared-folder route does."""
+        login = (self.headers.get("Tailscale-User-Login") or "").lower()
+        if self.headers.get("Host", "").lower() not in self._allowed_hosts() or not login or login not in allowed_logins():
+            return self._json(403, {"ok": False, "message": "refused"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(min(n, 2000000))
+            key = open(os.path.join(MC_DIR, "state", "relay.key")).read().strip()
+            req = json.loads(body.decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return self._json(403, {"ok": False, "message": "refused"})
+        good = hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+        rid = str(req.get("id") or "")
+        if len(key) < 32 or not secrets.compare_digest(self.headers.get("X-MC-Sig", ""), good) or not re.match(r"^[0-9]{6,12}-[0-9]{1,12}$", rid):
+            return self._json(403, {"ok": False, "message": "refused"})
+        now = time.time()
+        for k in [k for k, t in SEEN_RELAY.items() if now - t > 900]:
+            SEEN_RELAY.pop(k, None)
+        if rid in SEEN_RELAY or abs(now - float(req.get("time") or 0)) > 180:
+            return self._json(403, {"ok": False, "message": "refused (stale or repeated)"})
+        SEEN_RELAY[rid] = now
+        tmpd = tempfile.mkdtemp(dir=ARCHIVE, prefix="relay-")
+        try:
+            fp = os.path.join(tmpd, "request.json")
+            with open(fp, "wb") as f:
+                f.write(body)
+            subprocess.run([sys.executable, os.path.join(MC_DIR, "lib", "mc.py"), "relay-run", fp, tmpd], capture_output=True, timeout=180,
+                           env=dict(os.environ, MC_DIR=MC_DIR))
+            res = json.load(open(os.path.join(tmpd, rid + ".json")))
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            res = {"id": rid, "rc": 124 if isinstance(e, subprocess.TimeoutExpired) else 1, "out": "", "err": "relay: %s\n" % e.__class__.__name__}
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
+        self._log({"relay": rid, "from": req.get("from"), "rc": res.get("rc"), "via": "tailscale"})
+        return self._json(200, res)
+
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        _ROUTE.note = ""
+        if path == "/api/relay":
+            return self._relay_in()
         if path not in ("/api/send", "/api/collect", "/api/launch", "/api/key", "/api/end", "/api/answer", "/api/contract"):
             return self._reply(404, "not found", "text/plain")
         origin = self.headers.get("Origin", "").lower()
@@ -400,6 +459,15 @@ def main():
     with open(os.path.join(ARCHIVE, "port"), "w") as f:
         f.write(str(PORT))
     sys.stderr.write("%s serving %s at http://localhost:%d\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), MC_DIR, PORT))
+
+    def ts_refresh():   # keeps this PC's Tailscale name and address current for your other PCs
+        while True:
+            try:
+                tailscale()
+            except Exception:  # noqa
+                pass
+            time.sleep(310)
+    threading.Thread(target=ts_refresh, daemon=True).start()
     srv.serve_forever()
 
 

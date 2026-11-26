@@ -3448,8 +3448,9 @@ function send(force){var t=ta.value;if(!t.trim())return;btn.disabled=true;window
  .then(function(r){return r.json();}).then(function(d){btn.disabled=false;window.MC_BUSY=false;
   var when=new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}),scr=d.screen?'<pre class="sendscr">'+esc(d.screen)+'</pre>':'';
   if(d.ok){var sent=ta.value;ta.value='';ta.style.height='';
-   if(box.getAttribute('data-compact')==='1')res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+'</div>'+(scr?'<details class="scr"><summary class="small">The agent\u2019s screen a few seconds later</summary>'+scr+'</details>':'');
-   else res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+'. The agent\u2019s screen a few seconds later:</div>'+scr;
+   var via=d.route?' \u00b7 '+esc(d.route):'';
+   if(box.getAttribute('data-compact')==='1')res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+via+'</div>'+(scr?'<details class="scr"><summary class="small">The agent\u2019s screen a few seconds later</summary>'+scr+'</details>':'');
+   else res.innerHTML='<div class="small sentok">\u2713 Sent at '+when+via+'. The agent\u2019s screen a few seconds later:</div>'+scr;
    var bk=box.getAttribute('data-key');if(bk&&sent.trim()){var bd=document.createElement('div');bd.className='cacts';bd.setAttribute('data-ckey',bk);
     var bb=document.createElement('button');bb.type='button';bb.className='btn2 sm';bb.textContent='Make this binding';bb.setAttribute('data-cop','amend');
     bb.setAttribute('data-ctext',sent.trim().slice(0,1200));bb.setAttribute('data-cconfirm','Add this message to the contract as an amendment, so later checks hold the agent to it?');
@@ -3472,7 +3473,8 @@ TOOLS_JS = r"""<script>
 (function(){
 // New-session dialog, session actions (interrupt / copy terminal command / end) and desktop alerts.
 var S=window.MC_SEND||null,served=!!(S&&/^https?:/.test(location.protocol));
-function post(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-MC-Token':S.token},body:JSON.stringify(b)}).then(function(r){return r.json();});}
+function post(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-MC-Token':S.token},body:JSON.stringify(b)}).then(function(r){return r.json();})
+ .then(function(j){if(j&&j.route&&j.message)j.message+=' ('+j.route+')';return j;});}
 function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function rs(t){return t?' · resets '+new Date(t*1000).toLocaleString([],{weekday:'short',hour:'numeric',minute:'2-digit'}):'';}
 function wins(ws){return (ws||[]).map(function(w){var l=Math.max(0,Math.round(100-w.used)),c=l<10?'bad-t':(l<25?'warn-t':'ok-t');
@@ -4158,6 +4160,90 @@ def cmd_discover(args):
             print("%s=%s" % (a, hit))
 
 
+# ---------------------------------------------------------------- relay between your PCs over Tailscale
+# A request for another PC goes straight to that PC's mission control server over your tailnet (seconds). If it can't
+# get there (a VPN in the way, Tailscale off, the PC asleep), mctl falls back to the shared folder (about a minute).
+# Each request is signed with a key kept in the shared folder, and the receiving server also requires your own
+# Tailscale login, a fresh timestamp and an id it hasn't seen.
+def relay_key():
+    p = os.path.join(STATE, "relay.key")
+    try:
+        with open(p) as f:
+            k = f.read().strip()
+        if len(k) >= 32:
+            return k
+    except OSError:
+        pass
+    import secrets
+    os.makedirs(STATE, exist_ok=True)
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(32))
+    except FileExistsError:
+        pass
+    with open(p) as f:
+        return f.read().strip()
+
+
+def relay_sig(key, body):
+    import hmac
+    return hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+
+
+def cmd_relay_send(pc, reqfile):
+    """Hand one request to another PC over Tailscale. Exit 0: done (result JSON printed). Exit 3: couldn't reach it,
+    nothing ran, use the shared folder. Exit 4: it was delivered but no answer came back (don't send it again)."""
+    import http.client
+    import socket
+    import ssl
+    info = rjson(os.path.join(STATE, "ts", pc + ".json"), None) or {}
+    name, ip = str(info.get("name") or ""), str(info.get("ip") or "")
+    if not name or not ip or time.time() - float(info.get("t") or 0) > 3 * 86400 or os.environ.get("RELAY_TAILSCALE", "1") == "0":
+        return 3
+    body = open(reqfile, "rb").read()
+    try:
+        ctx = ssl.create_default_context()
+        sock = socket.create_connection((ip, 443), timeout=3)
+        tls = ctx.wrap_socket(sock, server_hostname=name)
+    except (OSError, ssl.SSLError):
+        return 3
+    try:
+        tls.settimeout(175)
+        conn = http.client.HTTPSConnection(name, 443, context=ctx, timeout=175)
+        conn.sock = tls
+        conn.request("POST", "/api/relay", body=body, headers={"Content-Type": "application/json", "Host": name,
+                                                                 "X-MC-Sig": relay_sig(relay_key(), body)})
+    except (OSError, http.client.HTTPException, ssl.SSLError):
+        return 3
+    try:
+        r = conn.getresponse()
+        data = r.read()
+    except (OSError, http.client.HTTPException, ssl.SSLError):
+        return 4
+    if r.status in (403, 404, 405, 502, 503):   # not set up there, refused before running: the shared folder is next
+        return 3
+    try:
+        res = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return 4
+    print(json.dumps(res))
+    return 0
+
+
+def ts_publish(name, ip):
+    """Each PC's server notes its Tailscale name and address here, so the others can reach it."""
+    me = (os.environ.get("MC_HOST") or LOCAL_NAME).lower()
+    p = os.path.join(STATE, "ts", me + ".json")
+    cur = rjson(p, {}) or {}
+    if cur.get("name") == name and cur.get("ip") == ip and time.time() - float(cur.get("t") or 0) < 6 * 3600:
+        return
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p + ".tmp", "w") as f:
+        json.dump({"name": name, "ip": ip, "t": time.time()}, f)
+    os.replace(p + ".tmp", p)
+
+
 def cmd_relay_run(path, outdir):
     """Answer one request handed over from another of your PCs through the shared folder (see relay in mctl): run its
     script here, or on the node it names through this PC's connections, and write the result for the asker."""
@@ -4313,6 +4399,12 @@ def main():
         print("%s\t%s\t%s" % (gg["node"], gg.get("target") or gg["name"], gg["key"]))
     elif a[0] == "contract-edit":
         sys.exit(cmd_contract_edit(a[1], json.loads(sys.stdin.read() or "{}")))
+    elif a[0] == "relay-send":
+        sys.exit(cmd_relay_send(a[1], a[2]))
+    elif a[0] == "ts-publish":
+        ts_publish(a[1], a[2])
+    elif a[0] == "relay-key":
+        relay_key()
     elif a[0] == "relay-run":
         cmd_relay_run(a[1], a[2])
     elif a[0] == "digest-config":
