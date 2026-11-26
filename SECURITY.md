@@ -54,8 +54,9 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
   in; keep the folder private.
 - Contract upkeep only adds or tightens rules by itself; loosening one always needs your Approve. It reads the
   agent's instruction files and `.mc/requests.jsonl` in its folder, and writes nothing on the cluster.
-- Messages to an agent about the contract (your answer to its request, "Tell the agent how to ask") are sent
-  only when you press that button.
+- Messages to an agent about the contract (a rule you lock, unlock or allow, a criterion or amendment you
+  add, your answer to its request, "Tell the agent how to ask") are sent only when you press that button
+  and confirm. `CONTRACT_TELL_AGENT=0` in config.env keeps contract changes from being messaged.
 - It never submits or cancels jobs.
 - To report Claude's usage it gives sessions it starts a status line script
   (`~/.cache/mission-control/claude_statusline.py`) that saves the usage numbers and then runs your own
