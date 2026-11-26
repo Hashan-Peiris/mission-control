@@ -710,7 +710,7 @@ def cmd_contract_edit(key, req):
     name = str(req.get("name") or "").upper().strip()
     if name and not re.match(r"^[A-Z_][A-Z0-9_]{0,40}$", name):
         return out(False, "That isn't a parameter name.")
-    agent_msg, msg = None, ""
+    agent_msg, msg, was, bound = None, "", "", ""
     try:
         if op == "set":
             rop, val = str(req.get("rule_op") or "=="), str(req.get("val") or "").strip()
@@ -726,6 +726,7 @@ def cmd_contract_edit(key, req):
             if not e or not e["op"]:
                 return out(False, "%s has no rule." % name)
             raw = CT.set_watch(raw, name)
+            was = "%s %s" % (e["op"], e["val"])
             st.setdefault("unlocked", []).append(name)
             raw, aid = CT.add_amendment(raw, "Unlocked %s on the dashboard (was %s %s)" % (name, e["op"], e["val"]))
             msg = "%s is unlocked (any change is still shown)" % name
@@ -757,6 +758,7 @@ def cmd_contract_edit(key, req):
             if not u:
                 return out(False, "That instruction isn't in the latest data any more.")
             raw, aid = CT.add_amendment(raw, "%s (from %s)" % (trunc(u["text"], 1200), u["id"]))
+            bound = u["text"]
             msg = "Your instruction %s is now binding (%s)" % (u["id"], aid)
         elif op in ("approve", "reject"):
             raw, msg, info = CT.decide(raw, st, str(req.get("pid") or ""), op == "approve")
@@ -784,6 +786,18 @@ def cmd_contract_edit(key, req):
         return out(False, str(e))
     if op in ("set", "allow", "keep") and name in (st.get("unlocked") or []):
         st["unlocked"] = [x for x in st["unlocked"] if x != name]
+    # Tell the agent what changed (you pressed the button), so it can plan with the new rule; CONTRACT_TELL_AGENT=0 turns it off
+    if agent_msg is None and os.environ.get("CONTRACT_TELL_AGENT", "1") != "0":
+        tell = {"set": "%s is now a rule (%s). Values outside it break the contract." % (name, msg),
+                "allow": ("%s%s." % (msg[:1].upper(), msg[1:])) if msg else "",
+                "unlock": "%s is no longer locked (it was %s). You may choose its value; say what you chose and why." % (name, was),
+                "unwatch": "%s is no longer watched." % name,
+                "criterion": "New acceptance criterion: %s" % str(req.get("text") or "").strip(),
+                "uncriterion": "This acceptance criterion was removed: %s" % str(req.get("text") or "").strip(),
+                "amend": "This is now part of the contract: %s" % str(req.get("text") or "").strip()[:1200],
+                "bind": "This instruction of mine is now part of the contract: %s" % bound[:1200]}.get(op)
+        if tell:
+            agent_msg = "[mission control] Contract change from the user: " + tell
     write_contract(raw)
     st["log"] = (st.get("log") or [])[-40:] + [{"t": time.time(), "x": "you: " + msg}]
     CT.save_state(CSTATE_DIR, key, st)
@@ -1804,7 +1818,12 @@ def analyze_goal(gdesc, shared):
     instr = []
     promoted = " ".join(a["text"] for a in contract["amends"])
     for s in sessions:
-        typed = [u for u in s.get("user", []) if u.get("typed")] or s.get("user", [])
+        meta = s.get("meta") or {}
+        robot = bool(meta.get("agent_role")) or any(w in json.dumps(meta.get("source") or "").lower() + str(meta.get("thread_source") or "")
+                                                   for w in ("guardian", "subagent", "review"))
+        if robot:   # its "user" messages come from the main agent or Codex's reviewer, not from you
+            continue
+        typed = [u for u in s.get("user", []) if u.get("typed")] or (s.get("user", []) if s.get("label") in (None, "main") else [])
         for u in typed:
             uid = hid(u["text"])
             instr.append({"id": uid, "ts": u.get("ts"), "who": s.get("label"), "host": s.get("host"),
@@ -1921,8 +1940,8 @@ def contract_card_html(s):
         meta.append("codes in use: " + ", ".join("%s (%d file%s)" % (c, n, "s" if n != 1 else "") for c, n in sorted(cc["codes"].items(), key=lambda kv: -kv[1])))
     if cc.get("specs"):
         meta.append("rules read from " + ", ".join("%s (%s)" % (n, hm(t)) for n, t in cc["specs"]))
-    o.append('<div class="small mut">Contract <span class="mono">%s</span>%s. Automatic changes only add or tighten rules; anything looser waits for your OK.</div>' % (
-        esc(cc.get("path") or ""), (" \u00b7 " + esc(" \u00b7 ".join(meta))) if meta else ""))
+    o.append('<div class="rnote" style="margin:8px 0 0" title="Automatic changes only add or tighten rules; anything looser waits for your OK.">'
+             '<span class="mono">%s</span>%s</div>' % (esc(cc.get("path") or ""), (" \u00b7 " + esc(" \u00b7 ".join(meta))) if meta else ""))
     cp = cc.get("compute") or {}
     bits = []
     if cp.get("allowed"):
@@ -1937,7 +1956,7 @@ def contract_card_html(s):
         o.append('<div class="small" style="margin-top:6px"><b>Compute</b> \u00b7 %s</div>' % esc(" \u00b7 ".join(bits)))
     pt = s["params"]["table"]
     if pt:
-        o.append('<div class="tscroll"><table style="margin-top:8px"><tr><th>Parameter</th><th>Rule</th><th>Values in recent input files</th><th></th></tr>')
+        o.append('<div class="tscroll"><table style="margin-top:8px"><tr><th>Setting</th><th>Rule</th><th title="Values in input files changed recently">Recent values</th><th></th></tr>')
         for row in pt:
             vals = ", ".join(('<span class="%s" title="%s">%s \u00d7%d</span>' % ("bad-t" if v["bad"] else "", esc(v["ex"]), esc(v["v"]), v["n"])) for v in row["values"][:6]) \
                 or '<span class="mut">none in recent files</span>'
@@ -1951,8 +1970,9 @@ def contract_card_html(s):
             elif row["values"]:
                 acts = lock_acts(row["name"], [x["v"] for x in row["values"]], cls_form=False)
             src = ('<div class="small mut" title="%s">%s</div>' % (esc(r["tag"]), esc(r["tag"].split(":")[0]))) if r.get("auto") and r.get("tag") else ""
-            o.append('<tr><td class=mono>%s</td><td class=mut>%s%s</td><td>%s</td><td><div class="cacts tight" data-ckey="%s">%s<div class="actmsg"></div></div></td></tr>' % (
-                esc(row["name"]), esc(row["rule"]), src, vals, esc(k), "".join(act_btn(a, "btn2 sm") for a in acts)))
+            menu = ('<details class="rowmenu"><summary title="Change %s">\u22ef</summary><div class="cacts" data-ckey="%s">%s<div class="actmsg"></div></div></details>' % (
+                esc(row["name"]), esc(k), "".join(act_btn(a, "btn2 sm") for a in acts))) if acts else ""
+            o.append('<tr><td class=mono>%s</td><td class=mut>%s%s</td><td>%s</td><td class="mcell">%s</td></tr>' % (esc(row["name"]), esc(row["rule"]), src, vals, menu))
         o.append("</table></div>")
     o.append('<div class="cform" data-ckey="%s"><span class="small mut">Add a rule</span>'
              '<input name="name" placeholder="ENCUT" maxlength="40" autocapitalize="characters" list="cnames-%s">'
@@ -1974,8 +1994,8 @@ def contract_card_html(s):
         o.append('<details class="clog"><summary class="small mut">Recent contract changes</summary><ul class="clist small">%s</ul></details>' % "".join(
             "<li><span class=mut>%s</span> %s</li>" % (esc(hm(x.get("t"))), esc(x.get("x"))) for x in cc["log"]))
     if not (s.get("tmux") or {}).get("notmux"):
-        o.append('<div class="cacts" data-ckey="%s" style="margin-top:10px">%s<span class="small mut"> sends the agent the protected settings '
-                 'and how to ask before changing one (its requests then show up here with Approve and Reject).</span><div class="actmsg"></div></div>' % (
+        o.append('<div class="cacts" data-ckey="%s" style="margin-top:10px" title="Its requests then show up here with Approve and Reject">%s'
+                 '<span class="small mut">sends the agent its protected settings and how to ask first</span><div class="actmsg"></div></div>' % (
                      esc(k), act_btn({"label": "Tell the agent how to ask", "op": "tell",
                                       "confirm": "Send the agent the contract's protected settings and how to ask before changing one?"}, "btn2 sm")))
     o.append("</div>")
@@ -2542,7 +2562,7 @@ def usage_html(u):
             left = max(0, 100 - w["used"])
             cls = "bad-t" if left < 10 else ("warn-t" if left < 25 else "ok-t")
             rs = (" · resets %s" % time.strftime("%a %-I:%M %p", time.localtime(w["resets"]))) if w.get("resets") else ""
-            out.append('<b class="%s">%d%%</b> of the %s left%s' % (cls, left, esc(w["label"]), rs))
+            out.append('<b class="%s">%d%%</b> left <span class="mut">(%s)%s</span>' % (cls, left, esc(w["label"]), rs))
         return "; ".join(out)
     parts = []
     for c in (u or {}).get("codex") or []:
@@ -2554,8 +2574,8 @@ def usage_html(u):
     if cl and cl["windows"]:
         parts.append('<span class="ug"><span class="kind claude">Claude</span> %s <span class="mut">(as of %s)</span></span>' % (wins(cl["windows"]), esc(ago(cl["t"]))))
     else:
-        parts.append('<span class="ug"><span class="kind claude">Claude</span> <span class="mut">not reported yet: it shows once a Claude session '
-                     'started from here replies</span></span>')
+        parts.append('<span class="ug" title="Claude\u2019s usage shows once a Claude session started from here replies"><span class="kind claude">Claude</span> '
+                     '<span class="mut">no reading yet</span></span>')
     return '<div class="usage">%s</div>' % "".join(parts)
 
 
@@ -2883,7 +2903,7 @@ def session_card(g):
     sev = "gray" if gray else {"red": "red", "amber": "amber"}.get(g["sev"], "")
     o = ['<a class="scard %s" style="%s" href="goals/%s.html"%s><div class="sh"><span class="dot %s"></span><span class="sn" title="%s">%s</span>%s</div>' % (
         sev, hue(g["key"]), esc(g["key"]), sec("o", "s:" + g["key"], "Session " + g["name"]), sev, esc(g["name"]), esc(g["name"]), kind_badge(g.get("kind")))]
-    o.append('<div class="st %s">%s</div>' % (scls, esc(stxt)))
+    o.append('<div class="st %s">%s%s</div>' % (scls, esc(stxt), ('<span class="ago"> \u00b7 active %s</span>' % esc(ago(g["last"]))) if g.get("last") and not gray else ""))
     if g.get("title") and g["title"] != g["name"]:
         o.append('<div class="obj" title="%s">%s</div>' % (esc(trunc(g["title"], 600)), esc(trunc(g["title"], 160))))
     w, we = g.get("latest_words"), g.get("latest_epoch")
@@ -2892,10 +2912,8 @@ def session_card(g):
     if w:
         o.append('<div class="words"><div class="wt"><span class="mut">%s \u00b7</span> %s</div></div>' % (esc(ago(we)), esc(trunc(re.sub(r"[*`#]", "", w).replace("\n", " "), 420))))
     meta = []
-    if g.get("last") and not gray:
-        meta.append("Active <b>%s</b>" % esc(ago(g["last"])))
     if g.get("context_left") is not None:
-        meta.append('Context <b class="%s">%d%%</b> free' % ("bad-t" if g["context_left"] <= 15 else "", g["context_left"]))
+        meta.append('<b class="%s">%d%%</b> context free' % ("warn-t" if g["context_left"] <= 15 else "", g["context_left"]))
     if g["plan_total"]:
         meta.append("Plan <b>%d/%d</b>" % (g["plan_done"], g["plan_total"]))
     if g["crit_total"]:
@@ -2906,13 +2924,11 @@ def session_card(g):
     if g.get("conv_count"):
         meta.append("<b>%s</b> messages" % "{:,}".format(g["conv_count"]))
     if g.get("model"):
-        meta.append('<span class="mdl" style="font-size:12px">%s</span>' % esc(" \u00b7 ".join(x for x in (g["model"], g.get("effort")) if x)))
-    if g["reds"] or g["ambers"]:
-        meta.append("%s%s" % (('<span class="pill bad">%d red</span> ' % g["reds"]) if g["reds"] else "",
-                              ('<span class="pill warn">%d amber</span>' % g["ambers"]) if g["ambers"] else ""))
-    o.append('<div class="meta">%s</div>' % "".join("<span>%s</span>" % m for m in meta))
+        meta.append(esc(" ".join(x for x in (g["model"], g.get("effort")) if x)))
+    cnt = "".join((('<span class="cnt red">%d</span>' % g["reds"]) if g["reds"] else "", ('<span class="cnt amber">%d</span>' % g["ambers"]) if g["ambers"] else ""))
+    o.append('<div class="meta"><span class="facts">%s</span>%s</div>' % (" \u00b7 ".join(meta), cnt))
     if g.get("top") and not gray:
-        o.append('<div class="small %s" style="margin-top:6px">%s</div>' % ("bad-t" if g["reds"] else "mut", esc(trunc(g["top"], 120))))
+        o.append('<div class="topf %s" title="%s">%s</div>' % ("red" if g["reds"] else "amber" if g["ambers"] else "", esc(g["top"]), esc(trunc(g["top"], 140))))
     o.append("</a>")
     return "".join(o)
 
@@ -2932,9 +2948,9 @@ def render_overview(ov):
     live = [g for g in goals if not g["unreachable"] and not g["ended"]]
     chips = "".join('<span class="hc" title="%s"><span class="dot %s"></span>%s</span>' % (
         esc(h.get("detail") or ""), "" if h["ok"] else "red", esc(h["name"])) for h in ov["hosts"])
-    o.append('<header><div><h1>Mission control</h1><p class="sub">%d agent session%s running on %s%s</p>%s</div><div class="chips">%s'
+    o.append('<header class="ovh"><div><p class="ovsum"><b>%d agent session%s</b> running on %s%s</p>%s</div><div class="chips">%s'
              '<button type="button" class="pill bell" id="mc-bell" title="Desktop alerts for new red items while a mission control page is open">'
-             'Desktop alerts: off</button></div></header>' % (
+             'Alerts off</button></div></header>' % (
         len(live), "" if len(live) == 1 else "s", esc(", ".join(LOGIN_HOSTS.get(h, h) for h in hosts_with)) or "no hosts",
         (" \u00b7 <b class='bad-t'>%d need%s you</b>" % (len(needs), "s" if len(needs) == 1 else "")) if needs else "",
         usage_html(LAUNCH.get("usage")) if LAUNCH else "", chips))
@@ -2976,10 +2992,8 @@ def render_overview(ov):
                 esc(x["host"]), esc(x["kind"]), esc(ago(x["last"])), esc(x["calls"]), esc(trunc(x["cwd"], 60))))
         o.append("</table></details>")
     hs = " \u00b7 ".join('%s <span style="color:var(--%s)">%s</span>' % (esc(h["name"]), "grn" if h["ok"] else "red", "ok" if h["ok"] else "down") for h in ov["hosts"])
-    o.append('<footer>Collectors: %s<br>Collected %s \u00b7 new data every %d min \u00b7 every running Codex or Claude session is found automatically '
-             '(tmux or not) on the watched nodes, the Rockfish and Skipjack login nodes and this PC<br>'
-             'Mission control types into a session only when you press Send on its page%s.<br>'
-             'Hover over any block and click its \u00d7 to hide it in this browser; <span class="mono">mctl hide NAME</span> hides it on every machine.%s</footer></main>%s</body></html>' % (
+    o.append('<footer><div>%s</div><div>Collected %s, every %d min. Sessions are found by themselves (tmux or not) on the watched nodes, the login nodes and this PC.</div>'
+             '<div>Mission control types into a session only when you press a button%s. Press a block\u2019s \u00d7 to hide it here; <span class="mono">mctl hide NAME</span> hides it everywhere.%s</div></footer></main>%s</body></html>' % (
                  hs, esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(ov["collected"]))) if ov.get("collected") else "never", CFG["interval"], never_note(), hidden_note(), HIDE_JS + REFRESH_JS + TOOLS_JS))
     return "\n".join(o)
 
@@ -3218,6 +3232,50 @@ body.convpage{--bg:var(--chatbg)}.card[data-sec$=":latest"]{background:var(--cha
 background:color-mix(in srgb,var(--fg) 7%,transparent);color:color-mix(in srgb,var(--fg) 80%,var(--c,var(--mut)))}
 .mb b{font-weight:600}
 @media (prefers-color-scheme:dark){.bub .mb,.msg .mb{color:color-mix(in srgb,var(--fg) 88%,var(--bg))}.bub .mb b{color:var(--fg)}}
+
+/* cleanup pass: fewer boxes and words; facts small and quiet; colour only where it means something */
+h2{font-size:15px}.h2n{font-weight:400;font-size:12px;color:var(--faint);margin-left:6px}
+header{margin:4px 0 12px}.sub{font-size:12.5px}.sub2{color:var(--faint);font-size:12px;margin:2px 0 0;overflow-wrap:anywhere}
+.objective{margin-top:8px}.objective b{font-weight:600;color:var(--fg);margin-right:4px}
+.ovh{gap:10px}.ovsum{margin:2px 0 6px;font-size:14px;color:var(--mut)}.ovsum b{color:var(--fg);font-weight:600}
+.usage{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12.5px}.ug{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+.ovh .chips{gap:5px}.hc,.bell{font-size:11.5px;padding:2px 9px}
+.quiet{background:none;border:none;padding:0 2px;margin:0 0 14px;font-size:13px}
+.cards{gap:8px}.m{padding:9px 11px;border-radius:10px;box-shadow:none;background:color-mix(in srgb,var(--s) 6%,var(--card));border-color:var(--line)}
+.m .l{font-size:11.5px;display:flex;align-items:center;gap:6px}.m .l:before{content:"";flex:none;width:6px;height:6px;border-radius:50%;background:var(--s)}
+.m .v{font-size:17px;margin:1px 0}.m .s{font-size:11.5px}
+@media (max-width:640px){.cards{grid-template-columns:repeat(3,minmax(0,1fr))}.m{padding:8px 9px}.m .v{font-size:15px}.m .l{font-size:11px}}
+@media (max-width:360px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.flag{padding:8px 11px;margin:6px 0;border-radius:9px;border-left-width:3px}.flag .t{font-size:13.5px}
+.flag .d{font-size:12.5px;opacity:.85}.flag .a{font-size:12px;margin-top:3px}
+.scard{padding:11px 13px}.scard .st{font-size:13px;margin:3px 0 1px}.st .ago{color:var(--mut);font-weight:400}
+.scard .words{background:color-mix(in srgb,var(--t-agent) 65%,transparent);border-left-width:2px;padding:7px 10px;margin:7px 0}
+.scard .meta{justify-content:space-between;align-items:center;flex-wrap:nowrap;gap:8px}.scard .facts{min-width:0}
+.cnt{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 6px;border-radius:99px;font-size:11.5px;font-weight:700;margin-left:4px}
+.cnt.amber{background:var(--ambbg);color:var(--amb)}.cnt.red{background:var(--redbg);color:var(--red)}
+.topf{font-size:12px;color:var(--mut);margin-top:5px;padding-left:12px;position:relative;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topf:before{content:"";position:absolute;left:0;top:.55em;width:6px;height:6px;border-radius:50%;background:var(--faint)}
+.topf.amber:before{background:var(--amb)}.topf.red{color:var(--red)}.topf.red:before{background:var(--red)}
+.hide-x{top:8px;right:8px;width:18px;height:18px;line-height:16px;font-size:12px;border:none;background:none;box-shadow:none}
+@media (hover:none){.hide-x{opacity:.35}}
+.rnote{font-size:11.5px;color:var(--faint);margin:-4px 0 6px 102px}
+.gpus{display:flex;gap:4px;align-items:flex-end;max-width:380px}.gpu{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;font-size:10px;color:var(--mut);gap:2px;line-height:1}
+.gb{width:100%;max-width:22px;height:20px;background:var(--bar);border-radius:4px;display:flex;align-items:flex-end;overflow:hidden}
+.gb i{display:block;width:100%;background:linear-gradient(0deg,var(--teal),var(--lime) 60%,var(--amber));border-radius:3px}.gb i.w{background:var(--amber)}
+.tl .e{padding:5px 0;gap:8px}.tl .tm{width:auto;min-width:42px;white-space:nowrap}.tl .w{width:62px}.tl .pill{font-size:11px;padding:1px 8px}
+.tl .tx{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}.tl .tx.open{display:block}
+details.fold{background:none;border:none;box-shadow:none;padding:0;margin:6px 0 0}details.fold>summary{font-weight:500;font-size:12.5px;color:var(--mut)}
+td.mcell{width:1%;white-space:nowrap;text-align:right}
+details.rowmenu{background:none;border:none;box-shadow:none;padding:0;margin:0;display:inline-block;text-align:left}
+details.rowmenu>summary{list-style:none;font-weight:700;color:var(--mut);padding:0 9px;border-radius:8px;border:1px solid var(--line);font-size:14px;line-height:22px}
+details.rowmenu>summary::-webkit-details-marker{display:none}details.rowmenu[open]>summary{color:var(--fg);border-color:var(--fg)}
+details.rowmenu .cacts{flex-direction:column;align-items:stretch;gap:4px;margin-top:6px}
+footer div{margin:2px 0}
+
+.card .flag.amber,.card .flag.info{background:none;border:none;border-radius:0;border-bottom:1px solid var(--line);padding:9px 0 9px 16px;margin:0;position:relative}
+.card .flag.amber:before,.card .flag.info:before{content:"";position:absolute;left:2px;top:16px;width:7px;height:7px;border-radius:50%;background:var(--fc)}
+.card h2+.flag.amber,.card h2+.flag.info{padding-top:2px}.card h2+.flag.amber:before,.card h2+.flag.info:before{top:9px}
+.card .flag.info .t{color:var(--fg)}.card .flag.amber:last-of-type,.card .flag.info:last-of-type{border-bottom:none}
 """ + HIDE_CSS
 
 
@@ -3314,7 +3372,7 @@ KIND_PILL = {"submit": ("submit", "ok"), "cancel": ("cancel", "warn"), "alloc": 
 
 
 def resources_html(resources, nodes, c, hist):
-    o = ['<h2>Resources <span class="small mut">(from the scheduler, not the agents)</span></h2>']
+    o = ['<h2>Resources <span class="h2n">from the scheduler</span></h2>']
     for nname, node in nodes.items():
         if not node:
             continue
@@ -3327,10 +3385,14 @@ def resources_html(resources, nodes, c, hist):
             used = node["mem_total_gb"] - node.get("mem_avail_gb", 0)
             o.append('<div class="row"><span class="n">%s RAM</span><span class="x">%s</span><span class="r">%.0f / %.0f GB</span></div>' % (
                 esc(nname), bar(used / node["mem_total_gb"], "w" if used / node["mem_total_gb"] > .9 else ""), used, node["mem_total_gb"]))
-        for gp in node.get("gpus", []):
-            u = gp.get("util", 0)
-            o.append('<div class="row"><span class="n">%s GPU %s</span><span class="x">%s</span><span class="r">%d%% \u00b7 %.0f GB</span></div>' % (
-                esc(nname), esc(gp.get("i")), bar(u / 100.0, "w" if u < 10 and gp.get("mem_used", 0) > 1024 else ""), u, gp.get("mem_used", 0) / 1024))
+        gps = node.get("gpus", [])
+        if gps:   # all GPUs on one row: a small bar each, its use underneath (memory in the tooltip)
+            cells = "".join('<span class="gpu" title="GPU %s: %d%% busy, %.0f GB in use"><span class="gb"><i style="height:%d%%" class="%s"></i></span>%d</span>' % (
+                esc(gp.get("i")), gp.get("util", 0), gp.get("mem_used", 0) / 1024, max(4, min(100, gp.get("util", 0))),
+                "w" if gp.get("util", 0) < 10 and gp.get("mem_used", 0) > 1024 else "", gp.get("util", 0)) for gp in gps)
+            avg = sum(gp.get("util", 0) for gp in gps) / len(gps)
+            o.append('<div class="row"><span class="n">%s GPUs</span><span class="x gpus">%s</span><span class="r">%.0f%% avg \u00b7 %.0f GB</span></div>' % (
+                esc(nname), cells, avg, sum(gp.get("mem_used", 0) for gp in gps) / 1024))
     for r in resources:
         if not r["ok"]:
             o.append('<div class="row"><span class="n">%s</span><span class="x bad-t">unreachable</span><span class="r small">%s</span></div>' % (esc(r["name"]), esc(trunc(r.get("error"), 50))))
@@ -3340,7 +3402,7 @@ def resources_html(resources, nodes, c, hist):
             esc(r["name"]), bar(eff if eff is not None else 0, "eff" if (eff or 1) > .7 else "w") if eff is not None else '<span class="small mut">no finished jobs in 48 h</span>',
             r["running"], r["pending"], r["cores"]))
         if r["alloc_ch"]:
-            o.append('<div class="small mut" style="margin:-4px 0 6px 102px">bar = share of 48 h core-hours used well \u00b7 %.0f core-h, %.0f idle, %.0f failed</div>' % (
+            o.append('<div class="rnote" title="The bar is the share of the last 48 h of core-hours used well">48 h: %.0f core-h \u00b7 %.0f idle \u00b7 %.0f failed</div>' % (
                 r["alloc_ch"], r["idle_ch"], r["failed_ch"]))
     if len(hist) > 2:
         o.append('<div class="row small mut" style="margin-top:10px"><span class="n">24 h cores</span><span class="x">%s</span><span class="r">%d now</span></div>' % (
@@ -3574,6 +3636,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
   if(body.op==='set'&&(!body.name||!body.val)){say('Fill in the name and the value.','bad');return;}
   if(body.op==='criterion'&&!(body.text||'').trim()){say('Write the criterion first.','bad');return;}}
  var q=b.getAttribute('data-cconfirm');if(form&&body.op==='set')q='Add the rule '+body.name.toUpperCase()+' '+body.rule_op+' '+body.val+'?';
+ if(['set','allow','unlock','unwatch','criterion','uncriterion','amend','bind'].indexOf(body.op)>=0)q=(q||'Change the contract?')+'\n\nThe agent gets a short message about the change.';
  if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say('Saving\u2026','');
  post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
   if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)if(ins2[i].type!=='hidden')ins2[i].value='';}})
@@ -3593,9 +3656,9 @@ var bell=document.getElementById('mc-bell');
 var on=function(){try{return localStorage.getItem('mc-alerts')==='1'&&!!window.Notification&&Notification.permission==='granted';}catch(_){return false;}};
 var reds=function(){try{return JSON.parse((document.getElementById('mc-reds')||{}).textContent||'[]');}catch(_){return [];}};
 var mark=function(l){try{localStorage.setItem('mc-reds-seen',JSON.stringify(l.map(function(r){return r.k;})));}catch(_){}};
-var paint=function(){if(bell){bell.textContent='Desktop alerts: '+(on()?'on':'off');bell.classList.toggle('on',on());}};
+var paint=function(){if(bell){bell.textContent='Alerts '+(on()?'on':'off');bell.classList.toggle('on',on());}};
 if(bell){bell.addEventListener('click',function(){
- if(!window.Notification||!window.isSecureContext){bell.title='Desktop alerts need the dashboard opened with mctl (http://localhost:8765).';bell.textContent='Desktop alerts: open with mctl';return;}
+ if(!window.Notification||!window.isSecureContext){bell.title='Desktop alerts need the dashboard opened with mctl (http://localhost:8765).';bell.textContent='Alerts: open with mctl';return;}
  if(on()){localStorage.setItem('mc-alerts','0');paint();return;}
  Notification.requestPermission().then(function(p){if(p==='granted'){localStorage.setItem('mc-alerts','1');mark(reds());
   try{new Notification('Mission control',{body:'Desktop alerts are on: you’ll hear about new red items while a dashboard tab is open.'});}catch(_){}}paint();});});paint();}
@@ -3682,28 +3745,30 @@ def render(s):
     o.append("<main>" + reds_json())
     stxt, scls = session_state(g, [f["key"] for f in s["flags"]], s.get("unreachable"), s.get("ended"), s.get("node_name"), s.get("last_seen"))
     where = LOGIN_HOSTS.get(s.get("node_name"), s.get("node_name") or "?")
-    meta = ["%s on %s" % ("no tmux (pid %s)" % esc((s.get("tmux") or {}).get("pid") or "?") if g.get("notmux") else "tmux " + esc(s["session"]), esc(where))]
+    meta = ["%s \u00b7 %s" % (esc(where), "no tmux (pid %s)" % esc((s.get("tmux") or {}).get("pid") or "?") if g.get("notmux") else "tmux " + esc(s["session"]))]
     if g.get("model"):
-        meta.append('<span class="mdl" title="Main agent\u2019s model and reasoning level">%s</span>' % esc(" \u00b7 ".join(x for x in (g["model"], g.get("effort")) if x)))
+        meta.append('<span title="Main agent\u2019s model and reasoning level">%s</span>' % esc(" ".join(x for x in (g["model"], g.get("effort")) if x)))
+    more = []
     subs, revs = {}, {}
     for x in s.get("sessions") or []:
         if x.get("role") == "goal" and x.get("label") not in (None, "main") and x.get("model"):
             k = " \u00b7 ".join(v for v in (x["model"], x.get("effort")) if v)
             grp = revs if "review" in x["model"] else subs   # Codex's approval reviewer runs as its own session
             grp[k] = grp.get(k, 0) + 1
-    for grp, name, tip in ((subs, "sub-agents", "Sub-agents\u2019 models and reasoning levels"),
-                           (revs, "approval reviewer", "Codex\u2019s automatic approval reviewer")):
+    for grp, name, tip in ((subs, "Sub-agents", "Sub-agents\u2019 models and reasoning levels"),
+                           (revs, "Reviewer", "Codex\u2019s automatic approval reviewer")):
         if grp:
-            meta.append('<span class="mdl" title="%s">%s: %s</span>' % (tip, name, esc(", ".join(
-                "%s%s" % (k, " \u00d7%d" % n if n > 1 else "") for k, n in sorted(grp.items(), key=lambda kv: -kv[1])))))
+            more.append('<span title="%s">%s %s</span>' % (tip, name, esc(", ".join(
+                "%s%s" % (k.replace(" \u00b7 ", " "), " \u00d7%d" % n if n > 1 else "") for k, n in sorted(grp.items(), key=lambda kv: -kv[1])))))
     if g.get("cwd"):  # shortened; click (or tap) for the whole path, selectable for copying
-        meta.append('<span class="mono xp" id="x-cwd" data-x title="Click to show the full folder"><span class="xs">%s</span><span class="xf">%s</span></span>'
+        more.append('<span class="mono xp" id="x-cwd" data-x title="Click to show the full folder"><span class="xs">%s</span><span class="xf">%s</span></span>'
                     % (esc(trunc(g["cwd"], 70)), esc(g["cwd"])))
     goal_full = ((s.get("goal") or {}).get("text") or s.get("title") or "").strip()
     o.append('<header><div style="min-width:0"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h1>%s</h1>%s<span class="pill %s">%s</span></div>'
-             '<p class="sub">%s</p>%s</div>%s</header>' % (
+             '<p class="sub">%s</p>%s%s</div>%s</header>' % (
                  esc(s["session"]), kind_badge(g.get("agent_kind")), scls, esc(stxt), " \u00b7 ".join(meta),
-                 ('<p class="objective" id="x-goal" data-x title="Click to show the whole goal"><b>Goal:</b> %s</p>' % esc(trunc(goal_full, 20000)))
+                 "".join('<p class="sub2">%s</p>' % m for m in more),
+                 ('<p class="objective" id="x-goal" data-x title="Click to show the whole goal"><b>Goal</b> %s</p>' % esc(trunc(goal_full, 20000)))
                  if goal_full and goal_full != s["session"] else "",
                  session_actions(s, g)))
     cv = s.get("conv") or {}
@@ -3785,20 +3850,21 @@ def render(s):
     o.append('<section class="cards"%s>' % sec("g", "cards"))
     tile_hue = {"Goal": "lime", "Last agent activity": "sky", "Plan": "violet", "Slurm jobs now": "teal",
                 "Idle or failed compute, 48 h": "orange", "Acceptance criteria": "pink"}
+    short = {"Last agent activity": "Activity", "Slurm jobs now": "Slurm now", "Idle or failed compute, 48 h": "Idle 48 h", "Acceptance criteria": "Criteria"}
     for l, v, sub in cards:
-        o.append('<div class="m" style="--s:var(--%s)"><div class="l">%s</div><div class="v">%s</div><div class="s">%s</div></div>'
-                 % (tile_hue.get(l, "slate"), esc(l), v, sub))
+        o.append('<div class="m" style="--s:var(--%s)" title="%s"><div class="l">%s</div><div class="v">%s</div><div class="s">%s</div></div>'
+                 % (tile_hue.get(l, "slate"), esc(l), esc(short.get(l, l)), v, sub))
     o.append("</section>")
 
     # needs you
     needs = [f for f in s["flags"] if f.get("needs_you")]
-    o.append('<section class="card%s"%s><h2>Needs you</h2>' % ("" if needs else " calm", sec("g", "needs")))
     if needs:
+        o.append('<section class="card"%s><h2>Needs you</h2>' % sec("g", "needs"))
         o.extend(flag_html(f) for f in needs)
+        o.append("</section>")
     else:
-        o.append('<div class="empty">Nothing needs you right now. %d amber item(s) below are worth a glance.</div>' % len(ambers)
-                 if ambers else '<div class="empty">Nothing needs you right now.</div>')
-    o.append("</section>")
+        o.append('<div class="quiet"%s><span class="dot"></span>Nothing needs you right now%s</div>' % (
+            sec("g", "needs"), (' <span class="mut">\u00b7 %d amber item%s below</span>' % (len(ambers), "" if len(ambers) == 1 else "s")) if ambers else ""))
 
     # plan + resources
     if s.get("criteria"):
@@ -3820,8 +3886,8 @@ def render(s):
                 cls, ic, esc(r["text"]), ' <span class="pill neu">from goal</span>' if r.get("src") == "goal text" else "",
                 esc(r.get("rule") or ""), cls if r["status"] == "not met" else "", esc(r.get("latest") or "\u2013"), esc(r.get("best") or "\u2013"), ev))
         o.append("</table></section>")
-    o.append('<section class="grid2"><div class="card"%s><h2>Plan</h2>' % sec("g", "plan"))
     if p["steps"]:
+        o.append('<section class="grid2"><div class="card"%s><h2>Plan</h2>' % sec("g", "plan"))
         for st in p["steps"]:
             stt = str(st.get("status", "")).lower()
             if stt in ("completed", "done", "complete"):
@@ -3833,13 +3899,13 @@ def render(s):
             o.append('<div class="step %s"><span class="i">%s</span><span>%s</span></div>' % (cls, ic, esc(st.get("step"))))
         o.append('<div class="small mut" style="margin-top:6px">Updated %s%s</div>' % (
             esc(ago(iso_epoch(p["ts"]))), (" \u00b7 " + esc(trunc(p["expl"], 200))) if p["expl"] else ""))
+        o.append('</div><div class="card"%s>' % sec("g", "resources"))
     else:
-        o.append('<div class="empty">The agent hasn\u2019t published a plan in this window. Codex shows one when it calls update_plan.</div>')
-    o.append('</div><div class="card"%s>' % sec("g", "resources"))
+        o.append('<section><div class="card"%s>' % sec("g", "resources"))
     o.append(resources_html(s["resources"], {s.get("node_name") or "node": s.get("node") or {}}, c, s.get("history") or []))
     o.append(storage_html(s.get("storage")))
     o.append("</div></section>")
-    o.append('<div style="height:14px"></div>')
+    o.append('<div style="height:14px"></div>' if p["steps"] else "")
 
     # integrity
     integ = [f for f in s["flags"] if f["area"] == "integrity" and not f.get("needs_you")]
@@ -3850,8 +3916,9 @@ def render(s):
         o.append('<div class="empty">No contract breaks, unexplained parameter changes or shortcut wording found.</div>')
     o.append(contract_card_html(s))
     sc = s["params"]["scan"]
-    o.append('<div class="small mut" style="margin-top:8px">Input scan: %s file(s) changed in the last %g h under %s%s. Rules live in <span class=mono>contract/goal_contract.md</span>.</div>' % (
-        sc.get("files") or 0, CFG["scan_hours"], esc(", ".join(sc.get("roots") or []) or "the goal folder"), " (scan cut short)" if sc.get("truncated") else ""))
+    o.append('<div class="rnote" style="margin:10px 0 0">Scanned %s input file%s changed in the last %g h under <span class="mono">%s</span>%s.</div>' % (
+        sc.get("files") or 0, "" if sc.get("files") == 1 else "s", CFG["scan_hours"], esc(", ".join(sc.get("roots") or []) or "the goal folder"),
+        " (cut short)" if sc.get("truncated") else ""))
     o.append("</section>")
 
     # other flags (goal / compute amber+info not shown above)
@@ -3862,9 +3929,11 @@ def render(s):
         o.append("</section>")
 
     # timeline
-    o.append('<section class="card"' + sec("g", "timeline") + '><h2>What happened <span class="small mut">(you, agents, decisions; newest first)</span></h2><div class="tl">')
+    o.append('<section class="card"' + sec("g", "timeline") + '><h2>What happened <span class="h2n">newest first</span></h2><div class="tl">')
     if s["timeline"]:
-        for t in s["timeline"]:
+        for i, t in enumerate(s["timeline"]):
+            if i == 12:
+                o.append('<details class="fold"><summary>%d older</summary>' % (len(s["timeline"]) - 12))
             lab, cls = KIND_PILL.get(t.get("kind"), (t.get("kind") or "cmd", "neu"))
             extra = ""
             if t.get("exit") not in (None, 0):
@@ -3873,9 +3942,12 @@ def render(s):
                 extra += ' <span class="pill ok">job %s</span>' % esc(t["jobid"])
             if t.get("watch"):
                 extra += ' <span class="pill warn">%s</span>' % esc(", ".join(t["watch"][:3]))
-            o.append('<div class="e"><span class="tm">%s</span><span class="w"><span class="pill %s">%s</span></span><span class="tx"><span class="small mut">%s</span> %s%s</span></div>' % (
-                esc(hm(t.get("epoch"))), cls, esc(lab), esc(t.get("who") if t.get("who") not in ("you", "decision") else ""),
-                esc(trunc(t.get("text"), 320)), extra))
+            o.append('<div class="e"><span class="tm">%s</span><span class="w"><span class="pill %s">%s</span></span><span class="tx" onclick="this.classList.toggle(\'open\')">'
+                     '<span class="small mut">%s</span> %s%s</span></div>' % (
+                         esc(hm(t.get("epoch"))), cls, esc(lab), esc(t.get("who") if t.get("who") not in ("you", "decision") else ""),
+                         esc(trunc(t.get("text"), 1200)), extra))
+        if len(s["timeline"]) > 12:
+            o.append("</details>")
     else:
         o.append('<div class="empty">No notable agent actions in the window.</div>')
     o.append("</div></section>")
@@ -3929,9 +4001,8 @@ def render(s):
     o.append("</details>")
 
     hs = " \u00b7 ".join('%s <span style="color:var(--%s)">%s</span>' % (esc(h["name"]), "grn" if h["ok"] else "red", "ok" if h["ok"] else "down") for h in s["hosts"])
-    o.append('<footer>Collectors: %s<br>Collected %s \u00b7 rendered %s \u00b7 refreshes every 2 min in the browser, new data every %d min<br>'
-             'Mission control types into a session only when you press Send above%s.<br>'
-             'Hover over any block and click its \u00d7 to hide it in this browser; <span class="mono">mctl hide NAME</span> hides it on every machine.%s</footer>' % (
+    o.append('<footer><div>%s</div><div>Collected %s, page built %s; new data every %d min.</div>'
+             '<div>Mission control types into a session only when you press a button%s. Press a block\u2019s \u00d7 to hide it here; <span class="mono">mctl hide NAME</span> hides it everywhere.%s</div></footer>' % (
                  hs, esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(s["collected"]))) if s.get("collected") else "never",
                  esc(time.strftime("%H:%M", time.localtime(s["generated"]))), CFG["interval"], never_note(), hidden_note()))
     o.append("</main>%s%s%s%s</body></html>" % (HIDE_JS, SEND_JS, REFRESH_JS, TOOLS_JS))

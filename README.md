@@ -199,7 +199,9 @@ the "Needs you" card, with Approve and Reject buttons.
 
 Changing it from the page, in the Scientific integrity card: Lock, Unlock or Keep each setting, add a
 rule or an acceptance criterion, and press "Make binding" next to any instruction you sent (or right after
-sending one). A rule you unlock or remove is never locked again automatically.
+sending one). A rule you unlock or remove is never locked again automatically. Each change you make is
+also sent to the agent as a short message ("ENCUT is no longer locked; you may choose its value..."), so
+it plans with the new rule; `CONTRACT_TELL_AGENT=0` in config.env turns that off.
 
 **The agent asks permission**: "Tell the agent how to ask" sends it the protected settings and the way to
 ask: one JSON line in `.mc/requests.jsonl` in its folder, e.g.
