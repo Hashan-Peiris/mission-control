@@ -44,10 +44,14 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
   you answer them in the dialog.
 - Answer buttons type only an answer the agent's screen itself offers (arrow keys and Enter, or y/n), after
   you confirm, and only if the screen still shows the same question.
-- Requests between your own PCs go through the shared OneDrive folder (`state/inbox/<pc>/`, answers in
-  `state/outbox/`): only scripts mission control wrote for one of the actions above, run by the other PC's
-  collector loop, and dropped if they arrive more than 3 minutes late. Anyone who can write to that folder
-  can already change mission control's code, so this adds no new way in; keep the folder private.
+- Requests between your own PCs go over Tailscale to the other PC's server, or, when that can't get
+  through, through the shared OneDrive folder (`state/inbox/<pc>/`, answers in `state/outbox/`). Either
+  way: only scripts mission control wrote for one of the actions above, dropped if they arrive more than
+  3 minutes late. Over Tailscale the server also requires your own Tailscale login, a signature made with
+  the key in `state/relay.key` (in the shared folder, never in git) and an id it hasn't seen, so a request
+  can't be replayed. A request that reached the other PC is never sent a second time through the folder.
+  Anyone who can write to that folder can already change mission control's code, so this adds no new way
+  in; keep the folder private.
 - Contract upkeep only adds or tightens rules by itself; loosening one always needs your Approve. It reads the
   agent's instruction files and `.mc/requests.jsonl` in its folder, and writes nothing on the cluster.
 - Messages to an agent about the contract (your answer to its request, "Tell the agent how to ask") are sent

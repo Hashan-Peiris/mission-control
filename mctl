@@ -152,8 +152,23 @@ relay() {  # relay PC bash -s [node]: run a script on another of your PCs throug
   [ "$1 $2" = "bash -s" ] || { echo "relay: only scripts can be handed over" >&2; return 2; }
   id="$(date +%s)-$RANDOM$RANDOM"; inp=$(base64 -w0)
   mkdir -p "$STATE/inbox/$pc" "$STATE/outbox" || return 1
-  printf '{"id": "%s", "from": "%s", "time": %s, "node": "%s", "stdin": "%s"}\n' "$id" "$MC_HOST" "$(date +%s)" "$tgt" "$inp" > "$STATE/inbox/$pc/$id.tmp" \
-    && mv "$STATE/inbox/$pc/$id.tmp" "$STATE/inbox/$pc/$id.json" || return 1
+  printf '{"id": "%s", "from": "%s", "time": %s, "node": "%s", "stdin": "%s"}\n' "$id" "$MC_HOST" "$(date +%s)" "$tgt" "$inp" > "$STATE/inbox/$pc/$id.tmp" || return 1
+  # First straight to that PC over Tailscale (seconds); if it can't get there, through the shared folder (about a minute)
+  local res
+  res=$($PY "$MC_DIR/lib/mc.py" relay-send "$pc" "$STATE/inbox/$pc/$id.tmp"); rc=$?
+  if [ $rc -eq 0 ]; then
+    rm -f "$STATE/inbox/$pc/$id.tmp"
+    echo "relay-route: tailscale $pc" >&2
+    printf '%s' "$res" | $PY -c 'import json,sys; r=json.load(sys.stdin); sys.stdout.write(r.get("out","")); sys.stderr.write(r.get("err","")); sys.exit(int(r.get("rc",1)))'
+    return $?
+  elif [ $rc -eq 4 ]; then   # it got there but the answer was lost: don't send it a second time
+    rm -f "$STATE/inbox/$pc/$id.tmp"
+    echo "relay-route: tailscale $pc" >&2
+    echo "Sent to $pc over Tailscale, but its answer didn't come back. Check the page in a minute before trying again." >&2
+    return 124
+  fi
+  echo "relay-route: onedrive $pc" >&2
+  mv "$STATE/inbox/$pc/$id.tmp" "$STATE/inbox/$pc/$id.json" || return 1
   t0=$SECONDS
   while [ $((SECONDS - t0)) -lt "${RELAY_WAIT:-150}" ]; do
     if [ -f "$STATE/outbox/$id.json" ]; then
@@ -464,6 +479,7 @@ loop() {
     fi
     load_cfg; parse_hosts
     ensure_server
+    [ -z "${TS_SHARED:-}" ] && { TS_SHARED=1; ts_share >> "$ARCHIVE/loop.log" 2>&1 & }
     if active_elsewhere; then
       log "standby: $ACTIVE_HOST is collecting" >> "$ARCHIVE/loop.log"
       publish_pc; nap $(( ${INTERVAL_MIN:-5} * 60 )); continue
@@ -820,6 +836,26 @@ ensure_server() {  # the local web page server (http://localhost:PORT) that lets
   ( MC_ARCHIVE_DIR="$ARCHIVE" MC_HOST="$MC_HOST" MC_PORT="${WEB_PORT:-8765}" MC_WEB_LOGINS="${WEB_LOGINS:-}" nohup $PY "$MC_DIR/lib/server.py" >> "$ARCHIVE/server.log" 2>&1 < /dev/null &
     echo $! > "$ARCHIVE/server.pid" )
   echo "$mt" > "$ARCHIVE/server.mtime"
+}
+
+ts_exe() {
+  local c
+  for c in tailscale.exe tailscale; do command -v "$c" > /dev/null 2>&1 && { echo "$c"; return 0; }; done
+  [ -x "/mnt/c/Program Files/Tailscale/tailscale.exe" ] && { echo "/mnt/c/Program Files/Tailscale/tailscale.exe"; return 0; }
+  return 1
+}
+# Let your other PCs reach this one's server over Tailscale (for actions between your PCs; only your own login gets in).
+# Same sharing as `mctl phone`; set RELAY_TAILSCALE=0 in config.env to keep using only the shared folder.
+ts_share() {
+  local ts port
+  [ "${RELAY_TAILSCALE:-1}" = 0 ] && return 0
+  ts=$(ts_exe) || return 0
+  port=$(cat "$ARCHIVE/port" 2> /dev/null || echo "${WEB_PORT:-8765}")
+  "$ts" status > /dev/null 2>&1 || return 0   # not signed in
+  "$ts" serve status 2> /dev/null | grep -Eq "(127\.0\.0\.1|localhost):$port" && return 0
+  if "$ts" serve --bg "$port" > /dev/null 2>&1; then
+    echo "$(date '+%F %T') shared this PC's mission control server with your own Tailscale devices (tailscale serve reset undoes it)"
+  fi
 }
 
 phone() {  # share this machine's dashboard with your own phone over Tailscale (private; nothing opens to the internet)
