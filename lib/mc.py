@@ -790,6 +790,113 @@ def cmd_contract_edit(key, req):
     return out(True, msg + ".", agent_msg)
 
 
+# ---------------------------------------------------------------- storage of the working folder (scanned every ~30 min)
+STEP_GB = 50          # milestones: every 50 GB the folder crosses, up or down
+SPIKE_GB = 10         # warning: this much growth in 30 minutes
+SPIKE_FILES = 50000   # ... or this many new files in 30 minutes (or the count doubling, from 2,000 files up)
+GB = 1e9
+
+
+def fmt_b(b):
+    b = float(b or 0)
+    for unit, d in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if abs(b) >= d:
+            return "%.3g %s" % (b / d, unit)
+    return "%d B" % b
+
+
+def fmt_n(n):
+    n = float(n or 0)
+    return "%.3g M" % (n / 1e6) if n >= 1e6 else ("{:,.0f}".format(n))
+
+
+def storage_update(gkey, scan, flags):
+    """Keep the folder's size history, note each 50 GB crossed, and warn on sudden growth. Returns what the page shows."""
+    path = os.path.join(STATE, "storage", gkey + ".json")
+    h = rjson(path, {}) or {}
+    if not scan or not scan.get("t"):
+        return dict(h, scanning=bool((scan or {}).get("scanning_since"))) if h.get("samples") else None
+    if h.get("root") != scan.get("root"):   # a different working folder: start a new history
+        h = {"root": scan.get("root"), "samples": [], "events": [], "spikes": []}
+    smp = h.setdefault("samples", [])
+    if not smp or scan["t"] > smp[-1][0] + 1:
+        prev = smp[-1] if smp else None
+        smp.append([scan["t"], scan.get("bytes", 0), scan.get("files", 0), 1 if scan.get("partial") else 0])
+        del smp[:-600]
+        if prev and not scan.get("partial"):
+            lo, hi = int(prev[1] // (STEP_GB * GB)), int(scan["bytes"] // (STEP_GB * GB))
+            if hi != lo:
+                h.setdefault("events", []).append([scan["t"], hi * STEP_GB if hi > lo else lo * STEP_GB, "up" if hi > lo else "down"])
+                del h["events"][:-20]
+            # compare with the sample about 30 min earlier (20 min to 3 h back), as a rate per 30 min
+            base = next((x for x in reversed(smp[:-1]) if 20 * 60 <= scan["t"] - x[0] <= 3 * 3600 and not (x[3:] or [0])[0]), None)
+            if base:
+                dt = scan["t"] - base[0]
+                db, dn = (scan["bytes"] - base[1]) * 1800.0 / dt, (scan["files"] - base[2]) * 1800.0 / dt
+                grew_types = []
+                for k, b, n in scan.get("types") or []:
+                    old = next((x for x in h.get("types") or [] if x[0] == k), None)
+                    if b - (old[1] if old else 0) > GB:
+                        grew_types.append((b - (old[1] if old else 0), k))
+                if db >= SPIKE_GB * GB or dn >= SPIKE_FILES or (base[2] >= 2000 and scan["files"] - base[2] >= base[2]):
+                    h.setdefault("spikes", []).append({"t": scan["t"], "db": scan["bytes"] - base[1], "dn": scan["files"] - base[2], "mins": dt / 60.0,
+                                                       "types": [[k, d] for d, k in sorted(grew_types, reverse=True)[:3]]})
+                    del h["spikes"][:-10]
+        h.update(types=scan.get("types") or [], biggest=scan.get("biggest") or [], partial=scan.get("partial"), secs=scan.get("secs"),
+                 files=scan.get("files"), bytes=scan.get("bytes"), t=scan["t"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(h, f)
+        os.replace(path + ".tmp", path)
+    sp = (h.get("spikes") or [])[-1:] or []
+    if sp and NOW - sp[0]["t"] < 6 * 3600:   # a sudden spike stays on the page for 6 h
+        x = sp[0]
+        what = []
+        if x["db"] >= SPIKE_GB * GB * x["mins"] / 30.0:
+            what.append("grew %s" % fmt_b(x["db"]))
+        if x["dn"] >= SPIKE_FILES * x["mins"] / 30.0 or x["dn"] > 0 and not what:
+            what.append("gained %s files" % fmt_n(x["dn"]))
+        flags.add("storage:spike", "amber", "compute", "The working folder %s in %.0f min" % (" and ".join(what) or "jumped", x["mins"]),
+                  "At %s. Now %s in %s files%s." % (hm(x["t"]), fmt_b(h.get("bytes")), fmt_n(h.get("files")),
+                                                     ("; mostly " + ", ".join("%s (+%s)" % (k, fmt_b(d)) for k, d in x["types"])) if x["types"] else ""),
+                  "Check what the agent is writing (Resources, Working folder).")
+    return dict(h, scanning=bool(scan.get("scanning_since")))
+
+
+def storage_html(st):
+    if not st or not st.get("samples"):
+        return ""
+    smp = st["samples"]
+    day = [x for x in smp if smp[-1][0] - x[0] <= 48 * 3600]
+    base = next((x for x in reversed(smp[:-1]) if 20 * 60 <= smp[-1][0] - x[0] <= 3 * 3600), None)
+    bits = []
+    if base:
+        d = smp[-1][1] - base[1]
+        bits.append("%s%s in %.0f min" % ("+" if d >= 0 else "\u2212", fmt_b(abs(d)), (smp[-1][0] - base[0]) / 60))
+    ev = (st.get("events") or [])[-1:]
+    if ev:
+        bits.append("%s %d GB %s" % ("passed" if ev[0][2] == "up" else "fell below", ev[0][1], ago(ev[0][0])))
+    bits.append("scanned %s%s" % (hm(st.get("t")), " (partial)" if st.get("partial") else ""))
+    o = ['<div class="row" style="margin-top:10px"><span class="n">Working folder</span><span class="x">%s</span><span class="r">%s \u00b7 %s files</span></div>' % (
+        spark([x[1] for x in day]), fmt_b(st.get("bytes")), fmt_n(st.get("files")))]
+    tot = float(st.get("bytes") or 0) or 1
+    rows = "".join('<tr><td class=mono>%s</td><td>%s</td><td class=mut>%.0f%%</td><td class=mut>%s files</td></tr>' % (
+        esc(k), fmt_b(b), 100 * b / tot, fmt_n(n)) for k, b, n in (st.get("types") or [])[:8])
+    root = (st.get("root") or "").rstrip("/") + "/"
+    big = "".join('<li><span class=mono>%s</span> <span class=mut>%s</span></li>' % (esc(trunc(p[len(root):] if p.startswith(root) else p, 90)), fmt_b(b))
+                  for p, b in (st.get("biggest") or [])[:4])
+    evs = "".join('<li>%s %d GB <span class=mut>%s</span></li>' % ("Passed" if e[2] == "up" else "Fell below", e[1], esc(hm(e[0])))
+                  for e in reversed((st.get("events") or [])[-6:]))
+    o.append('<details class="stor"><summary class="small mut">%s</summary><table class="small" style="margin-top:6px"><tr><th>Type</th><th>Size</th><th></th><th></th></tr>%s</table>'
+             '%s%s<div class="small mut" style="margin-top:6px">Folder <span class=mono>%s</span>. Checked every 30 min in the background; warns at %d GB '
+             'or %s new files in 30 min and marks every %d GB.</div></details>' % (
+                 esc(" \u00b7 ".join(bits)), rows,
+                 ('<div class="small" style="margin-top:8px">Biggest files</div><ul class="clist small">%s</ul>' % big) if big else "",
+                 ('<div class="small" style="margin-top:8px">%d GB steps</div><ul class="clist small">%s</ul>' % (STEP_GB, evs)) if evs else "",
+                 esc(st.get("root") or ""), SPIKE_GB, "{:,}".format(SPIKE_FILES), STEP_GB))
+    return "".join(o)
+
+
 def tidy_contracts(goals):
     """Move contracts of goals gone for 3 days (and older copies from renamed sessions) to contract/old/."""
     keep = {g["key"] for g in goals}
@@ -972,7 +1079,7 @@ def label_sessions(sessions):
     main = None
     for s in fam:
         src = json.dumps(s.get("meta", {})).lower()
-        if s.get("kind") == "codex" and "subagent" not in src and "parent" not in src:
+        if s.get("kind") == "codex" and "subagent" not in src and "parent" not in src and not (s.get("meta") or {}).get("agent_role"):
             main = s
             break
     if not main and fam:
@@ -1170,10 +1277,15 @@ def goal_doc(goal):
     dec = [d for d in doc.get("decisions", []) if any(str(d.get("file", "")).startswith(c) for c in cwds)]
     git = {c: v for c, v in (doc.get("git") or {}).items() if c in cwds}
     specs = {c: v for c, v in (doc.get("specs") or {}).items() if c in cwds}
+    stor = None
+    for root, v in (doc.get("storage") or {}).items():   # the scanned folder that holds this goal's main working folder
+        if cwds and (cwds[0] == root or cwds[0].startswith(root.rstrip("/") + "/")) and v:
+            stor = v
+            break
     reqs = [dict(r, cwd=c) for c, lst in (doc.get("requests") or {}).items() if c in cwds for r in lst]
     return {"ok": doc.get("ok", False), "tmux": goal.get("tm") or {}, "sessions": sessions, "goal_db": doc.get("goal_db"),
             "node": doc.get("node"), "params": params, "decisions": dec, "git": git, "goal_cwds": cwds,
-            "elapsed_s": doc.get("elapsed_s", 0), "specs": specs, "requests": reqs}
+            "elapsed_s": doc.get("elapsed_s", 0), "specs": specs, "requests": reqs, "storage": stor}
 
 
 def analyze_goal(gdesc, shared):
@@ -1206,7 +1318,10 @@ def analyze_goal(gdesc, shared):
     uniq, seen_sid = [], set()
     for s in sessions:
         s.setdefault("host", gnode)
-        sid = s.get("meta", {}).get("id") or s.get("meta", {}).get("sessionId") or s.get("path")
+        meta = s.get("meta", {}) or {}
+        # Newer Codex sub-agents (explorer, implementer, ...) are forks that keep the main session's id: tell them apart by file
+        fork = bool(meta.get("agent_role")) or "subagent" in json.dumps(meta.get("source") or "").lower()
+        sid = s.get("path") if fork else (meta.get("id") or meta.get("sessionId") or s.get("path"))
         if sid in seen_sid:
             continue
         seen_sid.add(sid)
@@ -1680,6 +1795,7 @@ def analyze_goal(gdesc, shared):
         flags.add("contract:empty", "info", "integrity", "The contract has no goal text yet",
                   "Fill contract/goal_contract.md so the checks know what matters.")
     contract_flags(flags, contract, cst, res, {"alloc_ch": tot_alloc}, node, gnode, codex_goal)
+    storage = storage_update(gkey, (ndoc or {}).get("storage"), flags)
     for f in flags.items:
         if f.get("acts"):
             f["gkey"] = gkey
@@ -1763,6 +1879,7 @@ def analyze_goal(gdesc, shared):
                  "warnings": int(warn_m.group(1)) if warn_m else 0, "busy": busy},
         "plan": {"steps": plan or [], "done": plan_done, "now": plan_now, "ts": plan_ts, "expl": plan_expl},
         "flags": flags.sorted(), "resources": res, "node": node, "scythe": scythe_txt,
+        "storage": storage,
         "ccard": {"path": os.path.relpath(CONTRACT, MC_DIR), "codes": cst.get("codes") or {}, "specs": sorted((cst.get("specs_seen") or {}).items()),
                   "compute": {k: v for k, v in CT.parse_compute(contract["raw"]).items() if k != "entries"},
                   "criteria": [t for _, t in CT.criteria_texts(contract["raw"])], "log": (cst.get("log") or [])[-6:][::-1],
@@ -3081,7 +3198,9 @@ border:1px solid var(--line);border-radius:8px;padding:6px 8px}
 .qbtns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.qbtns .btn2{text-align:left;white-space:normal;max-width:100%;border-radius:12px}
 .qa .actmsg{text-align:left;margin-top:6px}.qa .sendscr{margin-top:8px}
 .cacts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.cacts.tight{margin:0;min-width:120px}
-.cacts .cform{margin:0;display:inline-flex;gap:6px;flex-wrap:wrap}.cacts .cform input[name=val]{width:100px}
+.cacts .cform{margin:0;display:inline-flex;gap:6px;flex-wrap:wrap}
+details.stor,details.clog{background:none;border:0;box-shadow:none;padding:0;margin:2px 0 0}details.stor>summary,details.clog>summary{font-weight:400;font-size:12.5px}
+details.stor[open]{padding-bottom:6px}.cacts .cform input[name=val]{width:100px}
 .cacts .actmsg,.cform .actmsg{flex-basis:100%;text-align:left}.btn2.sm{padding:3px 10px;font-size:12px}
 .cform{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.cform input,.cform select{background:var(--chatbg,#0a0c11);color:inherit;
 border:1px solid var(--line,#2a3142);border-radius:8px;padding:4px 8px;font:inherit;font-size:13px;min-width:0}.cform input[name=name]{width:110px}
@@ -3716,6 +3835,7 @@ def render(s):
         o.append('<div class="empty">The agent hasn\u2019t published a plan in this window. Codex shows one when it calls update_plan.</div>')
     o.append('</div><div class="card"%s>' % sec("g", "resources"))
     o.append(resources_html(s["resources"], {s.get("node_name") or "node": s.get("node") or {}}, c, s.get("history") or []))
+    o.append(storage_html(s.get("storage")))
     o.append("</div></section>")
     o.append('<div style="height:14px"></div>')
 

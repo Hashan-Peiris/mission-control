@@ -188,6 +188,139 @@ def run(cmd, timeout=20, inp=None):
         return 1, "", str(e)
 
 
+# ---------------------------------------------------------------- storage of each goal's working folder
+# A full walk of a big folder can take minutes on a cluster filesystem, so it runs as its own low-priority background
+# process at most every STORAGE_EVERY_MIN; each digest only reads the last finished result (and starts the next walk
+# when one is due). Results: ~/.cache/mission-control/storage/<hash>.json
+STORAGE_EVERY_MIN = 30
+STORAGE_SCANNER = r"""
+import heapq, json, os, sys, time
+root, out, lock = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    os.nice(15)
+except Exception:
+    pass
+with open(lock, "w") as f:
+    f.write(str(os.getpid()))
+t0, limit = time.time(), 25 * 60
+VASP = set("WAVECAR CHGCAR CHG OUTCAR CONTCAR POSCAR PROCAR DOSCAR EIGENVAL LOCPOT XDATCAR OSZICAR IBZKPT PCDAT REPORT ELFCAR "
+           "AECCAR0 AECCAR1 AECCAR2 WAVEDER vaspout.h5 vasprun.xml".split())
+def kind(name):
+    if name in VASP or name.split(".")[0] in VASP:   # WAVECAR, WAVECAR.static, OUTCAR.relax1 ... count as the VASP file
+        return name.split(".")[0] if name not in VASP else name
+    low = name.lower()
+    parts = low.rsplit(".", 2)
+    if len(parts) == 3 and parts[2] in ("gz", "bz2", "xz", "zst") and 0 < len(parts[1]) <= 6:
+        return "." + parts[1] + "." + parts[2]
+    if "." in low[1:]:
+        ext = low.rsplit(".", 1)[1]
+        if ext.isdigit():
+            return "(numbered files)"
+        if 0 < len(ext) <= 10:
+            return "." + "".join("#" if ch.isdigit() else ch for ch in ext).replace("##", "#")
+    if name.isupper() and len(name) <= 16:
+        return name
+    return "(no extension)"
+try:
+    dev = os.stat(root).st_dev
+except OSError:
+    dev = None
+tot = files = dirs = errors = 0
+types, big, partial, stack = {}, [], False, [root]
+while stack and dev is not None:
+    if time.time() - t0 > limit:
+        partial = True
+        break
+    try:
+        it = os.scandir(stack.pop())
+    except OSError:
+        errors += 1
+        continue
+    with it:
+        for e in it:
+            try:
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if e.is_dir(follow_symlinks=False):
+                    if st.st_dev == dev:
+                        stack.append(e.path)
+                        dirs += 1
+                    continue
+            except OSError:
+                errors += 1
+                continue
+            sz = (getattr(st, "st_blocks", 0) or 0) * 512 or st.st_size
+            tot += sz
+            files += 1
+            k = kind(e.name)
+            t = types.get(k)
+            if t:
+                t[0] += sz
+                t[1] += 1
+            else:
+                types[k] = [sz, 1]
+            if len(big) < 6:
+                heapq.heappush(big, (sz, e.path))
+            elif sz > big[0][0]:
+                heapq.heapreplace(big, (sz, e.path))
+top = sorted(types.items(), key=lambda kv: -kv[1][0])
+rest = top[14:]
+types_out = [[k, v[0], v[1]] for k, v in top[:14]]
+if rest:
+    types_out.append(["(other types)", sum(v[0] for _, v in rest), sum(v[1] for _, v in rest)])
+res = {"root": root, "t": time.time(), "started": t0, "secs": round(time.time() - t0, 1), "bytes": tot, "files": files, "dirs": dirs,
+       "types": types_out, "biggest": [[p, b] for b, p in sorted(big, reverse=True)], "partial": partial, "errors": errors}
+tmp = out + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(res, f)
+os.replace(tmp, out)
+try:
+    os.remove(lock)
+except OSError:
+    pass
+"""
+
+
+def storage_info(roots):
+    d = os.path.expanduser("~/.cache/mission-control/storage")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return {}
+    res, started = {}, 0
+    for r in roots:
+        h = hashlib.sha1(r.encode("utf-8", "replace")).hexdigest()[:12]
+        fp, lock = os.path.join(d, h + ".json"), os.path.join(d, h + ".pid")
+        cur = None
+        try:
+            with open(fp) as f:
+                cur = json.load(f)
+            res[r] = cur
+        except (OSError, ValueError):
+            pass
+        running = False
+        try:
+            age = T0 - os.stat(lock).st_mtime
+            with open(lock) as f:
+                pid = int(f.read().strip() or 0)
+            os.kill(pid, 0)
+            running = age < 3 * 3600
+        except (OSError, ValueError):
+            running = False
+        if running:
+            res.setdefault(r, {})["scanning_since"] = T0 - age
+        due = not cur or T0 - cur.get("started", cur.get("t", 0)) >= STORAGE_EVERY_MIN * 60
+        if due and not running and started < 3 and os.path.isdir(r):
+            try:
+                subprocess.Popen([sys.executable, "-c", STORAGE_SCANNER, r, fp, lock], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
+                started += 1
+            except OSError:
+                pass
+    return res
+
+
 def trunc(s, n):
     if s is None:
         return ""
@@ -1447,6 +1580,11 @@ def main():
             if isinstance(r, dict):
                 reqs.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("id", "param", "value", "why", "rule", "ts")})
     out["specs"] = specs
+    tops = []   # each goal's working folder once (a folder inside another one is counted with it)
+    for c in sorted(set(cwds[:8]), key=len):
+        if c and c != "/" and not any(c == t or c.startswith(t.rstrip("/") + "/") for t in tops) and c.rstrip("/") != os.path.expanduser("~"):
+            tops.append(c)
+    out["storage"] = storage_info(tops[:6])
     out["requests"] = reqs
     out["git"] = {c: git_info(c) for c in cwds[:8]}
     out["elapsed_s"] = round(time.time() - T0, 2)
