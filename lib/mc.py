@@ -1114,7 +1114,7 @@ def items_decorate(flags, gkey, sessions, ndoc):
             f["asked"] = ask["t"]
         ack = (ist.get("acks") or {}).get(f["key"])
         if ack and not f["key"].startswith(NO_ACK) and ack.get("sig") == item_sig(f) and NOW - ack.get("t", 0) < 7 * 86400:
-            f["acked"] = {"note": ack.get("note", ""), "t": ack["t"], "was": f["sev"]}
+            f["acked"] = {"note": ack.get("note", ""), "t": ack["t"], "was": f["sev"], "needs": bool(f.get("needs_you"))}
             f["sev"], f["needs_you"] = "ok", False
     return answers
 
@@ -1131,7 +1131,7 @@ def item_bar(f):
     elif f.get("asked"):
         o.append('<div class="ans mut">Asked the agent at %s; its answer shows here.</div>' % esc(hm(f["asked"])))
     if f.get("acked"):
-        o.append('<div class="ans mut">Dismissed by you %s%s</div>' % (esc(ago(f["acked"]["t"])), (" \u2014 " + esc(f["acked"]["note"])) if f["acked"].get("note") else ""))
+        o.append('<div class="ans mut ackline">Dismissed by you %s%s</div>' % (esc(ago(f["acked"]["t"])), (" \u2014 " + esc(f["acked"]["note"])) if f["acked"].get("note") else ""))
     o.append('<div class="clr">%s</div><div class="ibtn">' % esc(f.get("clears") or ""))
     o.append('<button type="button" class="lnk" data-cop="ask" data-citems="%s">Ask agent</button>' % esc(f["id"]))
     if f.get("acked"):
@@ -1150,7 +1150,7 @@ def flag_list_html(items):
     o = [flag_html(f) for f in live]
     if gone:
         if not live:
-            o.append('<div class="empty">Nothing open.</div>')
+            o.append('<div class="empty nothing">Nothing open.</div>')
         o.append('<details class="fold dism"><summary>Dismissed (%d)</summary>%s</details>' % (len(gone), "".join(flag_html(f) for f in gone)))
     return "".join(o)
 
@@ -4422,6 +4422,26 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  if(a==='end'){var t=prompt('End '+name+'?\n\nThis closes its tmux session and stops the agent. Its conversation stays in its logs (codex resume / claude --resume).\n\nType the session name to confirm:');
   if(t===null)return;if(t.trim()!==name){say('Not ended: the name didn’t match.','bad');return;}say('Ending '+name+'…','');
   post('/api/end',{key:key,confirm:t.trim()}).then(function(j){say(j.message||'',j.ok?'ok':'bad');}).catch(function(){say('Couldn’t reach the mission control server.','bad');});}});
+// Dismiss / Bring back take effect on the page at once (the next update renders the same): the item moves into its
+// section's "Dismissed (N)" fold, or back out of it
+function dismFold(sec,make){var d=null,kids=sec.children;for(var i=0;i<kids.length;i++)if(kids[i].matches&&kids[i].matches('details.dism'))d=kids[i];
+ if(!d&&make){d=document.createElement('details');d.className='fold dism';d.innerHTML='<summary>Dismissed (0)</summary>';
+  var fl=[].filter.call(kids,function(c){return c.classList&&c.classList.contains('flag');}),em=[].filter.call(kids,function(c){return c.classList&&c.classList.contains('empty');});
+  var after=fl.length?fl[fl.length-1]:(em.length?em[em.length-1]:sec.querySelector('h2'));sec.insertBefore(d,after?after.nextSibling:sec.firstChild);}
+ return d;}
+function dismCount(sec,d){if(d){var n=d.querySelectorAll(':scope > .flag').length;if(!n)d.remove();else d.querySelector('summary').textContent='Dismissed ('+n+')';}
+ var live=[].filter.call(sec.children,function(c){return c.classList&&c.classList.contains('flag');}).length,em=sec.querySelector(':scope > .empty.nothing');
+ if(!live&&d&&d.parentNode&&!em){em=document.createElement('div');em.className='empty nothing';em.textContent='Nothing open.';sec.insertBefore(em,d);}
+ else if(live&&em)em.remove();}
+function moveItem(fl,dismiss,b){var sec=fl.closest('section');if(!sec)return;var bar=fl.querySelector('.ibar');
+ if(dismiss){fl.classList.add('ok');b.textContent='Bring back';b.setAttribute('data-cop','unack');
+  if(bar&&!bar.querySelector('.ackline')){var l=document.createElement('div');l.className='ans mut ackline';l.textContent='Dismissed by you just now';
+   var clr=bar.querySelector('.clr');bar.insertBefore(l,clr||bar.firstChild);}
+  var note=document.createElement('div');note.className='small mut mvnote';note.textContent='Dismissed: it is under “Dismissed” at the end of this section.';
+  fl.parentNode.insertBefore(note,fl);setTimeout(function(){note.remove();},6000);
+  var d=dismFold(sec,true);d.appendChild(fl);dismCount(sec,d);}
+ else{fl.classList.remove('ok');b.textContent='Dismiss';b.setAttribute('data-cop','ack');var al=bar&&bar.querySelector('.ackline');if(al)al.remove();
+  var d2=dismFold(sec,false);sec.insertBefore(fl,d2||null);dismCount(sec,d2);fl.scrollIntoView({block:'nearest'});}}
 // change the contract: buttons and small forms carry the change in data-c* attributes (lib/contract.py does the work)
 document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('button[data-cop]');if(!b)return;
  var box=b.closest('[data-ckey]');if(!box)return;var o=box.querySelector('.actmsg')||(box.parentNode&&box.parentNode.querySelector('.actmsg'));
@@ -4438,7 +4458,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  else if(body.op==='ack'){var t2=prompt('Dismiss this item? It stays hidden until it changes (7 days at most).\nWhy is it a non-issue? (optional, kept with it)','');if(t2===null)return;body.text=t2;q='';}
  if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say(['ask','probe','remind','pin'].indexOf(body.op)>=0?'Sending\u2026':'Saving\u2026','');
  post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
-  if(j.ok&&(body.op==='ack'||body.op==='unack')){var fl=b.closest('.flag');if(fl)fl.classList.toggle('ok',body.op==='ack');}
+  if(j.ok&&(body.op==='ack'||body.op==='unack')){var fl=b.closest('.flag');if(fl)moveItem(fl,body.op==='ack',b);}
   if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)if(ins2[i].type!=='hidden')ins2[i].value='';}})
  .catch(function(){window.MC_BUSY=false;b.disabled=false;say('Couldn\u2019t reach the mission control server.','bad');});});
 // answer a question on the agent's screen: the button types that answer into the session (after you confirm)
@@ -4658,6 +4678,8 @@ def render(s):
 
     # needs you
     needs = [f for f in s["flags"] if f.get("needs_you")]
+    in_needs = lambda f: f.get("needs_you") or (needs and (f.get("acked") or {}).get("needs"))   # dismissed ones stay in its fold
+    needs = [f for f in s["flags"] if in_needs(f)]
     if needs:
         o.append('<section class="card"%s><h2>Needs you %s</h2>' % (sec("g", "needs"), ask_all_btn(needs, s["key"], "Ask the agent about all")))
         o.append(flag_list_html(needs))
@@ -4708,7 +4730,7 @@ def render(s):
     o.append('<div style="height:14px"></div>' if p["steps"] else "")
 
     # integrity
-    integ = [f for f in s["flags"] if f["area"] == "integrity" and not f.get("needs_you")]
+    integ = [f for f in s["flags"] if f["area"] == "integrity" and not in_needs(f)]
     o.append('<section class="card"%s><h2>Scientific integrity %s</h2>' % (sec("g", "integrity"), ask_all_btn(integ, s["key"], "Ask about these")))
     if integ:
         o.append(flag_list_html(integ))
@@ -4723,7 +4745,7 @@ def render(s):
     o.append(memory_html(s))
 
     # other flags (goal / compute amber+info not shown above)
-    other = [f for f in s["flags"] if f["area"] in ("goal", "compute", "connection") and not f.get("needs_you")]
+    other = [f for f in s["flags"] if f["area"] in ("goal", "compute", "connection") and not in_needs(f)]
     if other:
         o.append('<section class="card"%s><h2>Watchdog %s</h2>' % (sec("g", "watchdog"), ask_all_btn(other, s["key"], "Ask about these")))
         o.append(flag_list_html(other))
