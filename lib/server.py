@@ -321,7 +321,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except OSError:
                     pass
             why = (err.strip().splitlines() or ["the session was busy or asking something"])[-1]
-            done = {"ask": "asked", "probe": "probed", "remind": "reminded"}.get(body.get("op"))
+            done = {"ask": "asked", "probe": "probed", "remind": "reminded", "pin": "pinned"}.get(body.get("op"))
             if done:   # an item question, a memory check or a reminder: recorded only once it went out
                 if rc == 0 and done in ("asked", "probed"):
                     self._check_back(150)
