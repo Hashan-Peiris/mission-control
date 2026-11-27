@@ -563,7 +563,39 @@ def push(lst, item, cap):
         del lst[: len(lst) - cap]
 
 
-def note_compaction(st, ts, summary=None, pre_tokens=None):
+def codex_compacted(p):
+    """(summary, encrypted, kept): newer Codex keeps the summary encrypted (an item with encrypted_content) and carries some
+    of your messages and its instruction files (AGENTS.md) over word for word in the replacement history."""
+    summ = p.get("message") if isinstance(p.get("message"), str) else ""
+    enc, kept = False, []
+    for it in p.get("replacement_history") or []:
+        if not isinstance(it, dict):
+            continue
+        if it.get("encrypted_content") or "compaction" in str(it.get("type") or ""):
+            enc = True
+        elif it.get("type") == "message" and it.get("role") == "user":
+            t = text_of(it.get("content"))
+            if t.strip() and not t.lstrip().startswith("<environment_context"):
+                kept.append(t)
+    return (summ or "").strip(), enc, kept
+
+
+def note_kept(st, texts):
+    """Messages that stayed in the agent's context word for word: stored once per session, referred to by hash."""
+    kt = st.setdefault("kept_texts", {})
+    out = []
+    for t in texts[-40:]:
+        t = t.strip()
+        k = hashlib.sha1(t.encode("utf-8", "replace")).hexdigest()[:8]
+        if k not in kt:
+            kt[k] = trunc(t, 8000 if "AGENTS.md" in t[:300] or "CLAUDE.md" in t[:300] else 2500)
+        out.append(k)
+    while len(kt) > 80:
+        kt.pop(next(iter(kt)))
+    return out
+
+
+def note_compaction(st, ts, summary=None, pre_tokens=None, enc=False, kept=None):
     """One compaction: its time, how full the context was, and the summary the agent carries on from (into the
     conversation store as a "compact" message, so mission control can check what it kept)."""
     last = st["compactions"][-1] if st["compactions"] else None
@@ -581,15 +613,29 @@ def note_compaction(st, ts, summary=None, pre_tokens=None):
                 if ci.get("ts") == last:
                     ci["chars"] = len(summary)
                     break
+        if enc or kept:
+            for ci in reversed(st.get("compact_info") or []):
+                if ci.get("ts") == last:
+                    ci["enc"] = ci.get("enc") or bool(enc)
+                    ci["kept"] = ci.get("kept") or note_kept(st, kept or [])
+                    break
+            for m in reversed(st.get("msgs") or []):
+                if enc and m.get("role") == "event" and m.get("ts") == last and str(m.get("text") or "").startswith("Context compacted:"):
+                    m["text"] = ("Context compacted. Codex keeps its summary encrypted, so it can't be read here; %d of your messages "
+                                 "and instruction files stayed in its context word for word." % len(kept or []))
+                    break
         return
     push(st["compactions"], ts, 50)
     used = pre_tokens or (st.get("ctx_used") or 0)
     push(st.setdefault("compact_info", []), {"ts": ts, "pre": used or None, "win": st.get("ctx") or None,
-                                            "chars": len(summary or "")}, 50)
+                                            "chars": len(summary or ""), "enc": bool(enc), "kept": note_kept(st, kept or [])}, 50)
     push(st["notable"], {"ts": ts, "tool": st.get("kind") or "agent", "kind": "event", "cmd": "context compacted"}, 500)
     if summary and summary.strip():
         st["compact_text_at"] = ts
         add_msg(st, ts, "compact", summary.strip())
+    elif enc:
+        add_msg(st, ts, "event", "Context compacted. Codex keeps its summary encrypted, so it can't be read here; %d of your messages "
+                                 "and instruction files stayed in its context word for word." % len(kept or []))
     else:
         add_msg(st, ts, "event", "Context compacted: the agent continued from a summary of the conversation so far.")
 
@@ -597,11 +643,12 @@ def note_compaction(st, ts, summary=None, pre_tokens=None):
 def backfill_compactions(st):
     """Once per session file: the summaries of compactions from before mission control kept them (read straight from the
     log, only the compaction lines; skipped for files over 1.5 GB)."""
-    st["cbf"] = 1
+    st["cbf"] = 2
     try:
         if os.path.getsize(st["path"]) > 1.5e9:
             return
         have = {m.get("ts") for m in st.get("msgs") or [] if m.get("role") == "compact"}
+        infos = {ci.get("ts"): ci for ci in st.get("compact_info") or []}
         found = []
         with open(st["path"], "rb") as f:
             for line in f:
@@ -611,25 +658,24 @@ def backfill_compactions(st):
                     o = json.loads(line.decode("utf-8", "replace"))
                 except ValueError:
                     continue
-                ts, summ = o.get("timestamp"), ""
+                ts, summ, enc, kept = o.get("timestamp"), "", False, []
                 if o.get("type") == "compacted":
-                    p = o.get("payload") or {}
-                    summ = p.get("message") if isinstance(p.get("message"), str) else ""
-                    if not summ.strip() and isinstance(p.get("replacement_history"), list):
-                        for it in reversed(p["replacement_history"]):
-                            if isinstance(it, dict) and it.get("type") == "message" and it.get("role") == "user":
-                                summ = text_of(it.get("content"))
-                                break
+                    summ, enc, kept = codex_compacted(o.get("payload") or {})
                 elif o.get("isCompactSummary"):
                     c = (o.get("message") or {}).get("content")
                     summ = c if isinstance(c, str) else text_of(c)
-                if ts and (summ or "").strip() and ts not in have:
-                    found.append((ts, summ))
-                    have.add(ts)
-        for ts, summ in found[-30:]:
-            add_msg(st, ts, "compact", summ.strip())
-            if not any(ci.get("ts") == ts for ci in st.get("compact_info") or []):
-                push(st.setdefault("compact_info", []), {"ts": ts, "pre": None, "win": st.get("ctx"), "chars": len(summ)}, 50)
+                if ts:
+                    found.append((ts, summ, enc, kept))
+        for ts, summ, enc, kept in found[-30:]:
+            if summ.strip() and ts not in have:
+                add_msg(st, ts, "compact", summ.strip())
+                have.add(ts)
+            ci = infos.get(ts)
+            if ci is None:
+                push(st.setdefault("compact_info", []), {"ts": ts, "pre": None, "win": st.get("ctx"), "chars": len(summ), "enc": enc,
+                                                        "kept": note_kept(st, kept)}, 50)
+            else:
+                ci.update(enc=enc, kept=note_kept(st, kept), chars=len(summ))
     except Exception:  # noqa
         pass
 
@@ -944,13 +990,8 @@ def handle_codex(st, o):
         elif pt == "turn_aborted":
             push(st["notable"], {"ts": ts, "tool": "codex", "kind": "event", "cmd": pt}, 500)
     elif t == "compacted":
-        summ = p.get("message") if isinstance(p.get("message"), str) else ""
-        if not (summ or "").strip() and isinstance(p.get("replacement_history"), list):
-            for it in reversed(p["replacement_history"]):   # newer Codex: the summary is the new history's last user turn
-                if isinstance(it, dict) and it.get("type") == "message" and it.get("role") == "user":
-                    summ = text_of(it.get("content"))
-                    break
-        note_compaction(st, ts, summ)
+        summ, enc, kept = codex_compacted(p)
+        note_compaction(st, ts, summ, None, enc, kept)
     elif t == "response_item":
         pt = p.get("type")
         if pt == "message":
@@ -1590,11 +1631,13 @@ def main():
     for fp, kind in sorted(cands.items()):
         st = files_state.get(fp) or new_state(fp, kind)
         parse_file(st, handle_codex if kind == "codex" else handle_claude)
-        if fp in open_files and not st.get("cbf"):
+        if fp in open_files and (st.get("cbf") or 0) < 2:
             backfill_compactions(st)
         new_files_state[fp] = st
         s = {k: v for k, v in st.items() if k not in ("seen_msg", "usage_ids", "offset", "ino", "msgs")}
         s["cmdlog"] = [c[:4] for c in st.get("cmdlog") or [] if c and c[0] >= T0 - 48 * 3600]   # without the call ids
+        refs = {k for ci in (st.get("compact_info") or [])[-8:] for k in ci.get("kept") or []}
+        s["kept_texts"] = {k: v for k, v in (st.get("kept_texts") or {}).items() if k in refs}
         since = MSG_SINCE.get(fp) or {}
         floor = since.get("seq", 0) if since.get("epoch") == st.get("msg_epoch") else 0
         s["msgs_new"] = [m for m in st.get("msgs", []) if m["seq"] > floor]

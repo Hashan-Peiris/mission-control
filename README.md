@@ -16,6 +16,43 @@ It was built for one researcher's setup and generalises from there:
 Mission control never logs in by itself. It only rides connections that already exist, so it can't
 lock you out of a cluster with failed logins and never needs your credentials.
 
+## What it looks like
+
+The screenshots below come from a made-up demo: a Codex agent computing elastic constants with VASP
+and a Claude Code agent fine-tuning a machine-learned potential, on one compute node.
+
+**The dashboard.** What needs you across all sessions comes first: here, a question on the agent's
+screen you can answer with one tap, a rule change it asked for, an edit that broke the contract, and
+acceptance criteria it proposed. Below are the sessions with their state and latest words.
+
+![The dashboard](docs/img/overview.png)
+
+**Needs you, on a session page.** Every item says what makes it go away by itself and has Ask agent and
+Dismiss. The agent's answers show under the item ("intended" here), and its requests are laid out as the
+change, what it is for and why, with Allow for this request, Change the rule or Reject.
+
+![Needs you](docs/img/needs-you.png)
+
+**Scientific integrity.** Every watched setting in the agents' recent input files, checked against the
+contract. A setting seen with several values can be locked to the ones you accept with one tap.
+
+![Scientific integrity](docs/img/integrity.png)
+
+**Memory.** What each compaction kept of the contract and your instructions, how the agent worked before
+and after, and buttons to check what it remembers, remind it, or pin the rules in AGENTS.md.
+
+![Memory across compactions](docs/img/memory.png)
+
+**The conversation.** Everything you and the agents said, sub-agents included, with each compaction's
+summary folded in place and a box to message the agent as if you were at its terminal.
+
+![The conversation](docs/img/conversation.png)
+
+**The working folder** (under Resources): its size over two days, what kind of files fill it, the biggest
+files, and every 50 GB crossed. **On the phone**, the same pages, in dark mode here.
+
+<p><img src="docs/img/storage.png" alt="The working folder" width="49%"> <img src="docs/img/phone-overview.png" alt="The dashboard on a phone" width="24%"> <img src="docs/img/phone-session.png" alt="A session page on a phone" width="24%"></p>
+
 ## Start it (once per machine)
 
 Put this folder somewhere every machine can see (for example inside OneDrive), then in WSL Ubuntu:
