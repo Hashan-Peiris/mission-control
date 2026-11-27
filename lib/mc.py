@@ -172,6 +172,12 @@ def ago(epoch):
     return "%.1f d ago" % (s / 86400)
 
 
+def dur(secs):
+    """A length of time in words: 40 s, 12 min, 2.5 h, 1.5 d."""
+    s = max(0, float(secs or 0))
+    return "%d s" % s if s < 90 else ("%d min" % (s / 60) if s < 5400 else ("%.1f h" % (s / 3600) if s < 172800 else "%.1f d" % (s / 86400)))
+
+
 def hm(epoch):
     if not epoch:
         return ""
@@ -897,6 +903,32 @@ def cmd_contract_edit(key, req):
                     msg = "Brought back"
             items_save(ipath, ist)
             return out(True, msg + ".")
+        elif op in ("probe", "probed", "remind", "reminded"):   # memory: ask what it remembers, or remind it (Memory card)
+            mem = snap.get("memory") or {}
+            if op == "probe":
+                return out(True, "Asked the agent what it remembers; its answer is scored on the Memory card.",
+                           "[mission control] Memory check from the user. From what you remember (don't open files for this), reply "
+                           "with one line per item, starting each line with its label:\nGOAL: the goal in one line\nRULE: each setting "
+                           "you must keep, with its value\nLIMIT: each compute limit (clusters, budget)\nCRITERION: each acceptance "
+                           "criterion\nINSTRUCTION: each standing instruction from the user\nNEXT: your next three steps\nThen carry on "
+                           "with your work.")
+            if op == "remind":
+                full = mem.get("items_full") or []
+                if not full:
+                    return out(False, "The contract has no rules or limits to remind it of yet.")
+                comps = [c for c in mem.get("comps") or [] if c.get("who") in (None, "", "main")]
+                last, pr = (comps[-1] if comps else {}), (mem.get("probe") or {})
+                miss = (pr.get("hard_missing") if pr.get("answered") and pr.get("at", 0) > (last.get("e") or 0) else last.get("hard_missing")) or []
+                text = "[mission control] Reminder from the user: these still apply to this goal.\n" + "\n".join("- " + x for x in full)
+                if miss:
+                    text += "\n\nYour last summary or memory check left out: %s." % "; ".join(miss)
+                return out(True, "Sent the agent its contract items%s." % ((" (%d it had left out)" % len(miss)) if miss else ""),
+                           text + "\nKeep them in your working notes, and carry on.")
+            ms = mem_state(key)
+            k = "probes" if op == "probed" else "reminds"
+            ms[k] = (ms.get(k) or [])[-9:] + [time.time()]
+            mem_save(key, ms)
+            return out(True, "Recorded.")
         elif op in ("approve", "reject", "approve_once"):
             pids = [x for x in re.split(r"[,\s]+", str(req.get("pid") or "")) if x][:40]
             sigs = [x for x in re.split(r"[,\s]+", str(req.get("psig") or "")) if x]
@@ -1006,6 +1038,8 @@ def clears_text(key, hours):
         "gpu": "Goes away when the GPU is busy again.",
         "storage": "Goes away 6 h after the spike.",
         "goal": "Goes away when the agent\u2019s state changes.",
+        "memory": "Goes away when a newer summary or memory check keeps every rule and limit, after a reminder, or 48 h after the compaction.",
+        "drift": "Goes away when the agent finishes a plan step or does something else.",
         "agent": "Goes away when an agent runs in the session again.",
         "tmux": "Goes away when the tmux session is back.",
         "quota": "Goes away when the quota window resets.",
@@ -1601,6 +1635,307 @@ def goal_doc(goal):
             "elapsed_s": doc.get("elapsed_s", 0), "specs": specs, "requests": reqs, "answers": answers, "storage": stor}
 
 
+# ---------------------------------------------------------------- memory across compactions, and drift in long runs
+# When an agent compacts, it carries on from a summary it wrote of the work so far. Each summary is checked against what
+# should survive it (the contract's rules and limits, its criteria, your standing instructions); the hours before and after
+# are compared (contract breaks, failed commands, repeated work, time back to real work); long runs are watched for hours
+# without plan progress and for command loops. "Check what it remembers" asks the agent to list them from memory.
+MEM_WORDS = {"ENCUT": ["cutoff", "cut-off", "energy cutoff", "plane-wave cutoff"], "EDIFF": ["electronic convergence"],
+             "EDIFFG": ["force convergence", "ionic convergence"], "KSPACING": ["k-point spacing", "k-spacing"],
+             "ISMEAR": ["smearing method"], "SIGMA": ["smearing width"], "PREC": ["precision"], "ISPIN": ["spin polarization"]}
+MEM_STOP = set(("the a an and or not of to in on for with by is are be this that these those it its as at from into than then also only "
+                "each every all any your you their our we they will must should can may use using used keep kept dont don't please "
+                "make sure when what which there here have has had more most less very just").split())
+CONSTRAINT_RX = re.compile(r"\b(don'?t|do not|never|always|only|must|keep|avoid|no more|not use|not run|stop|at most|at least|limit|budget|"
+                           r"instead of|without)\b", re.I)
+PROBE_RX = re.compile(r"(?im)^\W{0,4}(GOAL|RULE|LIMIT|CRITERION|INSTRUCTION|NEXT)\s*:\s*(.+)$")
+
+
+def _mwords(t):
+    return {w for w in re.findall(r"[a-z][a-z0-9_+\-]{3,}", str(t).lower()) if w not in MEM_STOP}
+
+
+def mem_items(contract, instr, goal_text):
+    """What should survive a compaction."""
+    items = []
+    for w in contract["watch"]:
+        if w["op"] and not w["name"].startswith("POT_"):
+            items.append({"kind": "rule", "label": "%s %s %s" % (w["name"], w["op"], w["val"]), "name": w["name"], "op": w["op"], "val": w["val"]})
+    cp = CT.parse_compute(contract["raw"])
+    if cp["allowed"]:
+        hs = [x.split(" (")[0].strip() for x in cp["allowed"]]
+        items.append({"kind": "limit", "label": "only %s" % ", ".join(hs), "hosts": hs})
+    for f in cp["forbid"]:
+        items.append({"kind": "limit", "label": "not %s" % f, "hosts": [f.split(" (")[0].strip()]})
+    if cp["budget"]:
+        items.append({"kind": "limit", "label": "budget %s %s" % ("{:,.0f}".format(cp["budget"][0]), cp["budget"][1]), "num": cp["budget"][0]})
+    for t in CT.criteria_texts(contract["raw"]):
+        items.append({"kind": "criterion", "label": trunc(t, 80), "text": t})
+    gw = _mwords(goal_text)
+    seen = []
+    for u in instr:   # newest first: standing instructions (constraints), not the goal itself
+        t = u["text"].strip()
+        if not (12 <= len(t) <= 700) or not CONSTRAINT_RX.search(t):
+            continue
+        w = _mwords(t)
+        if not w or (gw and len(w & gw) >= 0.8 * len(w)) or any(len(w & s) >= 0.8 * len(w) for s in seen):
+            continue
+        seen.append(w)
+        items.append({"kind": "instruction", "label": trunc(t, 80), "text": t})
+        if len(seen) >= 10:
+            break
+    for a in contract["amends"]:   # instructions you made binding
+        if "(from U" in a["text"]:
+            items.append({"kind": "instruction", "label": trunc(a["text"], 80), "text": a["text"]})
+    return items
+
+
+def mem_check(text, items):
+    """kept / partial / missing for each item, as found in a summary (or a memory-check reply)."""
+    low = str(text or "").lower()
+    nums = []
+    for m in re.finditer(r"\d[\d,]*(?:\.\d+)?\s*[kK]?\b|" + CT.NUM, low):
+        tok = m.group(0).replace(",", "").strip()
+        mult = 1000 if tok.lower().endswith("k") else 1
+        x = num(tok.rstrip("kK").strip())
+        if x is not None:
+            nums.append(x * mult)
+    words = _mwords(low)
+    out = []
+    for it in items:
+        st = "missing"
+        if it["kind"] == "rule":
+            vals = it["val"].split("|") if it["op"] == "in" else [it["val"]]
+            hit = False
+            for nm in [it["name"]] + MEM_WORDS.get(it["name"], []):
+                for m in re.finditer(r"(?<![a-z0-9_])%s(?![a-z0-9_])" % re.escape(nm.lower()), low):
+                    hit = True
+                    win = low[max(0, m.start() - 30): m.end() + 45]
+                    for v in vals:
+                        want = num(v)
+                        if want is not None:
+                            for mm in re.finditer(CT.NUM, win):
+                                x = num(mm.group(0))
+                                if x is not None and abs(x - want) <= 1e-9 * max(1.0, abs(want)):
+                                    st = "kept"
+                        elif v.strip().lower() and re.sub(r"^\.|\.$", "", v.strip().lower())[:6] in win:
+                            st = "kept"
+                    if st == "kept":
+                        break
+                if st == "kept":
+                    break
+            if st != "kept" and hit:
+                st = "partial"
+        elif it["kind"] == "limit":
+            if it.get("hosts"):
+                st = "kept" if all(re.search(r"\b%s\b" % re.escape(h.lower()), low) for h in it["hosts"]) else "missing"
+            elif it.get("num"):
+                st = "kept" if any(abs(x - it["num"]) < 0.5 for x in nums) else "missing"
+        else:
+            w = _mwords(it["text"])
+            if w:
+                frac = len(w & words) / float(len(w))
+                st = "kept" if frac >= 0.5 else ("partial" if frac >= 0.3 else "missing")
+        out.append(st)
+    return out
+
+
+def mem_state(gkey):
+    return rjson(os.path.join(STATE, "memory", gkey + ".json"), {}) or {}
+
+
+def mem_save(gkey, st):
+    p = os.path.join(STATE, "memory", gkey + ".json")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p + ".tmp", "w") as f:
+        json.dump(st, f)
+    os.replace(p + ".tmp", p)
+
+
+def _norm_cmd(c):
+    return re.sub(r"\s+", " ", str(c or "")).strip()[:300]
+
+
+def memory_report(gkey, flags, conv, main, fam, contract, instr, goal_text, changes, plan_done, plan_total):
+    """The Memory card's data, and its flags."""
+    ms = mem_state(gkey)
+    items = mem_items(contract, instr, goal_text)
+    sessions = [s for s in ([main] if main else []) + [x for x in fam if x is not main] if s]
+    info = {}
+    for s in sessions:
+        for ci in s.get("compact_info") or []:
+            e = iso_epoch(ci.get("ts"))
+            if e:
+                info[int(e)] = dict(ci, who=s.get("label") or "main")
+    comps = []
+    for m in conv:
+        if m["r"] == "compact" and m["e"]:
+            ci = next((v for k, v in info.items() if abs(k - m["e"]) < 120), {})
+            comps.append({"e": m["e"], "who": m["w"] or "main", "text": m["x"], "pre": ci.get("pre"), "win": ci.get("win")})
+    for s in sessions:   # compactions recorded before summaries were kept
+        for ts in s.get("compactions") or []:
+            e = iso_epoch(ts)
+            if e and not any(abs(c["e"] - e) < 120 for c in comps):
+                ci = info.get(int(e)) or {}
+                comps.append({"e": e, "who": s.get("label") or "main", "text": "", "pre": ci.get("pre"), "win": ci.get("win")})
+    comps.sort(key=lambda c: c["e"])
+    mainc = [c for c in comps if c["who"] in (None, "", "main")]
+    ev = sorted([dict(x, e=iso_epoch(x.get("ts")) or 0) for x in (main or {}).get("notable", []) if x.get("ts")], key=lambda x: x["e"])
+    work = [x for x in ev if x.get("kind") in ("edit", "submit", "plan")]
+    # every command the agent ran (time, kind, hash, exit), when the digest keeps it; else the notable ones
+    cl = [{"e": c[0], "kind": c[1], "h": c[2], "exit": c[3]} for c in (main or {}).get("cmdlog") or [] if isinstance(c, list) and len(c) >= 4]
+    if not cl:
+        cl = [{"e": x["e"], "kind": x.get("kind"), "h": _norm_cmd(x.get("cmd")), "exit": x.get("exit")} for x in ev]
+    runs = [c for c in cl if c["kind"] not in ("plan", "monitor", "edit")]
+    for i, c in enumerate(mainc):
+        if c["text"]:
+            res = mem_check(c["text"], items)
+            c["kept"] = sum(1 for r in res if r == "kept")
+            c["missing"] = [it["label"] for it, r in zip(items, res) if r == "missing"]
+            c["partial"] = [it["label"] for it, r in zip(items, res) if r == "partial"]
+            c["hard_missing"] = [it["label"] for it, r in zip(items, res) if r != "kept" and it["kind"] in ("rule", "limit")]
+        lo = mainc[i - 1]["e"] if i else 0
+        hi = mainc[i + 1]["e"] if i + 1 < len(mainc) else NOW
+        w = min(3 * 3600, c["e"] - lo if lo else 3 * 3600, max(60, hi - c["e"]))
+        win_b, win_a = (c["e"] - w, c["e"]), (c["e"], c["e"] + w)
+        inside = lambda e, wn: wn[0] <= e < wn[1]
+        c["w_h"] = w / 3600.0
+        c["breaks"] = [sum(1 for ch in changes if ch.get("bad") and inside(iso_epoch(ch.get("ts")) or 0, wn)) for wn in (win_b, win_a)]
+        c["fails"] = [sum(1 for x in cl if x.get("exit") not in (None, 0, "0") and inside(x["e"], wn)) for wn in (win_b, win_a)]
+        before = {x["h"] for x in runs if c["e"] - 6 * 3600 <= x["e"] < c["e"]}
+        c["repeats"] = sum(1 for x in runs if inside(x["e"], win_a) and x["h"] in before)
+        nxt = next((x for x in work if x["e"] >= c["e"]), None)
+        c["back"] = (nxt["e"] - c["e"]) if nxt and (i + 1 >= len(mainc) or nxt["e"] < mainc[i + 1]["e"]) else None
+    # the latest memory check (asked with the button) and its reply
+    probe = None
+    for t in sorted(ms.get("probes") or [], reverse=True)[:1]:
+        rep = next((m for m in conv if m["r"] == "agent" and m["e"] >= t - 5 and len(PROBE_RX.findall(m["x"])) >= 2), None)
+        probe = {"t": t, "answered": bool(rep)}
+        if rep:
+            body = "\n".join(v for k, v in PROBE_RX.findall(rep["x"]) if k.upper() != "NEXT")
+            res = mem_check(body, items)
+            probe.update(at=rep["e"], kept=sum(1 for r in res if r == "kept"),
+                         missing=[it["label"] for it, r in zip(items, res) if r != "kept"],
+                         hard_missing=[it["label"] for it, r in zip(items, res) if r != "kept" and it["kind"] in ("rule", "limit")])
+    remind = max(ms.get("reminds") or [0]) or None
+    # plan progress over time (kept here, since the agent's log only has its latest plan)
+    ph = ms.setdefault("plan_hist", [])
+    if plan_total and (not ph or ph[-1][1:] != [plan_done, plan_total]):
+        ph.append([NOW, plan_done, plan_total])
+        del ph[:-60]
+        mem_save(gkey, ms)
+    # ---- flags
+    last = mainc[-1] if mainc else None
+    if last and NOW - last["e"] < 48 * 3600:
+        newer = probe if probe and probe.get("answered") and probe.get("at", 0) > last["e"] else None
+        if newer:
+            if newer["hard_missing"]:
+                flags.add("memory:probe:%d" % int(newer["t"]), "amber", "integrity",
+                          "The agent's memory check left out %d contract item%s" % (len(newer["hard_missing"]), "" if len(newer["hard_missing"]) == 1 else "s"),
+                          "Missing: %s" % "; ".join(newer["hard_missing"]), "Remind it of the contract (Memory card).",
+                          acts=[{"label": "Remind the agent", "op": "remind", "confirm": "Send the agent its contract items again?"}])
+        elif last.get("hard_missing") and not (remind and remind > last["e"]):
+            flags.add("memory:forgot:%d" % int(last["e"]), "amber", "integrity",
+                      "After the compaction at %s, the agent's summary leaves out %d contract item%s" % (
+                          hm(last["e"]), len(last["hard_missing"]), "" if len(last["hard_missing"]) == 1 else "s"),
+                      "Missing: %s" % "; ".join(last["hard_missing"]),
+                      "Remind it, or check what it remembers.",
+                      acts=[{"label": "Remind the agent", "op": "remind", "confirm": "Send the agent its contract items again, noting what its summary left out?"},
+                            {"label": "Check what it remembers", "op": "probe", "confirm": "Ask the agent to list its goal, rules, limits and next steps from memory?"}])
+        b0, b1 = last["breaks"]
+        f0, f1 = last["fails"]
+        worse = []
+        if b1 >= 1 and b1 > b0:
+            worse.append("contract breaks %d → %d" % (b0, b1))
+        if f1 >= 3 and f1 >= 3 * max(1, f0):
+            worse.append("failed commands %d → %d" % (f0, f1))
+        if last["repeats"] >= 5:
+            worse.append("%d earlier commands run again" % last["repeats"])
+        if worse:
+            flags.add("memory:after:%d" % int(last["e"]), "amber", "integrity",
+                      "The agent works differently since the compaction at %s" % hm(last["e"]),
+                      "In %.0f h before and after: %s." % (last["w_h"], "; ".join(worse)), "Look at its recent edits and commands, or check what it remembers.")
+    # hours of work with no plan step finished
+    if ph and plan_total and plan_done < plan_total:
+        since = next((ph[i][0] for i in range(len(ph) - 1, 0, -1) if ph[i][1] > ph[i - 1][1]), ph[0][0])
+        busy = [x for x in ev if x["e"] >= since and x.get("kind") not in ("monitor",)]
+        if NOW - since >= 12 * 3600 and len(busy) >= 40:
+            flags.add("drift:stall", "amber", "goal", "No plan step finished in %s" % ago(since).replace(" ago", ""),
+                      "%d actions since, while the plan stays at %d of %d." % (len(busy), plan_done, plan_total),
+                      "Ask the agent what is holding it up.")
+    # the same command over and over, with no edit, submission or plan step in between
+    recent = [x for x in cl if x["e"] >= NOW - 2 * 3600]
+    if recent and not any(x["kind"] in ("edit", "submit", "plan") for x in recent):
+        cnt = {}
+        for x in recent:
+            if x["kind"] not in ("monitor", "plan"):
+                cnt[x["h"]] = cnt.get(x["h"], 0) + 1
+        top = max(cnt.items(), key=lambda kv: kv[1]) if cnt else None
+        if top and top[1] >= 8:
+            txt = next((t.get("cmd") for t in reversed((main or {}).get("tools") or []) if hashlib.sha1(
+                re.sub(r"\s+", " ", t.get("cmd") or "").strip()[:2000].encode("utf-8", "replace")).hexdigest()[:6] == top[0]), "") or top[0]
+            flags.add("drift:loop", "amber", "goal", "The agent ran the same command %d times in 2 h" % top[1],
+                      trunc(txt, 160), "It may be stuck in a loop. Look at the live screen, or ask it.")
+    return {"items": [it["label"] for it in items], "items_full": [it.get("text") or it["label"] for it in items], "n_items": len(items), "comps": [
+        dict({k: c.get(k) for k in ("e", "who", "pre", "win", "kept", "missing", "partial", "hard_missing", "breaks", "fails", "repeats", "back", "w_h")},
+             has_text=bool(c["text"])) for c in comps[-12:]], "probe": probe, "remind": remind}
+
+
+def memory_html(s):
+    mem = s.get("memory") or {}
+    comps = [c for c in mem.get("comps") or [] if c.get("who") in (None, "", "main")]
+    nsub = len([c for c in mem.get("comps") or [] if c.get("who") not in (None, "", "main")])
+    pr = mem.get("probe")
+    if not comps and not pr:
+        return ""
+    last = comps[-1] if comps else None
+    bits = ["%d compaction%s" % (len(comps), "" if len(comps) == 1 else "s")] if comps else []
+    if last:
+        bits.append("last %s" % ago(last["e"]))
+    if nsub:
+        bits.append("%d in sub-agents" % nsub)
+    o = ['<section class="card"%s><h2>Memory <span class="h2n">%s</span></h2>' % (sec("g", "memory"), esc(" \u00b7 ".join(bits)))]
+    o.append('<div class="small mut" style="margin:-2px 0 8px">Each compaction leaves the agent with a summary it wrote itself. Kept counts the '
+             'contract\u2019s rules and limits, its criteria and your standing instructions (%d now) found in that summary.</div>' % mem.get("n_items", 0))
+    if pr:
+        if pr.get("answered"):
+            o.append('<div class="mrow"><b>Memory check</b> %s: kept %d of %d%s</div>' % (
+                esc(hm(pr["at"])), pr["kept"], mem.get("n_items", 0),
+                (' \u00b7 left out: ' + clip_html("; ".join(pr["missing"]), 160)) if pr.get("missing") else " \u00b7 nothing left out"))
+        else:
+            o.append('<div class="mrow"><b>Memory check</b> asked at %s; its answer is scored here.</div>' % esc(hm(pr["t"])))
+    if mem.get("remind"):
+        o.append('<div class="mrow mut">Reminded of the contract at %s.</div>' % esc(hm(mem["remind"])))
+    o.append('<div class="cacts" data-ckey="%s" style="margin:8px 0 10px">%s %s<span class="actmsg"></span></div>' % (
+        esc(s["key"]),
+        act_btn({"label": "Check what it remembers", "op": "probe", "confirm": "Ask the agent to list its goal, rules, limits, criteria and next steps from memory? Its answer is scored here."}),
+        act_btn({"label": "Remind it of the contract", "op": "remind", "confirm": "Send the agent its contract items again?"})))
+    if comps:
+        rows = []
+        for c in reversed(comps[-8:]):
+            full = (" \u00b7 %d%% full" % round(100.0 * c["pre"] / c["win"])) if c.get("pre") and c.get("win") else ""
+            if c.get("has_text"):
+                kept = "%d of %d" % (c["kept"] or 0, mem.get("n_items", 0))
+                left = clip_html("; ".join(c.get("missing") or []), 120) if c.get("missing") else '<span class="mut">nothing</span>'
+            else:
+                kept, left = '<span class="mut">\u2013</span>', '<span class="mut">summary not recorded</span>'
+            after = []
+            b0, b1 = c.get("breaks") or [0, 0]
+            f0, f1 = c.get("fails") or [0, 0]
+            after.append('<span class="%s">breaks %d\u2192%d</span>' % ("bad-t" if b1 > b0 else "", b0, b1))
+            after.append('<span class="%s">failed %d\u2192%d</span>' % ("bad-t" if f1 >= 3 and f1 >= 3 * max(1, f0) else "", f0, f1))
+            if c.get("repeats"):
+                after.append("%d repeated" % c["repeats"])
+            if c.get("back") is not None:
+                after.append("back to work in %s" % dur(c["back"]))
+            rows.append('<tr><td>%s<span class="mut">%s</span></td><td>%s</td><td>%s</td><td class="small">%s</td></tr>' % (
+                esc(hm(c["e"])), esc(full), kept, left, " \u00b7 ".join(after)))
+        o.append('<table class="small mtab"><tr><th>Compaction</th><th>Kept</th><th>Left out</th><th>%.0f h before \u2192 after</th></tr>%s</table>' % (
+            min(3, max((c.get("w_h") or 3) for c in comps[-8:])), "".join(rows)))
+    o.append("</section>")
+    return "".join(o)
+
+
 def analyze_goal(gdesc, shared):
     flags = Flags()
     gname, gkey, gnode = gdesc["name"], gdesc["key"], gdesc["node"]
@@ -2158,7 +2493,6 @@ def analyze_goal(gdesc, shared):
                   "Fill contract/goal_contract.md so the checks know what matters.")
     contract_flags(flags, contract, cst, res, {"alloc_ch": tot_alloc}, node, gnode, codex_goal)
     storage = storage_update(gkey, (ndoc or {}).get("storage"), flags)
-    items_decorate(flags, gkey, sessions, ndoc)
 
     # ---- instructions you typed
     instr = []
@@ -2184,6 +2518,20 @@ def analyze_goal(gdesc, shared):
         seen_ids.add(u["id"])
         uniq.append(u)
     instr = uniq[:60]
+    try:
+        memory = memory_report(gkey, flags, conv, main, fam, contract, instr, goal_text, changes, plan_done, len(plan or []))
+    except Exception as e:  # noqa: a bad record must not take the page down
+        sys.stderr.write("memory %s: %s\n" % (gkey, e))
+        memory = None
+    checked = [c["e"] for c in (memory or {}).get("comps") or [] if c.get("has_text")]
+    for f in list(flags.items):
+        if f["key"].startswith("goal:compaction"):
+            if any(re.search(r"compacted at (.+)$", f["title"]) and hm(e) in f["title"] for e in checked):
+                flags.items.remove(f)   # checked on the Memory card instead
+            elif not f.get("acts"):
+                f["acts"] = [{"label": "Check what it remembers", "op": "probe",
+                              "confirm": "Ask the agent to list its goal, rules, limits and next steps from memory? Its answer is scored on the Memory card."}]
+    items_decorate(flags, gkey, sessions, ndoc)
 
     # ---- timeline
     tl = []
@@ -2257,7 +2605,7 @@ def analyze_goal(gdesc, shared):
                     "waste_pct": None if waste_pct is None else round(waste_pct, 1), "gpu_h": round(gpu_h, 1),
                     "running_cores": running_cores},
         "params": {"table": ptable, "scan": {k: params.get(k) for k in ("files", "dirs", "roots", "truncated", "note", "cached", "t")}},
-        "changes": changes[-20:], "instructions": instr, "timeline": tl, "criteria": crit_rows,
+        "changes": changes[-20:], "instructions": instr, "timeline": tl, "criteria": crit_rows, "memory": memory,
         "measured": [{k: m.get(k) for k in ("epoch", "src", "cmd", "file", "metrics", "n_test", "who")} for m in measured[-30:]],
         "sessions": [{"label": s.get("label"), "host": s.get("host"), "kind": s.get("kind"), "role": s.get("role"),
                       "model": s.get("meta", {}).get("ctx_model") or s.get("meta", {}).get("model_provider"),
@@ -2435,6 +2783,9 @@ def load_conversation(sessions):
                 role = "sub"
             msgs.append({"t": m.get("ts"), "e": iso_epoch(m.get("ts")) or 0, "r": role, "w": label, "x": m.get("text") or "", "md": m.get("mdl") or ""})
     msgs.sort(key=lambda m: m["e"])
+    cmp_at = [m["e"] for m in msgs if m["r"] == "compact"]
+    if cmp_at:   # the plain "Context compacted" line, where the summary itself is now kept
+        msgs = [m for m in msgs if not (m["r"] == "event" and m["x"].startswith("Context compacted") and any(abs(m["e"] - e) < 120 for e in cmp_at))]
     return msgs
 
 
@@ -2620,7 +2971,7 @@ ROLE_CHIPS = [("agent", "Agent"), ("sub", "Sub-agents"), ("user", "You"), ("task
 # Every block on the pages can be hidden: click its x (this browser), or `mctl hide NAME` (every machine).
 SECTIONS = [("latest", "Agent's latest words"), ("cards", "Key numbers"), ("needs", "Needs you"), ("criteria", "Acceptance criteria"),
             ("plan", "Plan"), ("resources", "Resources"), ("integrity", "Scientific integrity"), ("watchdog", "Watchdog"),
-            ("timeline", "What happened"), ("instructions", "Your instructions"), ("screen", "Live screen"), ("slurm", "Slurm jobs"),
+            ("memory", "Memory"), ("timeline", "What happened"), ("instructions", "Your instructions"), ("screen", "Live screen"), ("slurm", "Slurm jobs"),
             ("sessions", "Agent sessions"), ("referee", "Referee review"), ("contract", "Contract"), ("others", "Other agent logs")]
 SEC_LABEL = dict(SECTIONS)
 
@@ -3629,7 +3980,8 @@ details.rowmenu>summary{list-style:none;font-weight:700;color:var(--mut);padding
 details.rowmenu>summary::-webkit-details-marker{display:none}details.rowmenu[open]>summary{color:var(--fg);border-color:var(--fg)}
 details.rowmenu .cacts{flex-direction:column;align-items:stretch;gap:4px;margin-top:6px}
 footer div{margin:2px 0}
-.ibar{margin-top:6px;font-size:12px}.pchg{font-family:var(--mono,ui-monospace,monospace);font-size:13px;font-weight:600;margin:3px 0 4px;color:var(--fg)}
+.ibar{margin-top:6px;font-size:12px}.mrow{font-size:13px;margin:4px 0}.mrow>b{font-weight:600;margin-right:6px}
+table.mtab td{vertical-align:top;padding-top:6px;padding-bottom:6px}table.mtab td:first-child{white-space:nowrap}.pchg{font-family:var(--mono,ui-monospace,monospace);font-size:13px;font-weight:600;margin:3px 0 4px;color:var(--fg)}
 .pmeta{font-size:12.5px;color:var(--mut);margin:3px 0;line-height:1.45}.pmeta>b{font-weight:600;color:var(--fg);margin-right:6px}.pmeta.faint{color:var(--faint);font-size:11.5px}
 ol.plist{margin:4px 0 6px;padding-left:22px;font-size:13px}ol.plist li{margin:5px 0;line-height:1.45}ol.plist .pbt{white-space:nowrap;margin-left:10px}
 ol.plist .pbt .lnk{margin-left:8px}ol.plist .pbt .lnk.dng{color:var(--rose)}
@@ -4014,7 +4366,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  if(['set','allow','unlock','unwatch','criterion','uncriterion','amend','bind'].indexOf(body.op)>=0)q=(q||'Change the contract?')+'\n\nThe agent gets a short message about the change.';
  if(body.op==='ask'){var n=(body.items||'').split(',').length;var t=prompt('Ask the agent about '+(n>1?'these '+n+' items':'this item')+'.\nYour question (leave empty for: is this intended? fix it if not):','');if(t===null)return;body.text=t;q='';}
  else if(body.op==='ack'){var t2=prompt('Dismiss this item? It stays hidden until it changes (7 days at most).\nWhy is it a non-issue? (optional, kept with it)','');if(t2===null)return;body.text=t2;q='';}
- if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say(body.op==='ask'?'Sending\u2026':'Saving\u2026','');
+ if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say(['ask','probe','remind'].indexOf(body.op)>=0?'Sending\u2026':'Saving\u2026','');
  post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
   if(j.ok&&(body.op==='ack'||body.op==='unack')){var fl=b.closest('.flag');if(fl)fl.classList.toggle('ok',body.op==='ack');}
   if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)if(ins2[i].type!=='hidden')ins2[i].value='';}})
@@ -4298,6 +4650,7 @@ def render(s):
         sc.get("files") or 0, "" if sc.get("files") == 1 else "s", CFG["scan_hours"], esc(", ".join(sc.get("roots") or []) or "the goal folder"),
         " (cut short)" if sc.get("truncated") else ""))
     o.append("</section>")
+    o.append(memory_html(s))
 
     # other flags (goal / compute amber+info not shown above)
     other = [f for f in s["flags"] if f["area"] in ("goal", "compute", "connection") and not f.get("needs_you")]

@@ -119,6 +119,24 @@ Edits that only mention a setting in notes or docs (`.md`, `.txt`, ...) are not 
 are compared the way VASP reads them (`0.10` = `0.1`, `T` = `.TRUE.`, `Acc` = `Accurate`), and an edit the
 agent already asked you about shows as "waiting for your decision" instead of a second alarm.
 
+## Memory across compactions and long runs
+
+Long goal sessions compact their context: the agent carries on from a summary it wrote itself, and that is where
+constraints tend to get lost. The Memory card on each session page checks every compaction:
+- **Kept**: how many of the contract's rules and limits, its acceptance criteria and your standing instructions appear
+  in that summary, and which ones it left out. Rules count only with their value ("ENCUT 520 eV" counts, "ENCUT" alone
+  doesn't).
+- **Before → after**: contract-breaking edits, failed commands and repeated commands in the hours before and after,
+  and how long the agent took to get back to real work (an edit, a submission or a plan update).
+- **Check what it remembers** asks the agent to list its goal, rules, limits, criteria, your instructions and next steps
+  from memory (lines starting `GOAL:`, `RULE:`, ...) and scores the answer the same way. **Remind it of the contract**
+  sends them again.
+
+A summary or memory check that leaves out a rule or limit, or a jump in breaks or failures after a compaction, becomes
+an item on the page, and so do hours of work with no plan step finished and the same command run over and over. The
+summaries themselves show, folded, in the conversation. Compactions from before this was added are read once from the
+session's log.
+
 ## Answer the agent's questions
 
 When an agent asks something (Codex or Claude approval prompts, a numbered menu, a y/n question), the
