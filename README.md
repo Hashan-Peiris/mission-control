@@ -346,7 +346,7 @@ With a single goal running, you can leave out `--goal`.
 
 - **Phone pushes**: set `NTFY_TOPIC` to a long random name and subscribe to it in the free ntfy
   app. You'll get new red/amber alerts plus a morning brief. Topics on ntfy.sh are public by name,
-  so pick something unguessable.
+  so pick something known only to you/team.
 - **Referee**: set `REFEREE_CMD="claude -p"` (or `codex exec -`) and `REFEREE_EVERY_H=6`. A second
   model then reviews the contract, your instructions and the evidence every 6 h. Its verdict appears
   on the dashboard.
