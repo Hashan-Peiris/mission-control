@@ -321,18 +321,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except OSError:
                     pass
             why = (err.strip().splitlines() or ["the session was busy or asking something"])[-1]
-            if body.get("op") == "ask":   # an item question: record it only once it went out
-                if rc == 0:
+            done = {"ask": "asked", "probe": "probed", "remind": "reminded"}.get(body.get("op"))
+            if done:   # an item question, a memory check or a reminder: recorded only once it went out
+                if rc == 0 and done in ("asked", "probed"):
                     self._check_back(150)
                 if rc == 124:   # handed over but no word back (another PC asleep, or its answer lost)
-                    return {"ok": False, "message": "%s. It isn't marked as asked; if the agent got it, its answer still shows under the item." % why.rstrip(".")}
+                    return {"ok": False, "message": "%s. It isn't recorded as sent; if the agent got it, its answer still shows up." % why.rstrip(".")}
                 if rc != 0:
-                    return {"ok": False, "message": "Couldn't ask the agent: %s. Nothing was sent; try again when the session is free." % why.rstrip(".")}
+                    return {"ok": False, "message": "Couldn't reach the agent: %s. Nothing was sent; try again when the session is free." % why.rstrip(".")}
                 try:
-                    edit(dict(body, op="asked"))
+                    edit(dict(body, op=done))
                 except (subprocess.TimeoutExpired, ValueError):
                     pass
-                return {"ok": True, "message": res.get("message") or "Asked the agent."}
+                return {"ok": True, "message": res.get("message") or "Sent."}
             res["message"] = (res.get("message") or "") + (" The agent has been told." if rc == 0 else
                                                            " Telling the agent didn't work (%s); send it yourself if needed." % why)
         return {"ok": bool(res.get("ok")), "message": res.get("message") or "Done."}

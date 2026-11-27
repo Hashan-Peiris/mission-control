@@ -594,6 +594,46 @@ def note_compaction(st, ts, summary=None, pre_tokens=None):
         add_msg(st, ts, "event", "Context compacted: the agent continued from a summary of the conversation so far.")
 
 
+def backfill_compactions(st):
+    """Once per session file: the summaries of compactions from before mission control kept them (read straight from the
+    log, only the compaction lines; skipped for files over 1.5 GB)."""
+    st["cbf"] = 1
+    try:
+        if os.path.getsize(st["path"]) > 1.5e9:
+            return
+        have = {m.get("ts") for m in st.get("msgs") or [] if m.get("role") == "compact"}
+        found = []
+        with open(st["path"], "rb") as f:
+            for line in f:
+                if b'"compacted"' not in line and b"isCompactSummary" not in line:
+                    continue
+                try:
+                    o = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                ts, summ = o.get("timestamp"), ""
+                if o.get("type") == "compacted":
+                    p = o.get("payload") or {}
+                    summ = p.get("message") if isinstance(p.get("message"), str) else ""
+                    if not summ.strip() and isinstance(p.get("replacement_history"), list):
+                        for it in reversed(p["replacement_history"]):
+                            if isinstance(it, dict) and it.get("type") == "message" and it.get("role") == "user":
+                                summ = text_of(it.get("content"))
+                                break
+                elif o.get("isCompactSummary"):
+                    c = (o.get("message") or {}).get("content")
+                    summ = c if isinstance(c, str) else text_of(c)
+                if ts and (summ or "").strip() and ts not in have:
+                    found.append((ts, summ))
+                    have.add(ts)
+        for ts, summ in found[-30:]:
+            add_msg(st, ts, "compact", summ.strip())
+            if not any(ci.get("ts") == ts for ci in st.get("compact_info") or []):
+                push(st.setdefault("compact_info", []), {"ts": ts, "pre": None, "win": st.get("ctx"), "chars": len(summ)}, 50)
+    except Exception:  # noqa
+        pass
+
+
 def text_of(content):
     if isinstance(content, str):
         return content
@@ -775,6 +815,11 @@ def handle_tool(st, ts, name, args, call_id):
     if WATCH_RE and kind != "plan" and WATCH_RE.search(cmd or ""):
         ev["watch"] = sorted(set(m.group(1).upper() for m in WATCH_RE.finditer(cmd)))[:8]
     push(st["tools"], ev, 120)
+    # every command, compactly (time, kind, a short hash of the command, exit code later): for repeats, loops and failure rates
+    e = iso_to_epoch(ts)
+    if e:
+        push(st.setdefault("cmdlog", []), [int(e), kind, hashlib.sha1(re.sub(r"\s+", " ", cmd or name or "").strip()[:2000].encode("utf-8", "replace")).hexdigest()[:6],
+                                           None, call_id], 400)
     if kind == "plan" and isinstance(a, dict):
         plan = a.get("plan") or a.get("todos")
         if isinstance(plan, list):
@@ -823,6 +868,11 @@ def handle_output(st, call_id, output, is_error=False):
                 break
     if code not in (None, 0):
         st["errors"] += 1
+    if code is not None:
+        for c in reversed((st.get("cmdlog") or [])[-60:]):
+            if len(c) > 4 and c[4] == call_id:
+                c[3] = code
+                break
     res = deepmd_parse(text) if len(text) < 2000000 else None
     if res:
         cmd = (found or {}).get("cmd", "")
@@ -1540,8 +1590,11 @@ def main():
     for fp, kind in sorted(cands.items()):
         st = files_state.get(fp) or new_state(fp, kind)
         parse_file(st, handle_codex if kind == "codex" else handle_claude)
+        if fp in open_files and not st.get("cbf"):
+            backfill_compactions(st)
         new_files_state[fp] = st
         s = {k: v for k, v in st.items() if k not in ("seen_msg", "usage_ids", "offset", "ino", "msgs")}
+        s["cmdlog"] = [c[:4] for c in st.get("cmdlog") or [] if c and c[0] >= T0 - 48 * 3600]   # without the call ids
         since = MSG_SINCE.get(fp) or {}
         floor = since.get("seq", 0) if since.get("epoch") == st.get("msg_epoch") else 0
         s["msgs_new"] = [m for m in st.get("msgs", []) if m["seq"] > floor]

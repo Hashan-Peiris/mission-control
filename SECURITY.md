@@ -55,7 +55,9 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
 - Contract upkeep only adds or tightens rules by itself; loosening one always needs your Approve. It reads the
   agent's instruction files and `.mc/requests.jsonl` in its folder, and writes nothing on the cluster.
 - "Ask agent" sends the agent the items you picked and your question, only when you press it. "Dismiss"
-  only changes how the page shows an item; nothing is sent.
+  only changes how the page shows an item; nothing is sent. "Check what it remembers" and "Remind it of the contract"
+  (Memory card) also send a message only when you press them. Reading compaction summaries is read-only, like the rest
+  of the digest.
 - Messages to an agent about the contract (a rule you lock, unlock or allow, a criterion or amendment you
   add, your answer to its request, "Tell the agent how to ask") are sent only when you press that button
   and confirm. `CONTRACT_TELL_AGENT=0` in config.env keeps contract changes from being messaged.
