@@ -450,8 +450,8 @@ def parse_criteria(text):
         unit_e, per = n.group(2).lower(), n.group(3).lower()
         per_atom = per.startswith("at")
         low = seg.lower()
-        if not ML_ERR_RX.search(text[max(0, seg_start - 80): n.end()]):
-            continue   # a number with eV/Å but no error, test or model nearby (e.g. a DFT force convergence): for the referee
+        if not ML_ERR_RX.search(text[max(0, seg_start - 80): n.end()]) or re.search(r"\bmax(?:imum)?\b", low):
+            continue   # no error, test or model nearby (e.g. a DFT force convergence), or a maximum error (dp test gives MAE/RMSE): referee
         if "force" in low:
             q = "force"
         elif "virial" in low:
@@ -2478,7 +2478,8 @@ def analyze_goal(gdesc, shared):
             measured.append(dict(m, epoch=m.get("mtime"), who="file"))
     measured.sort(key=lambda m: m.get("epoch") or 0)
     claims = [dict(cl, who=s.get("label"), epoch=iso_epoch(cl.get("ts"))) for s in (fam or sessions) for cl in s.get("claims", [])]
-    done_claims = [dict(d, who=s.get("label"), epoch=iso_epoch(d.get("ts"))) for s in (fam or sessions) for d in s.get("done_claims", [])]
+    done_claims = [dict(d, who=s.get("label"), epoch=iso_epoch(d.get("ts"))) for s in (fam or sessions) for d in s.get("done_claims", [])
+                   if not ANSWER_RX.match(d.get("text") or "")]   # an answer about a dashboard item is not a claim the goal is met
     crit_rows = []
     for c in criteria:
         row = {"text": c["text"], "src": c.get("src"), "parsed": c.get("parsed"), "status": "referee"}
