@@ -563,6 +563,37 @@ def push(lst, item, cap):
         del lst[: len(lst) - cap]
 
 
+def note_compaction(st, ts, summary=None, pre_tokens=None):
+    """One compaction: its time, how full the context was, and the summary the agent carries on from (into the
+    conversation store as a "compact" message, so mission control can check what it kept)."""
+    last = st["compactions"][-1] if st["compactions"] else None
+    e1, e0 = iso_to_epoch(ts), iso_to_epoch(last) if last else None
+    if last and e1 and e0 and abs(e1 - e0) < 120:   # Codex writes the same compaction twice (an event and an item)
+        if summary and summary.strip() and not st.get("compact_text_at") == last:
+            st["compact_text_at"] = last
+            for m in reversed(st.get("msgs") or []):   # the plain "Context compacted" line becomes the summary
+                if m.get("role") == "event" and m.get("ts") == last and str(m.get("text") or "").startswith("Context compacted"):
+                    m["role"], m["text"] = "compact", trunc(summary.strip(), MSG_TEXT)
+                    break
+            else:
+                add_msg(st, ts, "compact", summary.strip())
+            for ci in reversed(st.get("compact_info") or []):
+                if ci.get("ts") == last:
+                    ci["chars"] = len(summary)
+                    break
+        return
+    push(st["compactions"], ts, 50)
+    used = pre_tokens or (st.get("ctx_used") or 0)
+    push(st.setdefault("compact_info", []), {"ts": ts, "pre": used or None, "win": st.get("ctx") or None,
+                                            "chars": len(summary or "")}, 50)
+    push(st["notable"], {"ts": ts, "tool": st.get("kind") or "agent", "kind": "event", "cmd": "context compacted"}, 500)
+    if summary and summary.strip():
+        st["compact_text_at"] = ts
+        add_msg(st, ts, "compact", summary.strip())
+    else:
+        add_msg(st, ts, "event", "Context compacted: the agent continued from a summary of the conversation so far.")
+
+
 def text_of(content):
     if isinstance(content, str):
         return content
@@ -848,6 +879,9 @@ def handle_codex(st, o):
             if isinstance(info, dict):
                 st["tokens"] = info.get("total_token_usage") or st["tokens"]
                 st["ctx"] = info.get("model_context_window") or st["ctx"]
+                lu = info.get("last_token_usage")
+                if isinstance(lu, dict) and lu.get("total_tokens"):
+                    st["ctx_used"] = int(lu.get("total_tokens") or 0)
             if p.get("rate_limits"):
                 st["rate"] = p.get("rate_limits")
         elif "goal" in pt:
@@ -855,14 +889,18 @@ def handle_codex(st, o):
         elif pt in ("error", "stream_error"):
             st["errors"] += 1
             push(st["notable"], {"ts": ts, "tool": "codex", "kind": "error", "cmd": trunc(p.get("message") or json.dumps(p), 400)}, 500)
-        elif pt in ("turn_aborted", "context_compacted", "compaction"):
+        elif pt in ("context_compacted", "compaction"):
+            note_compaction(st, ts)
+        elif pt == "turn_aborted":
             push(st["notable"], {"ts": ts, "tool": "codex", "kind": "event", "cmd": pt}, 500)
-            if "compact" in pt:
-                push(st["compactions"], ts, 50)
     elif t == "compacted":
-        push(st["compactions"], ts, 50)
-        add_msg(st, ts, "event", "Context compacted: the agent continued from a summary of the conversation so far.")
-        push(st["notable"], {"ts": ts, "tool": "codex", "kind": "event", "cmd": "context compacted"}, 500)
+        summ = p.get("message") if isinstance(p.get("message"), str) else ""
+        if not (summ or "").strip() and isinstance(p.get("replacement_history"), list):
+            for it in reversed(p["replacement_history"]):   # newer Codex: the summary is the new history's last user turn
+                if isinstance(it, dict) and it.get("type") == "message" and it.get("role") == "user":
+                    summ = text_of(it.get("content"))
+                    break
+        note_compaction(st, ts, summ)
     elif t == "response_item":
         pt = p.get("type")
         if pt == "message":
@@ -903,6 +941,13 @@ def handle_claude(st, o):
         st["meta"]["ctx_effort"] = "no thinking" if tmeta.get("disabled") else trunc(str(tmeta.get("level") or "thinking"), 40)
     msg = o.get("message") or {}
     content = msg.get("content") if isinstance(msg, dict) else None
+    if t == "system" and o.get("subtype") == "compact_boundary":
+        meta = o.get("compactMetadata") or {}
+        note_compaction(st, ts, None, meta.get("preTokens") if isinstance(meta, dict) else None)
+        return
+    if t == "user" and o.get("isCompactSummary"):
+        note_compaction(st, ts, content if isinstance(content, str) else text_of(content))
+        return
     if t == "user":
         if isinstance(content, str):
             add_user(st, ts, content, True)
@@ -1584,8 +1629,10 @@ def main():
                 r = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(r, dict):
-                reqs.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("id", "param", "value", "why", "rule", "ts", "scope", "criterion")})
+            if isinstance(r, dict):   # kept whole (lists stay lists), so the dashboard can lay the request out properly
+                lim = {"id": 60, "param": 80, "value": 2000, "why": 2000, "rule": 300, "ts": 40, "scope": 600, "criterion": 2000, "criteria": 2000}
+                reqs.setdefault(c, []).append({k: [trunc(re.sub(r"\s+", " ", str(x)).strip(), 700) for x in v[:24]] if isinstance(v, list) else
+                                               trunc(str(v if v is not None else ""), n) for k, n in lim.items() for v in [r.get(k, "")]})
     out["specs"] = specs
     ans = {}
     for c in cwds[:8]:   # the agent's answers about dashboard items (I3fa21: fixed / intended / ...), as JSON lines

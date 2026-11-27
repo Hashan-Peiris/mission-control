@@ -298,7 +298,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         key = str(req.get("key") or "")
         if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
             return {"ok": False, "message": "Unknown session."}
-        body = {k: str(req.get(k))[:1500] for k in ("op", "name", "rule_op", "val", "value", "text", "pid", "uid", "items", "item") if req.get(k) is not None}
+        body = {k: str(req.get(k))[:1500] for k in ("op", "name", "rule_op", "val", "value", "text", "pid", "uid", "items", "item", "psig") if req.get(k) is not None}
 
         def edit(b):
             p = subprocess.run(["bash", os.path.join(MC_DIR, "mctl"), "contract-edit", key], input=json.dumps(b),

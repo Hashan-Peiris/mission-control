@@ -669,30 +669,91 @@ def contract_upkeep(gkey, goal_text, codex_goal, ndoc, shared):
     return st, notes
 
 
+def prop_view(p, meta):
+    """A waiting change, in parts for the page: the change, what it is for, why, and the agent's request id."""
+    change = p["action"].split(" ", 1)[1] if " " in p["action"] else p["action"]
+    why, scope, rid = meta.get("why"), meta.get("scope"), meta.get("agent") or ""
+    if why is None:   # recorded before requests were kept in parts: read them back from the sentence
+        m = re.match(r"^The agent asks \(([^)]*)\):\s*(.*?)(?:\s+for\s+(.*?))?\.\s+Why:\s*(.*)$", p["text"])
+        if m:
+            rid, scope, why = m.group(1), m.group(3) or "", m.group(4)
+        else:
+            return {"change": change, "text": p["text"]}
+    return {"change": change, "scope": scope or "", "why": why or "", "rid": rid}
+
+
+def clip_html(text, n=260):
+    """Text as HTML; past about n characters the rest folds behind "more"."""
+    text = str(text or "")
+    if len(text) <= n + 60:
+        return esc(text)
+    cut = (text[:n].rsplit(" ", 1)[0] if " " in text[:n] else text[:n]).rstrip(" .,;:")
+    return ('<details class="dd"><summary><span class="lead">%s\u2026</span><span class="full">%s</span> <span class="mtog"></span></summary></details>'
+            % (esc(cut), esc(text)))
+
+
+def prop_html(pv, gkey):
+    o = []
+    if pv.get("change"):
+        o.append('<div class="pchg">%s</div>' % clip_html(pv["change"], 200))
+    if pv.get("items"):
+        lis = "".join('<li><span class="ptx">%s</span><span class="pbt">%s%s</span>%s</li>' % (
+            clip_html(it["text"], 240),
+            act_btn({"label": "Add", "op": "approve", "pid": it["pid"], "psig": it["psig"],
+                     "confirm": "Add this acceptance criterion to the contract?\n\n%s\n\nThe agent is told." % trunc(it["text"], 600)}, "lnk"),
+            act_btn({"label": "Reject", "op": "reject", "pid": it["pid"], "psig": it["psig"], "danger": True,
+                     "confirm": "Reject this criterion?\n\n%s" % trunc(it["text"], 600)}, "lnk"),
+            ('<div class="pmeta"><b>Why</b>%s</div>' % clip_html(it["why"], 160)) if it.get("why") and (
+                k + 1 == len(pv["items"]) or pv["items"][k + 1].get("why") != it["why"]) else "") for k, it in enumerate(pv["items"]))
+        o.append('<div data-ckey="%s"><ol class="plist">%s</ol><div class="actmsg"></div></div>' % (esc(gkey), lis))
+    if pv.get("scope"):
+        o.append('<div class="pmeta"><b>For</b>%s</div>' % clip_html(pv["scope"], 200))
+    if pv.get("why"):
+        o.append('<div class="pmeta"><b>Why</b>%s</div>' % clip_html(pv["why"], 220))
+    if pv.get("text"):
+        o.append('<div class="pmeta">%s</div>' % clip_html(pv["text"], 260))
+    if pv.get("rid"):
+        o.append('<div class="pmeta faint">%s %s from the agent</div>' % ("Requests" if "," in pv["rid"] else "Request", esc(pv["rid"])))
+    return "".join(o)
+
+
 def contract_flags(flags, contract, cst, res, comp, node, gnode, codex_goal):
     raw = contract["raw"]
     cp = CT.parse_compute(raw)
+    groups = {}   # proposed acceptance criteria, one card per agent request
     for p in CT.proposals(raw):   # changes that would loosen a rule: yours to decide
         meta = (cst.get("proposals") or {}).get(p["id"]) or {}
         agent = bool(meta.get("agent")) or p["text"].startswith(("The agent asks", "The agent proposes"))
-        if p["action"].lower().startswith("criterion "):   # a proposed acceptance criterion: add it or not
-            flags.add("prop:%s" % p["id"], "amber", "goal", "The agent proposes an acceptance criterion", p["text"],
-                      "Add it to the contract, or reject it.", needs_you=True, crit=True,
-                      acts=[{"label": "Add it", "op": "approve", "pid": p["id"],
-                             "confirm": "Add this acceptance criterion to the contract?\n\n%s\n\nThe agent is told." % p["action"][10:]},
-                            {"label": "Reject", "op": "reject", "pid": p["id"], "danger": True,
-                             "confirm": "Reject %s?\n\nThe agent is told." % p["id"]}])
+        psig = CT.sig(p["id"], p["action"])[:8]   # the page sends it back, so a stale page can't decide a different request
+        if p["action"].lower().startswith("criterion "):
+            groups.setdefault("all", []).append((p, meta, psig))
             continue
+        pv = prop_view(p, meta)
+        what = pv["change"]
         flags.add("prop:%s" % p["id"], "red" if agent else "amber", "goal",
-                  "The agent asks to change a rule" if agent else "A change would loosen the contract", p["text"],
-                  "Allow it for this request only, change the rule for good, or reject it.", needs_you=True,
-                  acts=[{"label": "Allow for this request", "op": "approve_once", "pid": p["id"],
-                         "confirm": "Allow it for this request only?\n\n%s\n\nThe rule stays as it is; the approval is recorded as an amendment%s." % (
-                             p["text"], " and the agent is told" if agent else "")},
-                        {"label": "Change the rule", "op": "approve", "pid": p["id"],
-                         "confirm": "Change the contract rule for good?\n\n%s%s" % (p["text"], "\n\nThe agent is told." if agent else "")},
-                        {"label": "Reject", "op": "reject", "pid": p["id"], "danger": True,
-                         "confirm": "Reject %s?%s" % (p["id"], "\n\nThe agent is told." if agent else "")}])
+                  "The agent asks to change a rule" if agent else "A change would loosen the contract", "",
+                  "Allow it for this request only, change the rule for good, or reject it.", needs_you=True, prop=pv,
+                  acts=[{"label": "Allow for this request", "op": "approve_once", "pid": p["id"], "psig": psig,
+                         "confirm": "Allow %s for this request only?\n\nThe rule stays as it is; the approval is recorded as an amendment%s." % (
+                             what, " and the agent is told" if agent else "")},
+                        {"label": "Change the rule", "op": "approve", "pid": p["id"], "psig": psig,
+                         "confirm": "Change the contract rule for good: %s?%s" % (what, "\n\nThe agent is told." if agent else "")},
+                        {"label": "Reject", "op": "reject", "pid": p["id"], "psig": psig, "danger": True,
+                         "confirm": "Reject %s (%s)?%s" % (p["id"], what, "\n\nThe agent is told." if agent else "")}])
+    for _, lst in groups.items():   # every proposed criterion in one card, whichever request it came in
+        n, pids, sigs = len(lst), ",".join(p["id"] for p, _, _ in lst), ",".join(x for _, _, x in lst)
+        whys = {m.get("why") or "" for _, m, _ in lst}
+        rids = sorted({m.get("agent") or "" for _, m, _ in lst} - {""})
+        flags.add("prop:crit", "amber", "goal",
+                  "The agent proposes %s" % ("an acceptance criterion" if n == 1 else "%d acceptance criteria" % n), "",
+                  "Add %s to the contract, or reject %s." % (("it", "it") if n == 1 else ("them", "them")), needs_you=True,
+                  prop={"rid": ", ".join(rids), "why": whys.pop() if len(whys) == 1 else "",
+                        "items": [{"pid": p["id"], "text": p["action"][10:], "psig": x, "why": (m.get("why") or "") if len({mm.get("why") or "" for _, mm, _ in lst}) > 1 else ""}
+                                  for p, m, x in lst]},
+                  acts=[{"label": "Add all %d" % n if n > 1 else "Add it", "op": "approve", "pid": pids, "psig": sigs,
+                         "confirm": "Add %s to the contract?\n\nThe agent is told." % ("these %d acceptance criteria" % n if n > 1 else "this acceptance criterion")},
+                        {"label": "Reject all" if n > 1 else "Reject", "op": "reject", "pid": pids, "psig": sigs, "danger": True,
+                         "confirm": "Reject %s?\n\nThe agent is told." % ("all %d proposed criteria" % n if n > 1 else "this criterion")}])
     allowed = [x.lower() for x in cp["allowed"]] if cp["allowed"] else None
     forbid = [x.split(" (")[0].strip().lower() for x in cp["forbid"]]
     for r in res:   # jobs this goal's agents submitted on a cluster the contract doesn't allow
@@ -838,6 +899,11 @@ def cmd_contract_edit(key, req):
             return out(True, msg + ".")
         elif op in ("approve", "reject", "approve_once"):
             pids = [x for x in re.split(r"[,\s]+", str(req.get("pid") or "")) if x][:40]
+            sigs = [x for x in re.split(r"[,\s]+", str(req.get("psig") or "")) if x]
+            if sigs:   # the page says which request it showed: refuse if that request changed since
+                cur = {p["id"]: CT.sig(p["id"], p["action"])[:8] for p in CT.proposals(raw)}
+                if len(sigs) != len(pids) or any(cur.get(i) != g for i, g in zip(pids, sigs)):
+                    return out(False, "That request changed or was already decided since this page was made. The page refreshes in a moment; try again then.")
             msgs, told = [], []
             for pid in pids or [""]:
                 raw, m1, info = CT.decide(raw, st, pid, op != "reject", once=op == "approve_once")
@@ -1025,16 +1091,6 @@ def flag_list_html(items):
             o.append('<div class="empty">Nothing open.</div>')
         o.append('<details class="fold dism"><summary>Dismissed (%d)</summary>%s</details>' % (len(gone), "".join(flag_html(f) for f in gone)))
     return "".join(o)
-
-
-def add_all_btn(needs, gkey):
-    crits = [f for f in needs if f.get("crit")]
-    if len(crits) < 2 or not gkey:
-        return ""
-    return ('<span class="cacts askall" data-ckey="%s"><button type="button" class="lnk" data-cop="approve" data-cpid="%s" data-cconfirm="%s">'
-            'Add all %d criteria</button><span class="actmsg"></span></span>') % (
-        esc(gkey), esc(",".join(f["key"][5:] for f in crits)), esc("Add all %d proposed acceptance criteria to the contract?\n\nThe agent is told." % len(crits)),
-        len(crits))
 
 
 def ask_all_btn(items, gkey, label):
@@ -2506,7 +2562,7 @@ function day(e){return new Date(e*1000).toLocaleDateString(undefined,{weekday:'l
 function tm(e){return new Date(e*1000).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});}
 function who(m){var n=NAME[m.r]||m.r;if(m.r==='task')return n+' '+esc(m.w||'sub-agent');if(m.r==='sub'||(m.r==='agent'&&m.w&&m.w!=='main'))n+=' · '+esc(m.w);return n;}
 function av(m){if(m.r==='sub')return 'S'+String(m.w||'').replace(/[^0-9]/g,'');return AV[m.r]||'?';}
-function on(r){var el=document.getElementById('f_'+r);return !el||el.checked;}
+function on(r){var el=document.getElementById('f_'+(r==='compact'?'event':r));return !el||el.checked;}
 function idOf(m){return m.e+'|'+m.r+'|'+m.x.length+'|'+m.x.slice(0,60);}
 function atBottom(){return window.innerHeight+window.scrollY>=document.body.scrollHeight-160;}
 function toLatest(){if(O.value==='new')window.scrollTo(0,0);else window.scrollTo(0,document.body.scrollHeight);}
@@ -2516,6 +2572,7 @@ function render(){var q=(Q.value||'').toLowerCase();
  var h=[],lastDay='',pk=null,pe=0;
  items.forEach(function(m){var d=day(m.e);if(d!==lastDay){h.push('<div class="day"><span>'+d+'</span></div>');lastDay=d;pk=null;}
   if(m.r==='event'){h.push('<div class="evt"><span>'+inl(m.x)+' · '+tm(m.e)+'</span></div>');pk=null;return;}
+  if(m.r==='compact'){h.push('<details class="cmp"><summary>Context compacted · '+tm(m.e)+' · the agent carries on from this summary</summary><div class="mb">'+md(m.x)+'</div></details>');pk=null;return;}
   var k=m.r+'|'+(m.w||''),cont=k===pk&&Math.abs(m.e-pe)<600;pk=k;pe=m.e;
   var long=m.x.length>2200||m.x.split('\n').length>26;
   h.push('<div class="row r-'+m.r+(cont?' cont':'')+(m.pending?' pending':'')+'">'+(m.r==='user'?'':'<div class="av">'+av(m)+'</div>')+
@@ -3403,6 +3460,8 @@ footer{color:var(--faint);font-size:12px;margin-top:18px;line-height:1.7}svg.sp{
 .row.pending .bub{opacity:.8}.row.pending .tm:after{content:" · sent"}
 .evt{display:flex;align-items:center;gap:10px;margin:16px 0;font-size:12px}.evt:before,.evt:after{content:"";flex:1;height:1px;background:var(--line)}
 .evt span{padding:3px 12px;border-radius:99px;background:var(--t-event);color:var(--amb)}
+details.cmp{margin:16px auto;max-width:760px;border:1px dashed color-mix(in srgb,var(--amb) 45%,transparent);border-radius:12px;padding:6px 12px;background:none;box-shadow:none}
+details.cmp>summary{font-size:12px;color:var(--amb);font-weight:600;cursor:pointer}details.cmp .mb{font-size:13px;margin-top:8px;max-height:60vh;overflow:auto}
 .day{display:flex;justify-content:center;margin:24px 0 8px}.day span{font-size:11px;font-weight:650;color:var(--mut);background:var(--card);border:1px solid var(--line);border-radius:99px;padding:3px 12px;text-transform:uppercase;letter-spacing:.05em}
 .math{white-space:nowrap}.mdl{color:var(--faint);font-size:11px;letter-spacing:.01em}.bub .mh .mdl{margin-left:auto;padding-left:10px}.r-user .bub .mdl{color:rgba(255,255,255,.6)}.math sup,.math sub{font-size:.75em}
 .sendbox textarea{border-radius:14px}details.scr{border:none;box-shadow:none;padding:4px 0;margin:0;background:none}details.scr summary{font-weight:500;color:var(--mut)}
@@ -3570,7 +3629,13 @@ details.rowmenu>summary{list-style:none;font-weight:700;color:var(--mut);padding
 details.rowmenu>summary::-webkit-details-marker{display:none}details.rowmenu[open]>summary{color:var(--fg);border-color:var(--fg)}
 details.rowmenu .cacts{flex-direction:column;align-items:stretch;gap:4px;margin-top:6px}
 footer div{margin:2px 0}
-.ibar{margin-top:6px;font-size:12px}.ibar .clr{color:var(--faint);font-size:11.5px;margin-top:2px}
+.ibar{margin-top:6px;font-size:12px}.pchg{font-family:var(--mono,ui-monospace,monospace);font-size:13px;font-weight:600;margin:3px 0 4px;color:var(--fg)}
+.pmeta{font-size:12.5px;color:var(--mut);margin:3px 0;line-height:1.45}.pmeta>b{font-weight:600;color:var(--fg);margin-right:6px}.pmeta.faint{color:var(--faint);font-size:11.5px}
+ol.plist{margin:4px 0 6px;padding-left:22px;font-size:13px}ol.plist li{margin:5px 0;line-height:1.45}ol.plist .pbt{white-space:nowrap;margin-left:10px}
+ol.plist .pbt .lnk{margin-left:8px}ol.plist .pbt .lnk.dng{color:var(--rose)}
+details.dd{display:inline;border:none;padding:0;margin:0;background:none;box-shadow:none}details.dd>summary{display:inline;list-style:none;cursor:pointer;font-weight:inherit;font-size:inherit;color:inherit;border:none;padding:0;margin:0;background:none;box-shadow:none}
+details.dd>summary::-webkit-details-marker{display:none}details.dd .full{display:none}details.dd[open] .full{display:inline}details.dd[open] .lead{display:none}
+details.dd .mtog::before{content:"more";color:var(--sky);font-weight:600;font-size:12px}details.dd[open] .mtog::before{content:"less"}.ibar .clr{color:var(--faint);font-size:11.5px;margin-top:2px}
 .ibtn{display:flex;flex-wrap:wrap;align-items:center;gap:2px 12px;margin-top:3px}
 .lnk{background:none;border:none;padding:2px 0;font:inherit;font-size:12px;font-weight:600;color:var(--sky);cursor:pointer}
 .lnk:hover{text-decoration:underline}.lnk:disabled{opacity:.5}.iid{font-family:ui-monospace,monospace;font-size:11px;color:var(--faint)}
@@ -3669,7 +3734,8 @@ def acts_html(acts, gkey):
 
 def flag_html(f, bar=True):
     return ('<div class="flag %s"><div class="t">%s</div>%s%s%s%s%s</div>' % (
-        f["sev"], esc(f["title"]), ('<div class="d">%s</div>' % esc(f["detail"])) if f["detail"] else "",
+        f["sev"], esc(f["title"]), prop_html(f["prop"], f.get("gkey") or "") if f.get("prop") else
+        ('<div class="d">%s</div>' % clip_html(f["detail"], 300)) if f["detail"] else "",
         ('<div class="a">%s</div>' % esc(f["action"])) if f["action"] and not f.get("acked") else "", question_html(f.get("q")),
         acts_html(f.get("acts"), f.get("gkey") or "") if not f.get("acked") else "", item_bar(f) if bar else ""))
 
@@ -3939,7 +4005,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  var box=b.closest('[data-ckey]');if(!box)return;var o=box.querySelector('.actmsg')||(box.parentNode&&box.parentNode.querySelector('.actmsg'));
  var say=function(t,c){if(o){o.className='actmsg '+(c||'');o.textContent=t;}else if(c==='bad')alert(t);};
  if(!served){say('Open the dashboard with mctl (http://localhost:8765) to change the contract from here.','bad');return;}
- var body={key:box.getAttribute('data-ckey'),op:b.getAttribute('data-cop')},map={cname:'name',cvalue:'value',cruleop:'rule_op',cval:'val',cpid:'pid',cuid:'uid',ctext:'text',citems:'items',citem:'item'};
+ var body={key:box.getAttribute('data-ckey'),op:b.getAttribute('data-cop')},map={cname:'name',cvalue:'value',cruleop:'rule_op',cval:'val',cpid:'pid',cuid:'uid',ctext:'text',citems:'items',citem:'item',cpsig:'psig'};
  for(var a in map){var v=b.getAttribute('data-'+a);if(v!==null)body[map[a]]=v;}
  var form=b.closest('.cform');if(form){var ins=form.querySelectorAll('input,select');for(var i=0;i<ins.length;i++)body[ins[i].name]=ins[i].value;
   if(body.op==='set'&&(!body.name||!body.val)){say('Fill in the name and the value.','bad');return;}
@@ -4171,8 +4237,7 @@ def render(s):
     # needs you
     needs = [f for f in s["flags"] if f.get("needs_you")]
     if needs:
-        o.append('<section class="card"%s><h2>Needs you %s%s</h2>' % (sec("g", "needs"), add_all_btn(needs, s["key"]),
-                                                                       ask_all_btn(needs, s["key"], "Ask the agent about all")))
+        o.append('<section class="card"%s><h2>Needs you %s</h2>' % (sec("g", "needs"), ask_all_btn(needs, s["key"], "Ask the agent about all")))
         o.append(flag_list_html(needs))
         o.append("</section>")
     else:
