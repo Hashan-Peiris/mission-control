@@ -95,6 +95,26 @@ Click **+ New session** in the top bar (on the dashboard opened with `mctl`, or 
   first (trusting a new folder, signing in, an update), its screen shows in the dialog and you answer there.
 - From WSL: `mctl launch --name NAME --agent codex --cmd codex_chat --model gpt-6.2-astra --effort high --check`
 
+## Talking with the agent about what the page shows
+
+Every item on a session page (Needs you, Scientific integrity, Watchdog) has a short id (like `I3fa21`),
+a line saying what makes it go away by itself, and two buttons:
+- **Ask agent** sends the agent that item (or, with "Ask the agent about all", every red and amber item
+  in the section) with its id and your question (or "is this intended? fix it if not"). The agent answers
+  one line per item, `I3fa21: fixed | intended | explained | working | need_decision - reason`, in its
+  reply or in `.mc/answers.jsonl` in its folder, and the answer shows under the item. An item shows as
+  asked only once the message went out; a sleeping or busy agent answers when it gets to it.
+- **Mark OK** (or **Accept the answer**, once the agent has explained) quiets an item you judged fine:
+  it stops counting as red or amber until it changes, for 7 days at most. Undo OK brings it back.
+
+Decisions on the contract go both ways too: the agent asks for a change in `.mc/requests.jsonl`
+(setting, value, why, scope) and you choose **Allow for this request** (recorded as an amendment, the rule
+stays), **Change the rule** (the rule itself is widened), or **Reject**; the agent is told either way, and
+every change you make yourself (lock, unlock, allow, criteria, Make binding) is sent to it as well.
+Edits that only mention a setting in notes or docs (`.md`, `.txt`, ...) are not counted as changes, values
+are compared the way VASP reads them (`0.10` = `0.1`, `T` = `.TRUE.`, `Acc` = `Accurate`), and an edit the
+agent already asked you about shows as "waiting for your decision" instead of a second alarm.
+
 ## Answer the agent's questions
 
 When an agent asks something (Codex or Claude approval prompts, a numbered menu, a y/n question), the

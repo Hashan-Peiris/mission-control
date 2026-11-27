@@ -298,11 +298,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         key = str(req.get("key") or "")
         if not re.match(r"^[A-Za-z0-9_.\-]{1,120}$", key):
             return {"ok": False, "message": "Unknown session."}
-        body = {k: str(req.get(k))[:1500] for k in ("op", "name", "rule_op", "val", "value", "text", "pid", "uid") if req.get(k) is not None}
-        try:
-            p = subprocess.run(["bash", os.path.join(MC_DIR, "mctl"), "contract-edit", key], input=json.dumps(body),
+        body = {k: str(req.get(k))[:1500] for k in ("op", "name", "rule_op", "val", "value", "text", "pid", "uid", "items", "item") if req.get(k) is not None}
+
+        def edit(b):
+            p = subprocess.run(["bash", os.path.join(MC_DIR, "mctl"), "contract-edit", key], input=json.dumps(b),
                                capture_output=True, text=True, timeout=90)
-            res = json.loads((p.stdout.strip().splitlines() or ["{}"])[-1])
+            return json.loads((p.stdout.strip().splitlines() or ["{}"])[-1])
+        try:
+            res = edit(body)
         except (subprocess.TimeoutExpired, ValueError) as e:
             return {"ok": False, "message": "Couldn't change the contract (%s)." % e.__class__.__name__}
         self._log({"key": key, "contract": body.get("op"), "ok": res.get("ok")})
@@ -317,9 +320,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     os.remove(tmp)
                 except OSError:
                     pass
+            why = (err.strip().splitlines() or ["the session was busy or asking something"])[-1]
+            if body.get("op") == "ask":   # an item question: record it only once it went out
+                if rc == 124:   # handed over but no word back (another PC asleep, or its answer lost)
+                    return {"ok": False, "message": "%s. It isn't marked as asked; if the agent got it, its answer still shows under the item." % why.rstrip(".")}
+                if rc != 0:
+                    return {"ok": False, "message": "Couldn't ask the agent: %s. Nothing was sent; try again when the session is free." % why.rstrip(".")}
+                try:
+                    edit(dict(body, op="asked"))
+                except (subprocess.TimeoutExpired, ValueError):
+                    pass
+                return {"ok": True, "message": res.get("message") or "Asked the agent."}
             res["message"] = (res.get("message") or "") + (" The agent has been told." if rc == 0 else
-                                                           " Telling the agent didn't work (%s); send it yourself if needed." % (
-                                                               (err.strip().splitlines() or ["the session was busy or asking something"])[-1]))
+                                                           " Telling the agent didn't work (%s); send it yourself if needed." % why)
         return {"ok": bool(res.get("ok")), "message": res.get("message") or "Done."}
 
     def _collect_now(self):

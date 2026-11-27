@@ -54,6 +54,8 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
   in; keep the folder private.
 - Contract upkeep only adds or tightens rules by itself; loosening one always needs your Approve. It reads the
   agent's instruction files and `.mc/requests.jsonl` in its folder, and writes nothing on the cluster.
+- "Ask agent" sends the agent the items you picked and your question, only when you press it. "Mark OK"
+  only changes how the page counts an item; nothing is sent.
 - Messages to an agent about the contract (a rule you lock, unlock or allow, a criterion or amendment you
   add, your answer to its request, "Tell the agent how to ask") are sent only when you press that button
   and confirm. `CONTRACT_TELL_AGENT=0` in config.env keeps contract changes from being messaged.
