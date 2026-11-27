@@ -988,7 +988,7 @@ def item_bar(f):
     o.append('<button type="button" class="lnk" data-cop="ask" data-citems="%s">Ask agent</button>' % esc(f["id"]))
     if f.get("acked"):
         o.append('<button type="button" class="lnk" data-cop="unack" data-citem="%s">Undo OK</button>' % esc(f["id"]))
-    elif not f["key"].startswith(NO_ACK):
+    elif not f["key"].startswith(NO_ACK) and f["sev"] != "info":   # notes don't count, so there is nothing to quiet
         o.append('<button type="button" class="lnk" data-cop="ack" data-citem="%s">%s</button>' % (
             esc(f["id"]), "Accept the answer" if a and a["status"] in ("intended", "explained", "wontfix") else "Mark OK"))
     o.append('<span class="iid" title="Item id, for asking about it">%s</span></div><div class="actmsg"></div></div>' % esc(f["id"]))
