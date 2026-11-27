@@ -605,10 +605,17 @@ def add_user(st, ts, text, typed):
     add_msg(st, ts, "user", text.strip())
 
 
+# the agent's answers about dashboard items ("I3fa21: intended - why"), taken from the whole reply before it is shortened
+ANSWER_LINE = re.compile(r"(?im)^\W{0,6}(I[0-9a-f]{5})\W{0,3}\s*[:\-\u2013\u2014]?\s*\**\s*(fixed|intended|explained|working|need[_ ]decision|won'?t fix|wontfix)\b"
+                         r"\**\s*[:\-\u2013\u2014.,]?\s*(.*)$")
+
+
 def add_agent(st, ts, text):
     if not text or not text.strip():
         return
     push(st["agent"], {"ts": ts, "text": trunc(text.strip(), 1800)}, 30)
+    for m in ANSWER_LINE.finditer(text):
+        push(st.setdefault("item_answers", []), {"ts": ts, "id": m.group(1), "status": m.group(2), "note": trunc(m.group(3).strip(), 400)}, 120)
     add_msg(st, ts, "agent", text.strip())
     scan_shortcuts(st, ts, "agent message", text)
     for m in CLAIM_RE.finditer(text):
@@ -1578,8 +1585,18 @@ def main():
             except ValueError:
                 continue
             if isinstance(r, dict):
-                reqs.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("id", "param", "value", "why", "rule", "ts")})
+                reqs.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("id", "param", "value", "why", "rule", "ts", "scope")})
     out["specs"] = specs
+    ans = {}
+    for c in cwds[:8]:   # the agent's answers about dashboard items (I3fa21: fixed / intended / ...), as JSON lines
+        for line in tail_file(os.path.join(c, ".mc", "answers.jsonl"), 40000, 80) or []:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("item"):
+                ans.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("item", "status", "note", "ts", "param", "value")})
+    out["answers"] = ans
     tops = []   # each goal's working folder once (a folder inside another one is counted with it)
     for c in sorted(set(cwds[:8]), key=len):
         if c and c != "/" and not any(c == t or c.startswith(t.rstrip("/") + "/") for t in tops) and c.rstrip("/") != os.path.expanduser("~"):

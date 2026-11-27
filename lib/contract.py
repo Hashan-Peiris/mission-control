@@ -598,22 +598,29 @@ def upkeep(raw, ctx, st):
             continue
         if any(p["action"] == action for p in proposals(raw)):
             continue
-        raw, pid = add_proposal(raw, "The agent asks (%s): %s. Why: %s" % (rid, action.split(" ", 1)[1], (r.get("why") or "not given")[:300]), action)
+        raw, pid = add_proposal(raw, "The agent asks (%s): %s%s. Why: %s" % (rid, action.split(" ", 1)[1],
+                                                                          (" for %s" % r["scope"][:120]) if r.get("scope") else "", (r.get("why") or "not given")[:300]), action)
         st["proposals"][pid] = {"sig": rs, "action": action, "agent": rid}
         st["requests_done"].append(rs)
         notes.append("agent request %s waiting for your OK" % rid)
     return raw, notes
 
 
-def decide(raw, st, pid, approve):
-    """Approve or reject a waiting change. Returns (raw, summary, info) where info says whether it came from the agent."""
+def decide(raw, st, pid, approve, once=False):
+    """Approve or reject a waiting change. With once=True the value is allowed for that request only: an amendment
+    records it (so those files aren't flagged) but the rule itself stays. Returns (raw, summary, info)."""
     p = next((x for x in proposals(raw) if x["id"] == pid), None)
     if not p:
         raise ValueError("%s is no longer waiting (already decided?)" % pid)
     meta = st["proposals"].pop(pid, {}) or {}
     raw = remove_proposal(raw, pid)
     summary = ""
-    if approve:
+    if approve and once:
+        what = p["action"].split(" ", 1)[1] if " " in p["action"] else p["action"]
+        raw, aid = add_amendment(raw, "Approved %s%s for that request only (the rule stays): %s (%s)" % (
+            pid, " from the agent (%s)" % meta["agent"] if meta.get("agent") else "", what, p["text"]))
+        summary = "%s allowed for that request only, recorded as %s; the rule stays" % (what, aid)
+    elif approve:
         raw, summary = apply_action(raw, p["action"])
         raw, aid = add_amendment(raw, "Approved %s%s: %s (%s)" % (pid, " from the agent (%s)" % meta["agent"] if meta.get("agent") else "", summary, p["text"]))
         summary = "%s, recorded as %s" % (summary, aid)
@@ -646,7 +653,9 @@ def protocol_text(raw, cwd):
     where = os.path.join(cwd, ".mc", "requests.jsonl") if cwd else ".mc/requests.jsonl (in your working folder)"
     return ("[mission control] The contract for this goal protects these settings: %s.%s Before you change one of them or work outside "
             "these limits, ask first: append one JSON line to %s, for example "
-            "{\"id\": \"R1\", \"param\": \"ENCUT\", \"value\": \"520\", \"why\": \"cutoff convergence check\"} "
-            "(or \"rule\": \"<= 1e-6\" instead of \"value\"). Carry on with other work meanwhile; the user approves or rejects it on the "
-            "dashboard and you will get a message with the answer.") % (
+            "{\"id\": \"R1\", \"param\": \"ENCUT\", \"value\": \"520\", \"why\": \"cutoff convergence check\", \"scope\": \"runs/conv\"} "
+            "(or \"rule\": \"<= 1e-6\" instead of \"value\"). Carry on with other work meanwhile; the user approves it (for that request "
+            "only, or as a new rule) or rejects it on the dashboard, and you get a message with the answer. When the user asks about "
+            "dashboard items (IDs like I3fa21), answer each on its own line: \"I3fa21: fixed | intended | explained | working | "
+            "need_decision - short reason\".") % (
         "; ".join(rules) or "none yet", (" Limits: %s." % "; ".join(limits)) if limits else "", where)

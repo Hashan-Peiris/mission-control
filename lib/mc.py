@@ -97,7 +97,7 @@ def compute_note():
     have = (["Rockfish"] if CFG["rf"] else []) + (["Skipjack"] if CFG["sj"] else []) + CFG["nodes"].split()
     return "- allowed: %s\n%s" % (", ".join(have) or "(clusters and nodes this goal may use)",
                                    ("- note: %s are never polled by mission control.\n" % " and ".join(w.capitalize() for w in NEVER)) if NEVER else "")
-SEV_ORDER = {"red": 0, "amber": 1, "info": 2}
+SEV_ORDER = {"red": 0, "amber": 1, "info": 2, "ok": 4}
 # this PC as a host name in the dashboard (the collector's own WSL; a laptop's when it has taken over)
 LOCAL_NAME = (os.environ.get("MC_HOST_OVERRIDE") or socket.gethostname().split(".")[0]).lower()
 LOGIN_HOSTS = {"rockfish-login": "Rockfish login node", "skipjack-login": "Skipjack login node"}
@@ -339,16 +339,34 @@ def parse_contract(path=None):
             "mtime": mtime, "raw": text}
 
 
+def norm_pv(v):
+    """A setting's value as VASP reads it: no quotes or code punctuation, any case, .TRUE./T/True alike, 0.10 = 0.1."""
+    x = str(v).strip().strip("\"'`()[]{},;:\\")
+    if re.fullmatch(r"\.?(t|true)\.?", x, re.I):
+        return "TRUE"
+    if re.fullmatch(r"\.?(f|false)\.?", x, re.I):
+        return "FALSE"
+    n = num(x)
+    return "%g" % n if n is not None else x.upper()
+
+
+def pv_equal(a, b):
+    a, b = norm_pv(a), norm_pv(b)
+    if a == b:
+        return True
+    # VASP reads text settings by their first letters (PREC = Acc is Accurate), and long lines get cut off
+    return len(a) >= 3 and len(b) >= 3 and a.isalpha() and b.isalpha() and (a.startswith(b) or b.startswith(a))
+
+
 def rule_violated(rule, value):
     op, ref = rule.get("op"), rule.get("val", "")
     if not op:
         return False
     if op == "in":
-        allowed = [x.strip().upper() for x in ref.split("|") if x.strip()]
-        return str(value).upper() not in allowed
-    a, b = num(value), num(ref)
+        return not any(pv_equal(value, x) for x in ref.split("|") if x.strip())
+    a, b = num(norm_pv(value)), num(norm_pv(ref))
     if a is None or b is None:
-        return op == "==" and str(value).upper() != ref.upper()
+        return op == "==" and not pv_equal(value, ref)
     if op == "abs<=":
         return abs(a) > abs(b) + 1e-15
     return not {"<=": a <= b + 1e-15, ">=": a >= b - 1e-15, "==": abs(a - b) <= 1e-12 * max(1, abs(b)),
@@ -657,8 +675,12 @@ def contract_flags(flags, contract, cst, res, comp, node, gnode, codex_goal):
         agent = bool(meta.get("agent")) or p["text"].startswith("The agent asks")
         flags.add("prop:%s" % p["id"], "red" if agent else "amber", "goal",
                   "The agent asks to change a rule" if agent else "A change would loosen the contract", p["text"],
-                  "Approve applies it and records an amendment%s." % (" and tells the agent" if agent else ""), needs_you=True,
-                  acts=[{"label": "Approve", "op": "approve", "pid": p["id"], "confirm": "Approve %s?\n\n%s" % (p["id"], p["text"])},
+                  "Allow it for this request only, change the rule for good, or reject it.", needs_you=True,
+                  acts=[{"label": "Allow for this request", "op": "approve_once", "pid": p["id"],
+                         "confirm": "Allow it for this request only?\n\n%s\n\nThe rule stays as it is; the approval is recorded as an amendment%s." % (
+                             p["text"], " and the agent is told" if agent else "")},
+                        {"label": "Change the rule", "op": "approve", "pid": p["id"],
+                         "confirm": "Change the contract rule for good?\n\n%s%s" % (p["text"], "\n\nThe agent is told." if agent else "")},
                         {"label": "Reject", "op": "reject", "pid": p["id"], "danger": True,
                          "confirm": "Reject %s?%s" % (p["id"], "\n\nThe agent is told." if agent else "")}])
     allowed = [x.lower() for x in cp["allowed"]] if cp["allowed"] else None
@@ -760,10 +782,53 @@ def cmd_contract_edit(key, req):
             raw, aid = CT.add_amendment(raw, "%s (from %s)" % (trunc(u["text"], 1200), u["id"]))
             bound = u["text"]
             msg = "Your instruction %s is now binding (%s)" % (u["id"], aid)
-        elif op in ("approve", "reject"):
-            raw, msg, info = CT.decide(raw, st, str(req.get("pid") or ""), op == "approve")
+        elif op in ("ask", "asked", "ack", "unack"):
+            # items on the page; these never touch the contract file. "ask" only writes the message: the server sends it
+            # and then records it with "asked", so an ask that didn't go out is not shown as asked.
+            flags = {f.get("id"): f for f in snap.get("flags") or [] if f.get("id")}
+            ipath = os.path.join(STATE, "items", key + ".json")
+            ist = rjson(ipath, {}) or {}
+            if op in ("ask", "asked"):
+                ids = [x for x in re.split(r"[,\s]+", str(req.get("items") or "")) if re.match(r"^I[0-9a-f]{5}$", x)]
+                items = [flags[x] for x in ids if x in flags]
+                if not items:
+                    return out(False, "Those items aren't on the page any more.")
+                q = re.sub(r"\s+", " ", str(req.get("text") or "")).strip()
+                if op == "asked":
+                    for f in items:
+                        ist.setdefault("asks", {})[f["id"]] = {"key": f["key"], "t": time.time(), "q": q}
+                    ist["asks"] = dict(sorted(ist["asks"].items(), key=lambda kv: kv[1].get("t", 0))[-200:])
+                    items_save(ipath, ist)
+                    return out(True, "Recorded.")
+                lines = ["- %s \u00b7 %s%s" % (f["id"], f["title"], (" \u00b7 " + trunc(f.get("detail") or "", 260)) if f.get("detail") else "") for f in items[:25]]
+                agent_msg = ("[mission control] The user asks about %s on the dashboard:\n%s\n\n%s\n\nAnswer each on its own line, starting with "
+                             "its id: \"%s: fixed | intended | explained | working | need_decision - short reason\". If one needs a contract "
+                             "change, also file a request in .mc/requests.jsonl (param, value, why, scope).") % (
+                    "this item" if len(items) == 1 else "these %d items" % len(items), "\n".join(lines),
+                    "Question: " + q if q else "Question: is this intended? If it is a mistake, fix it; if it needs a contract change, ask for it.",
+                    items[0]["id"])
+                zz = flags.get(item_id("goal:sleeping"))
+                return out(True, "Asked the agent about %s; its answer shows under %s when it replies%s." % (
+                    "this item" if len(items) == 1 else "%d items" % len(items), "it" if len(items) == 1 else "each one",
+                    (" (%s, so it answers then)" % zz["title"].split(",")[0].replace("Agent is", "it is")) if zz else ""), agent_msg)
+            else:
+                f = flags.get(str(req.get("item") or ""))
+                if not f:
+                    return out(False, "That item isn't on the page any more.")
+                if op == "ack":
+                    if f["key"].startswith(NO_ACK):
+                        return out(False, "This one waits for a decision or an answer, so it can't just be marked OK.")
+                    ist.setdefault("acks", {})[f["key"]] = {"sig": item_sig(f), "note": trunc(str(req.get("text") or "").strip(), 300), "t": time.time()}
+                    msg = "Marked OK; it stays quiet until it changes (7 days at most)"
+                else:
+                    (ist.get("acks") or {}).pop(f["key"], None)
+                    msg = "It counts again"
+            items_save(ipath, ist)
+            return out(True, msg + ". The page catches up at the next update.")
+        elif op in ("approve", "reject", "approve_once"):
+            raw, msg, info = CT.decide(raw, st, str(req.get("pid") or ""), op != "reject", once=op == "approve_once")
             if info.get("agent"):
-                agent_msg = ("[mission control] Your request %s was approved by the user: %s." % (info["agent"], msg) if op == "approve" else
+                agent_msg = ("[mission control] Your request %s was approved by the user: %s." % (info["agent"], msg) if op != "reject" else
                              "[mission control] Your request %s (%s) was not approved. Keep to the contract as it is." % (
                                  info["agent"], info["action"].split(" ", 1)[1]))
         elif op == "goal_sync":
@@ -802,6 +867,138 @@ def cmd_contract_edit(key, req):
     st["log"] = (st.get("log") or [])[-40:] + [{"t": time.time(), "x": "you: " + msg}]
     CT.save_state(CSTATE_DIR, key, st)
     return out(True, msg + ".", agent_msg)
+
+
+# ---------------------------------------------------------------- items on the page: ask the agent, its answers, your OK
+# Every flag gets a short id (I3fa21). "Ask agent" sends the agent the items with their ids; it answers one line each
+# ("I3fa21: intended - ...") in its reply or in .mc/answers.jsonl, and the answer shows under the item. "Mark OK" quiets an
+# item you have judged fine until it changes. Each item also says what makes it go away by itself.
+ANSWER_RX = re.compile(r"(?im)^\W{0,6}(I[0-9a-f]{5})\W{0,3}\s*[:\-\u2013\u2014]?\s*\**\s*(fixed|intended|explained|working|need[_ ]decision|won'?t fix|wontfix)\b"
+                       r"\**\s*[:\-\u2013\u2014.,]?\s*(.*)$")
+ANSWER_WORDS = {"fixed": "fixed it", "intended": "intended", "explained": "explained", "working": "working on it",
+                "need_decision": "needs your decision", "wontfix": "won\u2019t change it"}
+NO_ACK = ("prop:", "pane:")   # these wait for a decision or an answer; they can't just be marked OK
+
+
+def items_save(path, ist):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as fh:
+        json.dump(ist, fh)
+    os.replace(path + ".tmp", path)
+
+
+def item_id(key):
+    return "I" + hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:5]
+
+
+def item_sig(f):   # what an OK holds for: the item and its kind of finding (counts may change)
+    return hashlib.sha1((f["key"] + re.sub(r"\d+", "#", f["title"])).encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def clears_text(key, hours):
+    k = key.split(":", 1)[0]
+    return {
+        "chg": "Goes away %g h after the edit, or once the value keeps to the contract (allow it, or the agent changes it back)." % hours,
+        "param": "Goes away once no recent input file breaks the rule (allow the value, or the agent fixes the files).",
+        "param-mixed": "Goes away when you lock the setting, or when the recent files agree.",
+        "prop": "Goes away when you approve or reject it.",
+        "pane": "Goes away when the question on the agent\u2019s screen is answered.",
+        "pd": "Goes away when the jobs start or leave the queue.",
+        "dup": "Goes away when one of the two jobs ends.",
+        "waste": "Goes away when idle or failed time in the last %g h is back under the limit." % hours,
+        "loweff": "Goes away when that job is older than %g h, or new jobs use their CPUs." % hours,
+        "qf": "Goes away when the failures are older than %g h." % hours,
+        "sc": "Goes away when the wording is older than %g h." % hours,
+        "claim": "Goes away when a measured value backs the claim, or the claim is older than %g h." % hours,
+        "crit": "Goes away when the latest test output meets the criterion.",
+        "crit-noev": "Goes away when test output for it is found.",
+        "contract": "Goes away when the contract has what it is missing.",
+        "compute": "Goes away when the jobs, budget or load are back within the contract.",
+        "node": "Goes away when the node is busy again.",
+        "gpu": "Goes away when the GPU is busy again.",
+        "storage": "Goes away 6 h after the spike.",
+        "goal": "Goes away when the agent\u2019s state changes.",
+        "agent": "Goes away when an agent runs in the session again.",
+        "tmux": "Goes away when the tmux session is back.",
+        "quota": "Goes away when the quota window resets.",
+        "catchup": "Goes away when the older logs are read.",
+        "stale": "Goes away when fresh data arrives.",
+        "conn": "Goes away when the connection is back.",
+    }.get(k, "Goes away when a collection no longer sees it.")
+
+
+def item_answers(sessions, ndoc):
+    out = {}
+
+    def put(iid, status, note, t, src, extra=None):
+        st = status.lower().replace(" ", "_").replace("\u2019", "").replace("'", "")
+        st = "wontfix" if st in ("wont_fix", "wontfix") else st
+        if st not in ANSWER_WORDS:
+            return
+        if iid not in out or t >= out[iid]["t"]:
+            out[iid] = dict({"status": st, "note": trunc(note.strip().strip("|*` ").strip(), 400), "t": t, "src": src}, **(extra or {}))
+    for s in sessions:
+        for a in s.get("agent", []) or []:
+            for m in ANSWER_RX.finditer(a.get("text") or ""):
+                put(m.group(1), m.group(2), m.group(3), iso_epoch(a.get("ts")) or 0, "chat")
+        for a in s.get("item_answers", []) or []:   # remote_digest keeps these from the full reply (long replies are shortened)
+            put(str(a.get("id") or ""), str(a.get("status") or ""), str(a.get("note") or ""), iso_epoch(a.get("ts")) or 0, "chat")
+    for r in (ndoc or {}).get("answers") or []:
+        iid = str(r.get("item") or "")
+        if re.match(r"^I[0-9a-f]{5}$", iid):
+            put(iid, str(r.get("status") or ""), str(r.get("note") or ""), iso_epoch(r.get("ts")) or NOW, "file",
+                {"param": r.get("param") or "", "value": r.get("value") or ""})
+    return out
+
+
+def items_decorate(flags, gkey, sessions, ndoc):
+    path = os.path.join(STATE, "items", gkey + ".json")
+    ist = rjson(path, {}) or {}
+    answers = item_answers(sessions, ndoc)
+    for f in flags.items:
+        f["gkey"], f["id"], f["clears"] = gkey, item_id(f["key"]), clears_text(f["key"], CFG["hours"])
+        if f["id"] in answers:
+            f["answer"] = answers[f["id"]]
+        ask = (ist.get("asks") or {}).get(f["id"])
+        if ask and NOW - ask.get("t", 0) < 2 * 86400 and not (f.get("answer") and f["answer"]["t"] >= ask["t"] - 60):
+            f["asked"] = ask["t"]
+        ack = (ist.get("acks") or {}).get(f["key"])
+        if ack and not f["key"].startswith(NO_ACK) and ack.get("sig") == item_sig(f) and NOW - ack.get("t", 0) < 7 * 86400:
+            f["acked"] = {"note": ack.get("note", ""), "t": ack["t"], "was": f["sev"]}
+            f["sev"], f["needs_you"] = "ok", False
+    return answers
+
+
+def item_bar(f):
+    """Under each item on a session page: the agent's answer, what makes it go away, Ask agent, Mark OK."""
+    if not f.get("gkey") or not f.get("id"):
+        return ""
+    o = ['<div class="ibar" data-ckey="%s">' % esc(f["gkey"])]
+    a = f.get("answer")
+    if a:
+        o.append('<div class="ans"><b>Agent</b> <span class="mut">%s</span> \u00b7 <span class="as-%s">%s</span>%s</div>' % (
+            esc(hm(a["t"])), esc(a["status"]), esc(ANSWER_WORDS.get(a["status"], a["status"])), (" \u2014 " + esc(a["note"])) if a.get("note") else ""))
+    elif f.get("asked"):
+        o.append('<div class="ans mut">Asked the agent at %s; its answer shows here.</div>' % esc(hm(f["asked"])))
+    if f.get("acked"):
+        o.append('<div class="ans mut">Marked OK by you %s%s</div>' % (esc(ago(f["acked"]["t"])), (" \u2014 " + esc(f["acked"]["note"])) if f["acked"].get("note") else ""))
+    o.append('<div class="clr">%s</div><div class="ibtn">' % esc(f.get("clears") or ""))
+    o.append('<button type="button" class="lnk" data-cop="ask" data-citems="%s">Ask agent</button>' % esc(f["id"]))
+    if f.get("acked"):
+        o.append('<button type="button" class="lnk" data-cop="unack" data-citem="%s">Undo OK</button>' % esc(f["id"]))
+    elif not f["key"].startswith(NO_ACK):
+        o.append('<button type="button" class="lnk" data-cop="ack" data-citem="%s">%s</button>' % (
+            esc(f["id"]), "Accept the answer" if a and a["status"] in ("intended", "explained", "wontfix") else "Mark OK"))
+    o.append('<span class="iid" title="Item id, for asking about it">%s</span></div><div class="actmsg"></div></div>' % esc(f["id"]))
+    return "".join(o)
+
+
+def ask_all_btn(items, gkey, label):
+    ids = [f["id"] for f in items if f.get("id") and f.get("sev") in ("red", "amber")]
+    if len(ids) < 2 or not gkey:
+        return ""
+    return '<span class="cacts askall" data-ckey="%s"><button type="button" class="lnk" data-cop="ask" data-citems="%s">%s (%d)</button><span class="actmsg"></span></span>' % (
+        esc(gkey), esc(",".join(ids)), esc(label), len(ids))
 
 
 # ---------------------------------------------------------------- storage of the working folder (scanned every ~30 min)
@@ -1028,6 +1225,7 @@ class Flags:
         self.items = []
 
     def add(self, key, sev, area, title, detail="", action="", needs_you=False, q=None, acts=None):
+        self.items = [f for f in self.items if f["key"] != key]   # one entry per item: the newest wins
         self.items.append({"key": key, "sev": sev, "area": area, "title": title, "detail": detail,
                            "action": action, "needs_you": needs_you or sev == "red", "q": q, "acts": acts or None})
 
@@ -1297,9 +1495,10 @@ def goal_doc(goal):
             stor = v
             break
     reqs = [dict(r, cwd=c) for c, lst in (doc.get("requests") or {}).items() if c in cwds for r in lst]
+    answers = [dict(r, cwd=c) for c, lst in (doc.get("answers") or {}).items() if c in cwds for r in lst]
     return {"ok": doc.get("ok", False), "tmux": goal.get("tm") or {}, "sessions": sessions, "goal_db": doc.get("goal_db"),
             "node": doc.get("node"), "params": params, "decisions": dec, "git": git, "goal_cwds": cwds,
-            "elapsed_s": doc.get("elapsed_s", 0), "specs": specs, "requests": reqs, "storage": stor}
+            "elapsed_s": doc.get("elapsed_s", 0), "specs": specs, "requests": reqs, "answers": answers, "storage": stor}
 
 
 def analyze_goal(gdesc, shared):
@@ -1356,6 +1555,9 @@ def analyze_goal(gdesc, shared):
     if goal_text:
         fill_goal_if_empty(contract, goal_text)
     codex_goal = (goal or {}).get("text") or ""
+    for iid, a in item_answers(sessions, ndoc).items():   # "needs your decision" with a setting and value: a request
+        if a["status"] == "need_decision" and a.get("param") and a.get("value") and ndoc is not None:
+            ndoc.setdefault("requests", []).append({"id": iid, "param": a["param"], "value": a["value"], "why": a.get("note") or ""})
     cst, cnotes = contract_upkeep(gkey, goal_text, codex_goal, ndoc, shared)
     if cnotes:
         contract = parse_contract()
@@ -1655,8 +1857,9 @@ def analyze_goal(gdesc, shared):
                              "confirm": "Keep %s %s as your own rule? Breaks then show red." % (k, row["rule"])})
             flags.add("param:%s" % k, "amber" if row["auto"] else "red", "integrity",
                       "%s breaks the contract in %d recent input file(s)" % (k, sum(x["n"] for x in badv)),
-                      "Rule %s%s; found %s (e.g. %s)" % (row["rule"], (" (%s)" % row["tag"]) if row["auto"] else "",
-                                                       ", ".join("%s \u00d7%d" % (x["v"], x["n"]) for x in badv[:3]), trunc(badv[0]["ex"], 120)),
+                      "Rule %s%s; found %s%s" % (row["rule"], (" (%s)" % row["tag"]) if row["auto"] else "",
+                                                   ", ".join("%s \u00d7%d" % (x["v"], x["n"]) for x in badv[:3]),
+                                                   (" (e.g. %s)" % trunc(badv[0]["ex"], 120)) if badv[0].get("ex") else ""),
                       ("An automatic rule: keep it to make breaks red, or allow the value." if row["auto"] else
                        "Ask the agent to fix it, or allow the value."), acts=acts)
         elif len(row["values"]) > 1 and not rule.get("op") and k not in VARIES:
@@ -1668,6 +1871,13 @@ def analyze_goal(gdesc, shared):
                           "Pick what's valid: one value, any of these, a bound, or your own rule.",
                           acts=lock_acts(k, [x["v"] for x in row["values"]]))
     changes = []
+    pending = set()   # values the agent has asked you for (waiting under Needs you), so the edits aren't a second alarm
+    for pr in CT.proposals(contract["raw"]):
+        mm = re.match(r"^(?:allow|set)\s+([A-Z_][A-Z0-9_]*)\s+(?:(?:abs<=|<=|>=|==|<|>|in)\s+)?(.+)$", pr["action"], re.I)
+        if mm:
+            for v in mm.group(2).split("|"):
+                pending.add((mm.group(1).upper(), norm_pv(v), pr["id"]))
+    docs_rx = re.compile(r"\.(md|markdown|txt|rst|log|tex|html?|org|ipynb|csv|out)$", re.I)
     for s in sessions:
         for p in s.get("patches", []):
             e = iso_epoch(p.get("ts"))
@@ -1675,19 +1885,30 @@ def analyze_goal(gdesc, shared):
                 continue
             olds, news = {}, {}
             for sign, fpath, body, keep in p.get("lines", []):
+                if docs_rx.search(fpath or ""):   # notes and docs mention settings; they don't set them
+                    continue
                 for k in watch:
                     mm = re.search(r"(?<![A-Za-z0-9_])%s\s*[=:]\s*([^\s,;#!]+)" % re.escape(k), body, re.I)
                     if mm:
                         (olds if sign == "-" else news).setdefault((k, fpath), mm.group(1))
             for (k, fpath), nv in news.items():
                 ov = olds.get((k, fpath))
-                if ov is not None and ov.lower() == nv.lower():
+                if ov is not None and pv_equal(ov, nv):
                     continue
-                bad = rule_violated(watch[k], nv) and not authorized(k, nv, perm_texts)
-                changes.append({"ts": p.get("ts"), "who": s.get("label"), "param": k, "old": ov, "new": nv, "file": fpath, "bad": bad})
+                if ov is None and not rule_violated(watch[k], nv):
+                    continue   # a new line that keeps to the contract
+                bad = rule_violated(watch[k], nv) and not authorized(k, norm_pv(nv), perm_texts)
+                asked = next((pid for (pk, pv, pid) in pending if pk == k and pv_equal(pv, nv)), None)
+                changes.append({"ts": p.get("ts"), "who": s.get("label"), "param": k, "old": ov, "new": nv, "file": fpath,
+                                "bad": bad and not asked, "asked": asked})
     for ch in changes[-12:]:
         k = ch["param"]
-        ok = authorized(k, ch["new"], perm_texts)
+        ok = authorized(k, norm_pv(ch["new"]), perm_texts)
+        if ch.get("asked"):
+            flags.add("chg:%s:%s:%s" % (k, ch["file"], norm_pv(ch["new"])), "info", "integrity",
+                      "%s set to %s in %s, as the agent asked in %s" % (k, norm_pv(ch["new"]), trunc(ch["file"], 60), ch["asked"]),
+                      "Waiting for your decision on %s under Needs you." % ch["asked"])
+            continue
         if ch["bad"]:
             sev = "red"
         elif ch["old"] is None:
@@ -1695,12 +1916,14 @@ def analyze_goal(gdesc, shared):
         else:
             sev = "info" if ok else "amber"
         rule = watch.get(k, {})
-        flags.add("chg:%s:%s:%s" % (k, ch["file"], ch["new"]), sev, "integrity",
+        flags.add("chg:%s:%s:%s" % (k, ch["file"], norm_pv(ch["new"])), sev, "integrity",
                   "%s changed %s \u2192 %s by %s" % (k, ch["old"] or "(new)", ch["new"], ch["who"]),
                   "%s at %s%s" % (trunc(ch["file"], 90), hm(iso_epoch(ch["ts"])),
                                    (" \u00b7 breaks %s %s%s" % (k, ("%s %s" % (rule.get("op"), rule.get("val"))), " from your goal" if rule.get("src") == "goal text" else " in the contract")) if ch["bad"] else
                                    (" \u00b7 you allowed %s = %s in an instruction" % (k, ch["new"]) if ok else "")),
-                  "" if sev == "info" else "Reject it in the TUI, or allow it with: mctl amend \"%s may be %s because ...\"" % (k, ch["new"]))
+                  "" if sev == "info" else "Ask the agent about it, allow the value, or mark it OK.",
+                  acts=[{"label": "Allow %s" % norm_pv(ch["new"]), "op": "allow", "name": k, "value": norm_pv(ch["new"]),
+                         "confirm": "Allow %s = %s? The rule is widened and an amendment is recorded." % (k, norm_pv(ch["new"]))}] if ch["bad"] else None)
     red_chg = {f["key"].split(":")[1] for f in flags.items if f["key"].startswith("chg:") and f["sev"] == "red"}
     for f in list(flags.items):
         if f["key"].startswith("param:") and f["key"][6:] in red_chg:
@@ -1810,9 +2033,7 @@ def analyze_goal(gdesc, shared):
                   "Fill contract/goal_contract.md so the checks know what matters.")
     contract_flags(flags, contract, cst, res, {"alloc_ch": tot_alloc}, node, gnode, codex_goal)
     storage = storage_update(gkey, (ndoc or {}).get("storage"), flags)
-    for f in flags.items:
-        if f.get("acts"):
-            f["gkey"] = gkey
+    items_decorate(flags, gkey, sessions, ndoc)
 
     # ---- instructions you typed
     instr = []
@@ -2960,7 +3181,7 @@ def render_overview(ov):
         for i, f in enumerate(needs[:20]):
             if i == 4:
                 o.append("<details style='border:none;padding:0;margin:4px 0 0;box-shadow:none'><summary class='small'>%d more</summary>" % (len(needs[:20]) - 4))
-            h = flag_html(f)
+            h = flag_html(f, bar=False)
             if f.get("goal"):
                 h = '<a class="gc" href="goals/%s.html">%s</a>' % (esc(f["goal"]), h)
             o.append(h)
@@ -2984,7 +3205,7 @@ def render_overview(ov):
     o.append('<div style="height:16px"></div><section class="card"%s>%s</section>' % (sec("o", "resources"), resources_html(ov["resources"], ov["nodes"], ov["compute"], ov["history"])))
     comp = [f for f in ov["flags"] if f["area"] in ("compute", "connection") and not f.get("needs_you")]
     if comp:
-        o.append('<section class="card"%s><h2>Watchdog</h2>%s</section>' % (sec("o", "watchdog"), "".join(flag_html(f) for f in comp)))
+        o.append('<section class="card"%s><h2>Watchdog</h2>%s</section>' % (sec("o", "watchdog"), "".join(flag_html(f, bar=False) for f in comp)))
     if ov["others"]:
         o.append("<details" + sec("o", "others") + "><summary>Other agent logs seen recently (not running now): %d</summary><table><tr><th>Host</th><th>Kind</th><th>Last active</th><th>Calls</th><th>Folder</th></tr>" % len(ov["others"]))
         for x in ov["others"]:
@@ -3271,6 +3492,16 @@ details.rowmenu>summary{list-style:none;font-weight:700;color:var(--mut);padding
 details.rowmenu>summary::-webkit-details-marker{display:none}details.rowmenu[open]>summary{color:var(--fg);border-color:var(--fg)}
 details.rowmenu .cacts{flex-direction:column;align-items:stretch;gap:4px;margin-top:6px}
 footer div{margin:2px 0}
+.ibar{margin-top:6px;font-size:12px}.ibar .clr{color:var(--faint);font-size:11.5px;margin-top:2px}
+.ibtn{display:flex;flex-wrap:wrap;align-items:center;gap:2px 12px;margin-top:3px}
+.lnk{background:none;border:none;padding:2px 0;font:inherit;font-size:12px;font-weight:600;color:var(--sky);cursor:pointer}
+.lnk:hover{text-decoration:underline}.lnk:disabled{opacity:.5}.iid{font-family:ui-monospace,monospace;font-size:11px;color:var(--faint)}
+.ans{margin:3px 0 2px;padding:5px 8px;border-radius:8px;background:color-mix(in srgb,var(--violet) 12%,transparent);color:var(--fg)}
+.ans.mut{background:none;padding:0;color:var(--mut)}.as-fixed{color:var(--grn)}.as-intended,.as-explained{color:var(--sky)}
+.as-need_decision{color:var(--amb)}.as-wontfix{color:var(--red)}.as-working{color:var(--mut)}
+.flag.ok{--fc:var(--slate);opacity:.75}.card .flag.ok{background:none;border:none;border-bottom:1px solid var(--line);border-radius:0;padding:9px 0 9px 16px;margin:0;position:relative}
+.card .flag.ok:before{content:"\u2713";position:absolute;left:0;top:8px;font-size:11px;color:var(--grn)}.flag.ok .t{color:var(--mut)}
+.ibar .actmsg{text-align:left}h2 .askall{display:inline-flex;margin:0 0 0 8px;vertical-align:middle}h2 .askall .lnk{font-size:12px}
 
 .card .flag.amber,.card .flag.info{background:none;border:none;border-radius:0;border-bottom:1px solid var(--line);padding:9px 0 9px 16px;margin:0;position:relative}
 .card .flag.amber:before,.card .flag.info:before{content:"";position:absolute;left:2px;top:16px;width:7px;height:7px;border-radius:50%;background:var(--fc)}
@@ -3358,11 +3589,11 @@ def acts_html(acts, gkey):
     return '<div class="cacts" data-ckey="%s">%s<div class="actmsg"></div></div>' % (esc(gkey), "".join(btns))
 
 
-def flag_html(f):
-    return ('<div class="flag %s"><div class="t">%s</div>%s%s%s%s</div>' % (
+def flag_html(f, bar=True):
+    return ('<div class="flag %s"><div class="t">%s</div>%s%s%s%s%s</div>' % (
         f["sev"], esc(f["title"]), ('<div class="d">%s</div>' % esc(f["detail"])) if f["detail"] else "",
-        ('<div class="a">%s</div>' % esc(f["action"])) if f["action"] else "", question_html(f.get("q")),
-        acts_html(f.get("acts"), f.get("gkey") or "")))
+        ('<div class="a">%s</div>' % esc(f["action"])) if f["action"] and not f.get("acked") else "", question_html(f.get("q")),
+        acts_html(f.get("acts"), f.get("gkey") or "") if not f.get("acked") else "", item_bar(f) if bar else ""))
 
 
 KIND_PILL = {"submit": ("submit", "ok"), "cancel": ("cancel", "warn"), "alloc": ("srun", "ok"), "delete": ("delete", "bad"),
@@ -3630,15 +3861,18 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  var box=b.closest('[data-ckey]');if(!box)return;var o=box.querySelector('.actmsg')||(box.parentNode&&box.parentNode.querySelector('.actmsg'));
  var say=function(t,c){if(o){o.className='actmsg '+(c||'');o.textContent=t;}else if(c==='bad')alert(t);};
  if(!served){say('Open the dashboard with mctl (http://localhost:8765) to change the contract from here.','bad');return;}
- var body={key:box.getAttribute('data-ckey'),op:b.getAttribute('data-cop')},map={cname:'name',cvalue:'value',cruleop:'rule_op',cval:'val',cpid:'pid',cuid:'uid',ctext:'text'};
+ var body={key:box.getAttribute('data-ckey'),op:b.getAttribute('data-cop')},map={cname:'name',cvalue:'value',cruleop:'rule_op',cval:'val',cpid:'pid',cuid:'uid',ctext:'text',citems:'items',citem:'item'};
  for(var a in map){var v=b.getAttribute('data-'+a);if(v!==null)body[map[a]]=v;}
  var form=b.closest('.cform');if(form){var ins=form.querySelectorAll('input,select');for(var i=0;i<ins.length;i++)body[ins[i].name]=ins[i].value;
   if(body.op==='set'&&(!body.name||!body.val)){say('Fill in the name and the value.','bad');return;}
   if(body.op==='criterion'&&!(body.text||'').trim()){say('Write the criterion first.','bad');return;}}
  var q=b.getAttribute('data-cconfirm');if(form&&body.op==='set')q='Add the rule '+body.name.toUpperCase()+' '+body.rule_op+' '+body.val+'?';
  if(['set','allow','unlock','unwatch','criterion','uncriterion','amend','bind'].indexOf(body.op)>=0)q=(q||'Change the contract?')+'\n\nThe agent gets a short message about the change.';
- if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say('Saving\u2026','');
+ if(body.op==='ask'){var n=(body.items||'').split(',').length;var t=prompt('Ask the agent about '+(n>1?'these '+n+' items':'this item')+'.\nYour question (leave empty for: is this intended? fix it if not):','');if(t===null)return;body.text=t;q='';}
+ else if(body.op==='ack'){var t2=prompt('Mark this item OK until it changes. Why is it OK? (optional, kept with it)','');if(t2===null)return;body.text=t2;q='';}
+ if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say(body.op==='ask'?'Sending\u2026':'Saving\u2026','');
  post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
+  if(j.ok&&(body.op==='ack'||body.op==='unack')){var fl=b.closest('.flag');if(fl)fl.classList.toggle('ok',body.op==='ack');}
   if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)if(ins2[i].type!=='hidden')ins2[i].value='';}})
  .catch(function(){window.MC_BUSY=false;b.disabled=false;say('Couldn\u2019t reach the mission control server.','bad');});});
 // answer a question on the agent's screen: the button types that answer into the session (after you confirm)
@@ -3859,7 +4093,7 @@ def render(s):
     # needs you
     needs = [f for f in s["flags"] if f.get("needs_you")]
     if needs:
-        o.append('<section class="card"%s><h2>Needs you</h2>' % sec("g", "needs"))
+        o.append('<section class="card"%s><h2>Needs you %s</h2>' % (sec("g", "needs"), ask_all_btn(needs, s["key"], "Ask the agent about all")))
         o.extend(flag_html(f) for f in needs)
         o.append("</section>")
     else:
@@ -3909,7 +4143,7 @@ def render(s):
 
     # integrity
     integ = [f for f in s["flags"] if f["area"] == "integrity" and not f.get("needs_you")]
-    o.append('<section class="card"%s><h2>Scientific integrity</h2>' % sec("g", "integrity"))
+    o.append('<section class="card"%s><h2>Scientific integrity %s</h2>' % (sec("g", "integrity"), ask_all_btn(integ, s["key"], "Ask about these")))
     if integ:
         o.extend(flag_html(f) for f in integ)
     elif not any(f["area"] == "integrity" for f in s["flags"]):
@@ -3924,7 +4158,7 @@ def render(s):
     # other flags (goal / compute amber+info not shown above)
     other = [f for f in s["flags"] if f["area"] in ("goal", "compute", "connection") and not f.get("needs_you")]
     if other:
-        o.append('<section class="card"%s><h2>Watchdog</h2>' % sec("g", "watchdog"))
+        o.append('<section class="card"%s><h2>Watchdog %s</h2>' % (sec("g", "watchdog"), ask_all_btn(other, s["key"], "Ask about these")))
         o.extend(flag_html(f) for f in other)
         o.append("</section>")
 
