@@ -618,7 +618,7 @@ def upkeep(raw, ctx, st):
             if old.get("agent"):
                 st["requests_done"] = [x for x in st["requests_done"] if not x.startswith("agent:%s:" % old["agent"])]
             notes.append("re-read %s as acceptance criteria" % p["id"])
-    have_crit = {crit_key(t) for t in criteria_texts(raw)}
+    have_crit = {crit_key(t) for _, t in criteria_texts(raw)}
     for r in ctx.get("requests") or []:
         pname = str(r.get("param") or "").strip()
         crits = as_list(r.get("criterion")) + as_list(r.get("criteria")) + (as_list(r.get("value")) + as_list(r.get("rule")) if CRIT_PARAM.match(pname) else [])

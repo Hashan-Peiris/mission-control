@@ -1680,7 +1680,7 @@ def mem_items(contract, instr, goal_text):
         items.append({"kind": "limit", "label": "not %s" % f, "hosts": [f.split(" (")[0].strip()]})
     if cp["budget"]:
         items.append({"kind": "limit", "label": "budget %s %s" % ("{:,.0f}".format(cp["budget"][0]), cp["budget"][1]), "num": cp["budget"][0]})
-    for t in CT.criteria_texts(contract["raw"]):
+    for _, t in CT.criteria_texts(contract["raw"]):
         items.append({"kind": "criterion", "label": trunc(t, 80), "text": t})
     gw = _mwords(goal_text)
     seen = []
