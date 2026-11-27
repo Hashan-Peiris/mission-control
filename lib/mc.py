@@ -427,6 +427,10 @@ CRIT_OP_LE = re.compile(r"(?i)(below|under|less than|lower than|smaller than|at 
 CRIT_OP_GE = re.compile(r"(?i)(above|over|greater than|more than|at least|>=|\u2265|>)")
 
 
+ML_ERR_RX = re.compile(r"\b(rmse|mae|errors?|accuracy|accurate|tests?|tested|testing|validation|validate|held[- ]out|deviation|dp test|"
+                       r"predict\w*|model|potential)\b", re.I)
+
+
 def parse_criteria(text):
     """Turn plain-English thresholds into checkable metrics (one per number+unit). Unparsed text is kept for the referee."""
     m = re.match(r"(?i)custom:\s*([^|]+)\|\s*(.+?)\s*\|\s*(<=|>=|==|<|>)\s*([-+0-9.eE]+)\s*$", text)
@@ -446,6 +450,8 @@ def parse_criteria(text):
         unit_e, per = n.group(2).lower(), n.group(3).lower()
         per_atom = per.startswith("at")
         low = seg.lower()
+        if not ML_ERR_RX.search(text[max(0, seg_start - 80): n.end()]):
+            continue   # a number with eV/Å but no error, test or model nearby (e.g. a DFT force convergence): for the referee
         if "force" in low:
             q = "force"
         elif "virial" in low:
