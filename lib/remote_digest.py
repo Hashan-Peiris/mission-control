@@ -78,6 +78,15 @@ DONE_RX = re.compile(r"(?i)\b(?:goal|criteri\w*|targets?|thresholds?|requirement
                      r"(?:all\s+|fully\s+|now\s+)?(?:met|achieved|reached|satisfied|fulfilled|complete[d]?|passed)\b|"
                      r"\b(?:meets|satisfies|is below|is under) the (?:target|threshold|criteri\w*)\b|"
                      r"\bgoal (?:is )?(?:complete|done|accomplished)\b|\ball (?:acceptance )?criteria (?:are )?(?:met|satisfied|pass(?:ed)?)\b")
+COND_RX = re.compile(r"(?i)\b(?:once|when|whenever|until|unless|if|after|before|whether|so that|ensure|make sure|check|verify|confirm)\b[^.!?]{0,70}$")
+
+
+def is_done_claim(text):
+    """The agent stating the goal or a target is met, not "once the requirements are satisfied" or "check that ..."."""
+    text = text or ""
+    return any(not COND_RX.search(text[max(0, m.start() - 80): m.start()]) for m in DONE_RX.finditer(text))
+
+
 CLAIM_RE = re.compile(r"(?i)([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?\d+)?)\s*(meV|eV)\s*/\s*(atom|at)\b")
 
 
@@ -747,7 +756,7 @@ def add_agent(st, ts, text):
             v = float(m.group(1)) * (1e-3 if m.group(2).lower() == "mev" else 1.0)
             push(st.setdefault("claims", []), {"ts": ts, "metric": "energy_%s_atom" % ("mae" if re.search(r"(?i)\bmae\b", ctx) else "rmse"),
                                                "value": v, "context": re.sub(r"\s+", " ", ctx)[:240]}, 60)
-    if DONE_RX.search(text):
+    if is_done_claim(text):
         push(st.setdefault("done_claims", []), {"ts": ts, "text": trunc(re.sub(r"\s+", " ", text), 300)}, 20)
 
 
