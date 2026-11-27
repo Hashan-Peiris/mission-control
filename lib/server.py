@@ -322,6 +322,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pass
             why = (err.strip().splitlines() or ["the session was busy or asking something"])[-1]
             if body.get("op") == "ask":   # an item question: record it only once it went out
+                if rc == 0:
+                    self._check_back(150)
                 if rc == 124:   # handed over but no word back (another PC asleep, or its answer lost)
                     return {"ok": False, "message": "%s. It isn't marked as asked; if the agent got it, its answer still shows under the item." % why.rstrip(".")}
                 if rc != 0:
@@ -354,6 +356,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(os.path.join(ARCHIVE, "collect.now"), "w") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
         return {"ok": True, "started": True, "message": "Collecting fresh data now (about a minute). The page updates when it arrives."}
+
+    def _check_back(self, delay):
+        """After an item question, collect once more in a couple of minutes (if no collection ran meanwhile) so the
+        agent's answer reaches the page sooner. Only on the machine that collects."""
+        def go():
+            host, t = self._collector()
+            if (host and MY_HOST and host.lower() != MY_HOST) or time.time() - t < 90 or time.time() - LAST_NUDGE[0] < 90:
+                return
+            LAST_NUDGE[0] = time.time()
+            try:
+                with open(os.path.join(ARCHIVE, "collect.now"), "w") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+            except OSError:
+                pass
+        th = threading.Timer(delay, go)
+        th.daemon = True
+        th.start()
 
     def _relay_in(self):
         """A request from another of your PCs (relay in mctl), over your tailnet: your own Tailscale login, a valid

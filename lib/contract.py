@@ -585,11 +585,25 @@ def upkeep(raw, ctx, st):
         elif not val and e:
             raw = drop_compute(raw, key)
 
-    # 5. The agent asking to change a rule (.mc/requests.jsonl in its folder): shown as a proposal for you to decide
+    # 5. The agent asking to change a rule (.mc/requests.jsonl in its folder): shown as a proposal for you to decide.
+    #    It can also propose an acceptance criterion ("criterion": "..."), which you add or reject.
     for r in ctx.get("requests") or []:
-        rid = r.get("id") or sig(r.get("param"), r.get("value"), r.get("why"))[:6]
-        rs = "agent:%s:%s" % (rid, sig(r.get("param"), r.get("value"), r.get("rule")))
-        if rs in st["requests_done"] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(r.get("param") or "")):
+        crit = re.sub(r"\s+", " ", str(r.get("criterion") or "")).strip()[:300]
+        rid = r.get("id") or sig(r.get("param"), r.get("value"), r.get("why"), crit)[:6]
+        rs = "agent:%s:%s" % (rid, sig(r.get("param"), r.get("value"), r.get("rule")) if not crit else sig("criterion", crit))
+        if rs in st["requests_done"]:
+            continue
+        if crit:
+            action = "criterion " + crit
+            st["requests_done"].append(rs)
+            if crit_key(crit) in {crit_key(t) for t in criteria_texts(raw)} or any(p["action"] == action for p in proposals(raw)):
+                continue
+            raw, pid = add_proposal(raw, "The agent proposes an acceptance criterion (%s): %s. Why: %s" % (
+                rid, crit, (r.get("why") or "not given")[:300]), action)
+            st["proposals"][pid] = {"sig": rs, "action": action, "agent": rid}
+            notes.append("agent criterion %s waiting for your OK" % rid)
+            continue
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(r.get("param") or "")):
             continue
         name = str(r["param"]).upper()
         rule = re.match(r"^\s*(abs<=|<=|>=|==|<|>|in)\s+(.+)$", str(r.get("rule") or ""))
@@ -654,7 +668,9 @@ def protocol_text(raw, cwd):
     return ("[mission control] The contract for this goal protects these settings: %s.%s Before you change one of them or work outside "
             "these limits, ask first: append one JSON line to %s, for example "
             "{\"id\": \"R1\", \"param\": \"ENCUT\", \"value\": \"520\", \"why\": \"cutoff convergence check\", \"scope\": \"runs/conv\"} "
-            "(or \"rule\": \"<= 1e-6\" instead of \"value\"). Carry on with other work meanwhile; the user approves it (for that request "
+            "(or \"rule\": \"<= 1e-6\" instead of \"value\"). To propose an acceptance criterion, append "
+            "{\"id\": \"R2\", \"criterion\": \"energy RMSE <= 20 meV/atom on the held-out set\", \"why\": \"...\"}, one line per criterion. "
+            "Carry on with other work meanwhile; the user approves it (for that request "
             "only, or as a new rule) or rejects it on the dashboard, and you get a message with the answer. When the user asks about "
             "dashboard items (IDs like I3fa21), answer each on its own line: \"I3fa21: fixed | intended | explained | working | "
             "need_decision - short reason\".") % (

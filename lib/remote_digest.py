@@ -1585,7 +1585,7 @@ def main():
             except ValueError:
                 continue
             if isinstance(r, dict):
-                reqs.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("id", "param", "value", "why", "rule", "ts", "scope")})
+                reqs.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("id", "param", "value", "why", "rule", "ts", "scope", "criterion")})
     out["specs"] = specs
     ans = {}
     for c in cwds[:8]:   # the agent's answers about dashboard items (I3fa21: fixed / intended / ...), as JSON lines
