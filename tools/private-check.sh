@@ -18,7 +18,7 @@ words=$(for f in "$(git rev-parse --git-dir 2> /dev/null)/info/private-words" "$
 if [ "${1:-}" = --staged ]; then
   text=$(git diff --cached -U0 --diff-filter=ACMR | grep -E '^\+' | grep -v '^+++'; git diff --cached --name-only --diff-filter=ACMR)
 else
-  text=$(git ls-files; git ls-files -z | xargs -0 cat 2> /dev/null)
+  text=$(git ls-files; git ls-files -z | grep -zvE '\.(png|jpe?g|gif|webp|pdf|ico)$' | xargs -0 cat 2> /dev/null)   # images: names only
 fi
 hits=$(printf '%s\n' "$text" | grep -oiwF -f <(printf '%s\n' "$words") | sort -fu | tr '\n' ' ')
 if [ -n "$hits" ]; then
