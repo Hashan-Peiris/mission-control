@@ -7,6 +7,7 @@ Sources, in order of trust: what you wrote (no tag) > the goal's own instruction
 Codex goal text) > what the run files agree on. Lines written automatically carry a short "# ..." tag saying where
 they came from; remove the tag (or press Keep) to make a line yours.
 """
+import ast
 import hashlib
 import json
 import os
@@ -368,7 +369,29 @@ def proposals(raw):
     return out
 
 
+CRIT_PARAM = re.compile(r"^(?:ACCEPTANCE_?)?CRITERI(?:A|ON|AS)$|^ACCEPTANCE$", re.I)   # criteria filed as a "setting"
+
+
+def as_list(v):
+    """A request field as a list of texts: a JSON list, or a list written out as text ("['a', 'b']"), or one text."""
+    if isinstance(v, list):
+        return [re.sub(r"\s+", " ", str(x)).strip() for x in v if str(x).strip()]
+    t = str(v or "").strip()
+    if not t:
+        return []
+    if t.startswith("[") and t.endswith("]"):
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                x = parse(t)
+            except Exception:  # noqa
+                continue
+            if isinstance(x, list):
+                return as_list(x)
+    return [re.sub(r"\s+", " ", t)]
+
+
 def add_proposal(raw, text, action):
+    text, action = re.sub(r"\s+", " ", text).strip(), re.sub(r"\s+", " ", action).strip()   # one line in the contract
     for p in proposals(raw):
         if p["action"] == action:
             return raw, p["id"]
@@ -586,24 +609,38 @@ def upkeep(raw, ctx, st):
             raw = drop_compute(raw, key)
 
     # 5. The agent asking to change a rule (.mc/requests.jsonl in its folder): shown as a proposal for you to decide.
-    #    It can also propose an acceptance criterion ("criterion": "..."), which you add or reject.
+    #    It can also propose acceptance criteria ("criterion": "...", or a list), which you add or reject one by one.
+    for p in proposals(raw):   # criteria filed as if they were a setting (ACCEPTANCE_CRITERIA ...): read again as criteria
+        m = re.match(r"^(?:allow|set)\s+([A-Za-z_]+)\b", p["action"])
+        if m and CRIT_PARAM.match(m.group(1)):
+            old = st["proposals"].pop(p["id"], {}) or {}
+            raw = remove_proposal(raw, p["id"])
+            if old.get("agent"):
+                st["requests_done"] = [x for x in st["requests_done"] if not x.startswith("agent:%s:" % old["agent"])]
+            notes.append("re-read %s as acceptance criteria" % p["id"])
+    have_crit = {crit_key(t) for t in criteria_texts(raw)}
     for r in ctx.get("requests") or []:
-        crit = re.sub(r"\s+", " ", str(r.get("criterion") or "")).strip()[:300]
-        rid = r.get("id") or sig(r.get("param"), r.get("value"), r.get("why"), crit)[:6]
-        rs = "agent:%s:%s" % (rid, sig(r.get("param"), r.get("value"), r.get("rule")) if not crit else sig("criterion", crit))
-        if rs in st["requests_done"]:
+        pname = str(r.get("param") or "").strip()
+        crits = as_list(r.get("criterion")) + as_list(r.get("criteria")) + (as_list(r.get("value")) + as_list(r.get("rule")) if CRIT_PARAM.match(pname) else [])
+        why = re.sub(r"\s+", " ", str(r.get("why") or "")).strip()
+        scope = re.sub(r"\s+", " ", str(r.get("scope") or "")).strip()
+        rid = str(r.get("id") or "") or sig(pname, json.dumps(r.get("value")), why, json.dumps(crits))[:6]
+        if crits:
+            for crit in crits:
+                crit = crit[:700]
+                rs = "agent:%s:%s" % (rid, sig("criterion", crit))
+                if rs in st["requests_done"]:
+                    continue
+                st["requests_done"].append(rs)
+                action = "criterion " + crit
+                if crit_key(crit) in have_crit or any(p["action"] == action for p in proposals(raw)):
+                    continue
+                raw, pid = add_proposal(raw, "The agent proposes an acceptance criterion (%s): %s" % (rid, crit), action)
+                st["proposals"][pid] = {"sig": rs, "action": action, "agent": rid, "why": why[:1500], "scope": scope[:400], "kind": "criterion"}
+                notes.append("agent criterion %s waiting for your OK" % rid)
             continue
-        if crit:
-            action = "criterion " + crit
-            st["requests_done"].append(rs)
-            if crit_key(crit) in {crit_key(t) for t in criteria_texts(raw)} or any(p["action"] == action for p in proposals(raw)):
-                continue
-            raw, pid = add_proposal(raw, "The agent proposes an acceptance criterion (%s): %s. Why: %s" % (
-                rid, crit, (r.get("why") or "not given")[:300]), action)
-            st["proposals"][pid] = {"sig": rs, "action": action, "agent": rid}
-            notes.append("agent criterion %s waiting for your OK" % rid)
-            continue
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(r.get("param") or "")):
+        rs = "agent:%s:%s" % (rid, sig(r.get("param"), json.dumps(r.get("value")), r.get("rule")))
+        if rs in st["requests_done"] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", pname):
             continue
         name = str(r["param"]).upper()
         rule = re.match(r"^\s*(abs<=|<=|>=|==|<|>|in)\s+(.+)$", str(r.get("rule") or ""))
@@ -612,9 +649,13 @@ def upkeep(raw, ctx, st):
             continue
         if any(p["action"] == action for p in proposals(raw)):
             continue
+        for p in proposals(raw):   # the agent filed this request again, changed: the newer one replaces the older
+            if (st["proposals"].get(p["id"]) or {}).get("agent") == rid and (st["proposals"].get(p["id"]) or {}).get("kind") != "criterion":
+                st["proposals"].pop(p["id"], None)
+                raw = remove_proposal(raw, p["id"])
         raw, pid = add_proposal(raw, "The agent asks (%s): %s%s. Why: %s" % (rid, action.split(" ", 1)[1],
-                                                                          (" for %s" % r["scope"][:120]) if r.get("scope") else "", (r.get("why") or "not given")[:300]), action)
-        st["proposals"][pid] = {"sig": rs, "action": action, "agent": rid}
+                                                                          (" for %s" % scope[:160]) if scope else "", (why or "not given")[:300]), action)
+        st["proposals"][pid] = {"sig": rs, "action": action, "agent": rid, "why": why[:1500], "scope": scope[:400], "kind": "rule"}
         st["requests_done"].append(rs)
         notes.append("agent request %s waiting for your OK" % rid)
     return raw, notes
