@@ -427,6 +427,10 @@ CRIT_OP_LE = re.compile(r"(?i)(below|under|less than|lower than|smaller than|at 
 CRIT_OP_GE = re.compile(r"(?i)(above|over|greater than|more than|at least|>=|\u2265|>)")
 
 
+DONE_RX = re.compile(r"(?i)\b(?:goal|criteri\w*|targets?|thresholds?|requirements?)\s+(?:is|are|was|were|has been|have been|now|all)\s+"
+                     r"(?:all\s+|fully\s+|now\s+)?(?:met|achieved|reached|satisfied|fulfilled|complete[d]?|passed)\b|"
+                     r"\b(?:meets|satisfies|is below|is under) the (?:target|threshold|criteri\w*)\b|"
+                     r"\bgoal (?:is )?(?:complete|done|accomplished)\b|\ball (?:acceptance )?criteria (?:are )?(?:met|satisfied|pass(?:ed)?)\b")
 ML_ERR_RX = re.compile(r"\b(rmse|mae|errors?|accuracy|accurate|tests?|tested|testing|validation|validate|held[- ]out|deviation|dp test|"
                        r"predict\w*|model|potential)\b", re.I)
 
@@ -2479,7 +2483,7 @@ def analyze_goal(gdesc, shared):
     measured.sort(key=lambda m: m.get("epoch") or 0)
     claims = [dict(cl, who=s.get("label"), epoch=iso_epoch(cl.get("ts"))) for s in (fam or sessions) for cl in s.get("claims", [])]
     done_claims = [dict(d, who=s.get("label"), epoch=iso_epoch(d.get("ts"))) for s in (fam or sessions) for d in s.get("done_claims", [])
-                   if not ANSWER_RX.match(d.get("text") or "")]   # an answer about a dashboard item is not a claim the goal is met
+                   if not ANSWER_RX.match(d.get("text") or "") and DONE_RX.search(d.get("text") or "")]   # a plain "it's met", not an item answer
     crit_rows = []
     for c in criteria:
         row = {"text": c["text"], "src": c.get("src"), "parsed": c.get("parsed"), "status": "referee"}

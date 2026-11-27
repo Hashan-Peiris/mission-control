@@ -73,6 +73,11 @@ for _c in CFG.get("custom_metrics", []) or []:
 # ---------------------------------------------------------------- result metrics (DeePMD and friends)
 DP_LINE = re.compile(r"(Energy|Force|Virial)\s+(MAE|RMSE)(/Natoms)?\s*:\s*([-+]?[0-9.]+(?:[eE][-+]?\d+)?)\s*(\S*)")
 GENERIC_ATOM = re.compile(r"(?i)\b(?:energy|e)[ _-]*(rmse|mae)[ _-]*(?:per[ _-]?atom|/atom|/natoms)\b\s*[:=]?\s*([-+]?[0-9.]+(?:[eE][-+]?\d+)?)\s*(meV|eV)\b")
+# the agent saying the goal or its targets are met (a plain statement, not a plan or a list of steps)
+DONE_RX = re.compile(r"(?i)\b(?:goal|criteri\w*|targets?|thresholds?|requirements?)\s+(?:is|are|was|were|has been|have been|now|all)\s+"
+                     r"(?:all\s+|fully\s+|now\s+)?(?:met|achieved|reached|satisfied|fulfilled|complete[d]?|passed)\b|"
+                     r"\b(?:meets|satisfies|is below|is under) the (?:target|threshold|criteri\w*)\b|"
+                     r"\bgoal (?:is )?(?:complete|done|accomplished)\b|\ball (?:acceptance )?criteria (?:are )?(?:met|satisfied|pass(?:ed)?)\b")
 CLAIM_RE = re.compile(r"(?i)([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?\d+)?)\s*(meV|eV)\s*/\s*(atom|at)\b")
 
 
@@ -742,8 +747,7 @@ def add_agent(st, ts, text):
             v = float(m.group(1)) * (1e-3 if m.group(2).lower() == "mev" else 1.0)
             push(st.setdefault("claims", []), {"ts": ts, "metric": "energy_%s_atom" % ("mae" if re.search(r"(?i)\bmae\b", ctx) else "rmse"),
                                                "value": v, "context": re.sub(r"\s+", " ", ctx)[:240]}, 60)
-    if re.search(r"(?i)((goal|criteri\w*|target|threshold|requirement)s?\b.{0,40}\b(met|achieved|reached|satisfied|fulfilled|complete[d]?)\b|"
-                 r"\b(meets|satisf(y|ies)|below) the (target|threshold|criteri\w*)|goal (is )?(complete|done|accomplished))", text):
+    if DONE_RX.search(text):
         push(st.setdefault("done_claims", []), {"ts": ts, "text": trunc(re.sub(r"\s+", " ", text), 300)}, 20)
 
 
