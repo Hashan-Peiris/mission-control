@@ -1,0 +1,12 @@
+{
+  "attribution": {
+    "commit": "",
+    "sessionUrl": false
+  },
+  "env": {
+    "GIT_AUTHOR_NAME": "Mission Control automation",
+    "GIT_AUTHOR_EMAIL": "claude@automation.invalid",
+    "GIT_COMMITTER_NAME": "Mission Control automation",
+    "GIT_COMMITTER_EMAIL": "claude@automation.invalid"
+  }
+}
