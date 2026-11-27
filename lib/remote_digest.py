@@ -735,6 +735,7 @@ def add_agent(st, ts, text):
         push(st.setdefault("item_answers", []), {"ts": ts, "id": m.group(1), "status": m.group(2), "note": trunc(m.group(3).strip(), 400)}, 120)
     add_msg(st, ts, "agent", text.strip())
     scan_shortcuts(st, ts, "agent message", text)
+    text = ANSWER_LINE.sub("", text)   # its answers about dashboard items are not claims about the goal
     for m in CLAIM_RE.finditer(text):
         ctx = text[max(0, m.start() - 120): m.end() + 40]
         if re.search(r"(?i)rmse|mae|error|accura|deviation", ctx):
