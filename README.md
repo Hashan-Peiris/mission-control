@@ -103,14 +103,18 @@ a line saying what makes it go away by itself, and two buttons:
   in the section) with its id and your question (or "is this intended? fix it if not"). The agent answers
   one line per item, `I3fa21: fixed | intended | explained | working | need_decision - reason`, in its
   reply or in `.mc/answers.jsonl` in its folder, and the answer shows under the item. An item shows as
-  asked only once the message went out; a sleeping or busy agent answers when it gets to it.
-- **Mark OK** (or **Accept the answer**, once the agent has explained) quiets an item you judged fine:
-  it stops counting as red or amber until it changes, for 7 days at most. Undo OK brings it back.
+  asked only once the message went out; the dashboard collects again about 2 minutes later so the answer
+  shows up sooner, and a sleeping or busy agent answers when it gets to it.
+- **Dismiss** (or **Accept the answer**, once the agent has explained) hides an item you judge a non-issue:
+  it stops counting and folds into "Dismissed (N)" at the end of its section until it changes, for 7 days
+  at most. **Bring back** undoes it. Only the agent's requests can't be dismissed: approve or reject them.
 
 Decisions on the contract go both ways too: the agent asks for a change in `.mc/requests.jsonl`
 (setting, value, why, scope) and you choose **Allow for this request** (recorded as an amendment, the rule
 stays), **Change the rule** (the rule itself is widened), or **Reject**; the agent is told either way, and
-every change you make yourself (lock, unlock, allow, criteria, Make binding) is sent to it as well.
+every change you make yourself (lock, unlock, allow, criteria, Make binding) is sent to it as well. The agent
+can also propose acceptance criteria there (`"criterion": "..."`), which you add one by one or with
+**Add all**.
 Edits that only mention a setting in notes or docs (`.md`, `.txt`, ...) are not counted as changes, values
 are compared the way VASP reads them (`0.10` = `0.1`, `T` = `.TRUE.`, `Acc` = `Accurate`), and an edit the
 agent already asked you about shows as "waiting for your decision" instead of a second alarm.
@@ -276,7 +280,8 @@ With a single goal running, you can leave out `--goal`.
   - bursts of quick failures while they may still be happening (cleared once a later job runs fine),
     duplicate submissions (tasks of one array job don't count) and long-pending jobs (jobs on hold
     are shown as a note, jobs waiting on another job are left alone, and jobs whose dependency failed
-    are flagged because they can never start)
+    are flagged because they can never start). A job run from another session's folder shows on that
+    session's page, not on every page.
   - low CPU efficiency
   - idle GPUs that are holding memory
   - which agent submitted each job

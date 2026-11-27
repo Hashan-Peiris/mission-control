@@ -95,7 +95,9 @@ def never_note():
 
 def compute_note():
     have = (["Rockfish"] if CFG["rf"] else []) + (["Skipjack"] if CFG["sj"] else []) + CFG["nodes"].split()
-    return "- allowed: %s\n%s" % (", ".join(have) or "(clusters and nodes this goal may use)",
+    # tagged auto: a guess (every host mission control watches) that the goal's own words may narrow
+    return "- allowed: %s\n%s" % ((", ".join(have) + "   # auto: every watched host; narrow it if this goal uses fewer") if have else
+                                   "(clusters and nodes this goal may use)",
                                    ("- note: %s are never polled by mission control.\n" % " and ".join(w.capitalize() for w in NEVER)) if NEVER else "")
 SEV_ORDER = {"red": 0, "amber": 1, "info": 2, "ok": 4}
 # this PC as a host name in the dashboard (the collector's own WSL; a laptop's when it has taken over)
@@ -672,7 +674,15 @@ def contract_flags(flags, contract, cst, res, comp, node, gnode, codex_goal):
     cp = CT.parse_compute(raw)
     for p in CT.proposals(raw):   # changes that would loosen a rule: yours to decide
         meta = (cst.get("proposals") or {}).get(p["id"]) or {}
-        agent = bool(meta.get("agent")) or p["text"].startswith("The agent asks")
+        agent = bool(meta.get("agent")) or p["text"].startswith(("The agent asks", "The agent proposes"))
+        if p["action"].lower().startswith("criterion "):   # a proposed acceptance criterion: add it or not
+            flags.add("prop:%s" % p["id"], "amber", "goal", "The agent proposes an acceptance criterion", p["text"],
+                      "Add it to the contract, or reject it.", needs_you=True, crit=True,
+                      acts=[{"label": "Add it", "op": "approve", "pid": p["id"],
+                             "confirm": "Add this acceptance criterion to the contract?\n\n%s\n\nThe agent is told." % p["action"][10:]},
+                            {"label": "Reject", "op": "reject", "pid": p["id"], "danger": True,
+                             "confirm": "Reject %s?\n\nThe agent is told." % p["id"]}])
+            continue
         flags.add("prop:%s" % p["id"], "red" if agent else "amber", "goal",
                   "The agent asks to change a rule" if agent else "A change would loosen the contract", p["text"],
                   "Allow it for this request only, change the rule for good, or reject it.", needs_you=True,
@@ -713,7 +723,7 @@ def contract_flags(flags, contract, cst, res, comp, node, gnode, codex_goal):
     if not contract["criteria"] and NOW - (cst.get("first_seen") or NOW) > 86400:
         flags.add("contract:nocrit", "amber", "integrity", "No acceptance criteria yet",
                   "Without them the checks can't tell finished from unfinished work.",
-                  "Add one in the Scientific integrity card, e.g. force error <= 30 meV/A.")
+                  "Add one in the Scientific integrity card (e.g. force error <= 30 meV/A), or ask the agent to propose some.")
 
 
 def cmd_contract_edit(key, req):
@@ -803,7 +813,8 @@ def cmd_contract_edit(key, req):
                 lines = ["- %s \u00b7 %s%s" % (f["id"], f["title"], (" \u00b7 " + trunc(f.get("detail") or "", 260)) if f.get("detail") else "") for f in items[:25]]
                 agent_msg = ("[mission control] The user asks about %s on the dashboard:\n%s\n\n%s\n\nAnswer each on its own line, starting with "
                              "its id: \"%s: fixed | intended | explained | working | need_decision - short reason\". If one needs a contract "
-                             "change, also file a request in .mc/requests.jsonl (param, value, why, scope).") % (
+                             "change, also file a request in .mc/requests.jsonl (param, value, why, scope; or criterion and why to propose "
+                             "an acceptance criterion).") % (
                     "this item" if len(items) == 1 else "these %d items" % len(items), "\n".join(lines),
                     "Question: " + q if q else "Question: is this intended? If it is a mistake, fix it; if it needs a contract change, ask for it.",
                     items[0]["id"])
@@ -817,20 +828,28 @@ def cmd_contract_edit(key, req):
                     return out(False, "That item isn't on the page any more.")
                 if op == "ack":
                     if f["key"].startswith(NO_ACK):
-                        return out(False, "This one waits for a decision or an answer, so it can't just be marked OK.")
+                        return out(False, "The agent waits for your decision on this one: approve or reject it.")
                     ist.setdefault("acks", {})[f["key"]] = {"sig": item_sig(f), "note": trunc(str(req.get("text") or "").strip(), 300), "t": time.time()}
-                    msg = "Marked OK; it stays quiet until it changes (7 days at most)"
+                    msg = "Dismissed. It stays hidden until it changes (7 days at most), under Dismissed in its section"
                 else:
                     (ist.get("acks") or {}).pop(f["key"], None)
-                    msg = "It counts again"
+                    msg = "Brought back"
             items_save(ipath, ist)
-            return out(True, msg + ". The page catches up at the next update.")
+            return out(True, msg + ".")
         elif op in ("approve", "reject", "approve_once"):
-            raw, msg, info = CT.decide(raw, st, str(req.get("pid") or ""), op != "reject", once=op == "approve_once")
-            if info.get("agent"):
-                agent_msg = ("[mission control] Your request %s was approved by the user: %s." % (info["agent"], msg) if op != "reject" else
-                             "[mission control] Your request %s (%s) was not approved. Keep to the contract as it is." % (
-                                 info["agent"], info["action"].split(" ", 1)[1]))
+            pids = [x for x in re.split(r"[,\s]+", str(req.get("pid") or "")) if x][:40]
+            msgs, told = [], []
+            for pid in pids or [""]:
+                raw, m1, info = CT.decide(raw, st, pid, op != "reject", once=op == "approve_once")
+                msgs.append(m1)
+                if info.get("agent"):
+                    told.append("Your request %s was approved by the user: %s." % (info["agent"], m1) if op != "reject" else
+                                "Your request %s (%s) was not approved.%s" % (info["agent"], info["action"].split(" ", 1)[1],
+                                                                             "" if info["action"].lower().startswith("criterion") else
+                                                                             " Keep to the contract as it is."))
+            msg = msgs[0] if len(msgs) == 1 else "%s %d changes: %s" % ("Rejected" if op == "reject" else "Approved", len(msgs), "; ".join(msgs))
+            if told:
+                agent_msg = "[mission control] " + ("\n".join(told) if len(told) > 1 else told[0])
         elif op == "goal_sync":
             cg = (snap.get("ccard") or {}).get("codex_goal") or ""
             if not cg:
@@ -871,13 +890,13 @@ def cmd_contract_edit(key, req):
 
 # ---------------------------------------------------------------- items on the page: ask the agent, its answers, your OK
 # Every flag gets a short id (I3fa21). "Ask agent" sends the agent the items with their ids; it answers one line each
-# ("I3fa21: intended - ...") in its reply or in .mc/answers.jsonl, and the answer shows under the item. "Mark OK" quiets an
+# ("I3fa21: intended - ...") in its reply or in .mc/answers.jsonl, and the answer shows under the item. "Dismiss" quiets an
 # item you have judged fine until it changes. Each item also says what makes it go away by itself.
 ANSWER_RX = re.compile(r"(?im)^\W{0,6}(I[0-9a-f]{5})\W{0,3}\s*[:\-\u2013\u2014]?\s*\**\s*(fixed|intended|explained|working|need[_ ]decision|won'?t fix|wontfix)\b"
                        r"\**\s*[:\-\u2013\u2014.,]?\s*(.*)$")
 ANSWER_WORDS = {"fixed": "fixed it", "intended": "intended", "explained": "explained", "working": "working on it",
                 "need_decision": "needs your decision", "wontfix": "won\u2019t change it"}
-NO_ACK = ("prop:", "pane:")   # these wait for a decision or an answer; they can't just be marked OK
+NO_ACK = ("prop:",)   # the agent's requests wait for your decision (Reject is how you turn one down)
 
 
 def items_save(path, ist):
@@ -891,8 +910,9 @@ def item_id(key):
     return "I" + hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:5]
 
 
-def item_sig(f):   # what an OK holds for: the item and its kind of finding (counts may change)
-    return hashlib.sha1((f["key"] + re.sub(r"\d+", "#", f["title"])).encode("utf-8", "replace")).hexdigest()[:10]
+def item_sig(f):   # what a dismissal holds for: the item and its kind of finding (counts may change); for a question, that question
+    extra = ((f.get("q") or {}).get("sig") or f.get("detail") or "") if f["key"].startswith("pane:") else ""
+    return hashlib.sha1((f["key"] + re.sub(r"\d+", "#", f["title"]) + extra).encode("utf-8", "replace")).hexdigest()[:10]
 
 
 def clears_text(key, hours):
@@ -972,7 +992,7 @@ def items_decorate(flags, gkey, sessions, ndoc):
 
 
 def item_bar(f):
-    """Under each item on a session page: the agent's answer, what makes it go away, Ask agent, Mark OK."""
+    """Under each item on a session page: the agent's answer, what makes it go away, Ask agent, Dismiss."""
     if not f.get("gkey") or not f.get("id"):
         return ""
     o = ['<div class="ibar" data-ckey="%s">' % esc(f["gkey"])]
@@ -983,16 +1003,38 @@ def item_bar(f):
     elif f.get("asked"):
         o.append('<div class="ans mut">Asked the agent at %s; its answer shows here.</div>' % esc(hm(f["asked"])))
     if f.get("acked"):
-        o.append('<div class="ans mut">Marked OK by you %s%s</div>' % (esc(ago(f["acked"]["t"])), (" \u2014 " + esc(f["acked"]["note"])) if f["acked"].get("note") else ""))
+        o.append('<div class="ans mut">Dismissed by you %s%s</div>' % (esc(ago(f["acked"]["t"])), (" \u2014 " + esc(f["acked"]["note"])) if f["acked"].get("note") else ""))
     o.append('<div class="clr">%s</div><div class="ibtn">' % esc(f.get("clears") or ""))
     o.append('<button type="button" class="lnk" data-cop="ask" data-citems="%s">Ask agent</button>' % esc(f["id"]))
     if f.get("acked"):
-        o.append('<button type="button" class="lnk" data-cop="unack" data-citem="%s">Undo OK</button>' % esc(f["id"]))
-    elif not f["key"].startswith(NO_ACK) and f["sev"] != "info":   # notes don't count, so there is nothing to quiet
+        o.append('<button type="button" class="lnk" data-cop="unack" data-citem="%s">Bring back</button>' % esc(f["id"]))
+    elif not f["key"].startswith(NO_ACK):
         o.append('<button type="button" class="lnk" data-cop="ack" data-citem="%s">%s</button>' % (
-            esc(f["id"]), "Accept the answer" if a and a["status"] in ("intended", "explained", "wontfix") else "Mark OK"))
+            esc(f["id"]), "Accept the answer" if a and a["status"] in ("intended", "explained", "wontfix") else "Dismiss"))
     o.append('<span class="iid" title="Item id, for asking about it">%s</span></div><div class="actmsg"></div></div>' % esc(f["id"]))
     return "".join(o)
+
+
+def flag_list_html(items):
+    """A section's items: open ones first, the ones you dismissed folded away below (Bring back undoes it)."""
+    live = [f for f in items if not f.get("acked")]
+    gone = [f for f in items if f.get("acked")]
+    o = [flag_html(f) for f in live]
+    if gone:
+        if not live:
+            o.append('<div class="empty">Nothing open.</div>')
+        o.append('<details class="fold dism"><summary>Dismissed (%d)</summary>%s</details>' % (len(gone), "".join(flag_html(f) for f in gone)))
+    return "".join(o)
+
+
+def add_all_btn(needs, gkey):
+    crits = [f for f in needs if f.get("crit")]
+    if len(crits) < 2 or not gkey:
+        return ""
+    return ('<span class="cacts askall" data-ckey="%s"><button type="button" class="lnk" data-cop="approve" data-cpid="%s" data-cconfirm="%s">'
+            'Add all %d criteria</button><span class="actmsg"></span></span>') % (
+        esc(gkey), esc(",".join(f["key"][5:] for f in crits)), esc("Add all %d proposed acceptance criteria to the contract?\n\nThe agent is told." % len(crits)),
+        len(crits))
 
 
 def ask_all_btn(items, gkey, label):
@@ -1226,10 +1268,10 @@ class Flags:
     def __init__(self):
         self.items = []
 
-    def add(self, key, sev, area, title, detail="", action="", needs_you=False, q=None, acts=None):
+    def add(self, key, sev, area, title, detail="", action="", needs_you=False, q=None, acts=None, **extra):
         self.items = [f for f in self.items if f["key"] != key]   # one entry per item: the newest wins
-        self.items.append({"key": key, "sev": sev, "area": area, "title": title, "detail": detail,
-                           "action": action, "needs_you": needs_you or sev == "red", "q": q, "acts": acts or None})
+        self.items.append(dict({"key": key, "sev": sev, "area": area, "title": title, "detail": detail,
+                                "action": action, "needs_you": needs_you or sev == "red", "q": q, "acts": acts or None}, **extra))
 
     def sorted(self):
         return sorted(self.items, key=lambda f: (SEV_ORDER.get(f["sev"], 3), f["area"]))
@@ -1694,6 +1736,13 @@ def analyze_goal(gdesc, shared):
     res = []
     tot_alloc = tot_idle = tot_failed = tot_lost = gpu_h = 0.0
     low_eff_jobs, quick_fails = [], {}
+    my_dirs = (shared.get("goal_dirs") or {}).get(gkey) or []
+    other_dirs = [c for k, v in (shared.get("goal_dirs") or {}).items() if k != gkey for c in v]
+
+    def elsewhere(wd):   # a job run from another session's folder (and not from this one's): flagged on that session's page
+        wd = str(wd or "").rstrip("/")
+        inside = lambda dirs: any(wd == c or wd.startswith(c + "/") for c in dirs)
+        return bool(wd) and not inside(my_dirs) and inside(other_dirs)
     running_cores = 0
     for c in clusters:
         r = sum(1 for j in c["jobs"] if j.get("State") == "RUNNING")
@@ -1721,14 +1770,14 @@ def analyze_goal(gdesc, shared):
             if stt in ("FAILED", "OUT_OF_MEMORY", "DEADLINE"):
                 failed += ch
                 nfail += 1
-                if el < 300:
+                if el < 300 and not elsewhere(a.get("WorkDir")):
                     stem = re.sub(r"[\d_\-.]+$", "", a.get("JobName", "")) or a.get("JobName", "")
                     quick_fails.setdefault((c["name"], stem), []).append(a)
             else:
                 idle_part = max(0.0, ch - used)
                 idle += idle_part
                 eff = used / ch if ch else 1
-                if eff < CFG["low_eff"] and el > 600 and ncpu > 1 and stt == "COMPLETED":
+                if eff < CFG["low_eff"] and el > 600 and ncpu > 1 and stt == "COMPLETED" and not elsewhere(a.get("WorkDir")):
                     low_eff_jobs.append((c["name"], a, eff))
         tot_alloc += alloc
         tot_idle += idle
@@ -1736,7 +1785,7 @@ def analyze_goal(gdesc, shared):
         tot_lost += lost
         long_pd, held, never = [], [], []
         for j in c["jobs"]:
-            if j.get("State") == "PENDING":
+            if j.get("State") == "PENDING" and not elsewhere(j.get("WorkDir")):
                 sub = iso_epoch(j.get("Submit"))
                 why = str(j.get("Reason") or "").strip("() ")
                 if why == "DependencyNeverSatisfied":
@@ -1765,7 +1814,7 @@ def analyze_goal(gdesc, shared):
                           j.get("JobID"), trunc(j.get("Name"), 40), ago(sorted(held, key=lambda x: x[0])[0][0])), "")
         seen = {}
         for j in c["jobs"]:
-            if j.get("State") in ("RUNNING", "PENDING"):
+            if j.get("State") in ("RUNNING", "PENDING") and not elsewhere(j.get("WorkDir")):
                 k = (j.get("Name"), j.get("WorkDir"))
                 seen.setdefault(k, []).append(j.get("JobID"))
         for (nm, wd), ids in seen.items():
@@ -1819,7 +1868,7 @@ def analyze_goal(gdesc, shared):
     if low_eff_jobs:
         low_eff_jobs.sort(key=lambda x: x[2])
         cl, a, eff = low_eff_jobs[0]
-        flags.add("loweff:%s" % cl, "amber", "compute",
+        flags.add("loweff:%s:%s" % (cl, a.get("JobID")), "amber", "compute",
                   "%d finished job(s) used under %d%% of their CPUs" % (len(low_eff_jobs), CFG["low_eff"] * 100),
                   "Worst: %s %s on %s at %d%% of %s cores" % (a.get("JobID"), trunc(a.get("JobName"), 30), cl, eff * 100, a.get("AllocCPUS")),
                   "Ask for fewer cores, or fix the parallel settings.")
@@ -1941,7 +1990,7 @@ def analyze_goal(gdesc, shared):
                   "%s at %s%s" % (trunc(ch["file"], 90), hm(iso_epoch(ch["ts"])),
                                    (" \u00b7 breaks %s %s%s" % (k, ("%s %s" % (rule.get("op"), rule.get("val"))), " from your goal" if rule.get("src") == "goal text" else " in the contract")) if ch["bad"] else
                                    (" \u00b7 you allowed %s = %s in an instruction" % (k, ch["new"]) if ok else "")),
-                  "" if sev == "info" else "Ask the agent about it, allow the value, or mark it OK.",
+                  "" if sev == "info" else "Ask the agent about it, allow the value, or dismiss it.",
                   acts=[{"label": "Allow %s" % norm_pv(ch["new"]), "op": "allow", "name": k, "value": norm_pv(ch["new"]),
                          "confirm": "Allow %s = %s? The rule is widened and an amendment is recorded." % (k, norm_pv(ch["new"]))}] if ch["bad"] else None)
     red_chg = {f["key"].split(":")[1] for f in flags.items if f["key"].startswith("chg:") and f["sev"] == "red"}
@@ -2066,6 +2115,8 @@ def analyze_goal(gdesc, shared):
             continue
         typed = [u for u in s.get("user", []) if u.get("typed")] or (s.get("user", []) if s.get("label") in (None, "main") else [])
         for u in typed:
+            if u["text"].lstrip().startswith("[mission control]"):   # mission control's own messages (asks, contract notes)
+                continue
             uid = hid(u["text"])
             instr.append({"id": uid, "ts": u.get("ts"), "who": s.get("label"), "host": s.get("host"),
                           "text": u["text"], "promoted": uid in promoted})
@@ -3025,6 +3076,12 @@ def analyze():
         n0 = (CFG["nodes"].split() or ["node"])[0]
         goals = [{"name": "(no goals)", "node": n0, "key": "_none", "tm": {}, "doc": None, "pseudo": True}]
     snaps = []
+    shared["goal_dirs"] = {}   # each session's working folders: jobs inside another session's folder are its business
+    for g in goals:
+        try:
+            shared["goal_dirs"][g["key"]] = [c.rstrip("/") for c in goal_doc(g).get("goal_cwds") or [] if c and c != "/"]
+        except Exception:  # noqa
+            pass
     for g in goals:
         snap = analyze_goal(g, shared)
         snaps.append(snap)
@@ -3090,9 +3147,10 @@ def overview(shared, snaps):
         if f["key"] not in seen:
             seen.add(f["key"])
             flags.append(dict(f))
+    gone = {f["key"] for x in snaps for f in x["flags"] if f.get("acked")}   # dismissed on a session page: not repeated here
     for x in snaps:
         for f in x["flags"]:
-            if f["area"] == "compute" and f["key"] not in seen:
+            if f["area"] == "compute" and f["key"] not in seen and f["key"] not in gone:
                 seen.add(f["key"])
                 flags.append(dict(f))
     for x in real:
@@ -3889,7 +3947,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  var q=b.getAttribute('data-cconfirm');if(form&&body.op==='set')q='Add the rule '+body.name.toUpperCase()+' '+body.rule_op+' '+body.val+'?';
  if(['set','allow','unlock','unwatch','criterion','uncriterion','amend','bind'].indexOf(body.op)>=0)q=(q||'Change the contract?')+'\n\nThe agent gets a short message about the change.';
  if(body.op==='ask'){var n=(body.items||'').split(',').length;var t=prompt('Ask the agent about '+(n>1?'these '+n+' items':'this item')+'.\nYour question (leave empty for: is this intended? fix it if not):','');if(t===null)return;body.text=t;q='';}
- else if(body.op==='ack'){var t2=prompt('Mark this item OK until it changes. Why is it OK? (optional, kept with it)','');if(t2===null)return;body.text=t2;q='';}
+ else if(body.op==='ack'){var t2=prompt('Dismiss this item? It stays hidden until it changes (7 days at most).\nWhy is it a non-issue? (optional, kept with it)','');if(t2===null)return;body.text=t2;q='';}
  if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say(body.op==='ask'?'Sending\u2026':'Saving\u2026','');
  post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
   if(j.ok&&(body.op==='ack'||body.op==='unack')){var fl=b.closest('.flag');if(fl)fl.classList.toggle('ok',body.op==='ack');}
@@ -4113,8 +4171,9 @@ def render(s):
     # needs you
     needs = [f for f in s["flags"] if f.get("needs_you")]
     if needs:
-        o.append('<section class="card"%s><h2>Needs you %s</h2>' % (sec("g", "needs"), ask_all_btn(needs, s["key"], "Ask the agent about all")))
-        o.extend(flag_html(f) for f in needs)
+        o.append('<section class="card"%s><h2>Needs you %s%s</h2>' % (sec("g", "needs"), add_all_btn(needs, s["key"]),
+                                                                       ask_all_btn(needs, s["key"], "Ask the agent about all")))
+        o.append(flag_list_html(needs))
         o.append("</section>")
     else:
         o.append('<div class="quiet"%s><span class="dot"></span>Nothing needs you right now%s</div>' % (
@@ -4165,7 +4224,7 @@ def render(s):
     integ = [f for f in s["flags"] if f["area"] == "integrity" and not f.get("needs_you")]
     o.append('<section class="card"%s><h2>Scientific integrity %s</h2>' % (sec("g", "integrity"), ask_all_btn(integ, s["key"], "Ask about these")))
     if integ:
-        o.extend(flag_html(f) for f in integ)
+        o.append(flag_list_html(integ))
     elif not any(f["area"] == "integrity" for f in s["flags"]):
         o.append('<div class="empty">No contract breaks, unexplained parameter changes or shortcut wording found.</div>')
     o.append(contract_card_html(s))
@@ -4179,7 +4238,7 @@ def render(s):
     other = [f for f in s["flags"] if f["area"] in ("goal", "compute", "connection") and not f.get("needs_you")]
     if other:
         o.append('<section class="card"%s><h2>Watchdog %s</h2>' % (sec("g", "watchdog"), ask_all_btn(other, s["key"], "Ask about these")))
-        o.extend(flag_html(f) for f in other)
+        o.append(flag_list_html(other))
         o.append("</section>")
 
     # timeline
