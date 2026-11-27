@@ -274,7 +274,9 @@ With a single goal running, you can leave out `--goal`.
 - **Compute**: Running and pending jobs come from Slurm, not from what the agents say. It also flags:
   - share of idle or failed core-hours over 48 h
   - bursts of quick failures while they may still be happening (cleared once a later job runs fine),
-    duplicate submissions and long-pending jobs
+    duplicate submissions (tasks of one array job don't count) and long-pending jobs (jobs on hold
+    are shown as a note, jobs waiting on another job are left alone, and jobs whose dependency failed
+    are flagged because they can never start)
   - low CPU efficiency
   - idle GPUs that are holding memory
   - which agent submitted each job

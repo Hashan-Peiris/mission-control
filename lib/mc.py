@@ -904,6 +904,8 @@ def clears_text(key, hours):
         "prop": "Goes away when you approve or reject it.",
         "pane": "Goes away when the question on the agent\u2019s screen is answered.",
         "pd": "Goes away when the jobs start or leave the queue.",
+        "held": "Goes away when the jobs are released or cancelled.",
+        "never": "Goes away when the jobs are cancelled or resubmitted.",
         "dup": "Goes away when one of the two jobs ends.",
         "waste": "Goes away when idle or failed time in the last %g h is back under the limit." % hours,
         "loweff": "Goes away when that job is older than %g h, or new jobs use their CPUs." % hours,
@@ -1732,25 +1734,43 @@ def analyze_goal(gdesc, shared):
         tot_idle += idle
         tot_failed += failed
         tot_lost += lost
-        long_pd = []
+        long_pd, held, never = [], [], []
         for j in c["jobs"]:
             if j.get("State") == "PENDING":
                 sub = iso_epoch(j.get("Submit"))
-                if sub and NOW - sub > CFG["pending_h"] * 3600:
-                    long_pd.append(j)
-        if long_pd:
-            j = long_pd[0]
+                why = str(j.get("Reason") or "").strip("() ")
+                if why == "DependencyNeverSatisfied":
+                    never.append((sub or NOW, j))
+                elif why == "Dependency":
+                    continue   # waiting for another job, as planned
+                elif sub and NOW - sub > CFG["pending_h"] * 3600:
+                    (held if why == "JobHeldUser" else long_pd).append((sub, j))
+        if never:
+            j = sorted(never, key=lambda x: x[0])[0][1]
+            flags.add("never:%s:%s" % (c["name"], j.get("JobID")), "amber", "compute",
+                      "%d job(s) on %s can never start: the job they wait for failed" % (len(never), c["name"]),
+                      "e.g. %s (%s)" % (j.get("JobID"), trunc(j.get("Name"), 40)),
+                      "Cancel them, or resubmit without the dependency.")
+        if long_pd:   # keyed by the oldest one, so the item (and your OK) stays the same until it starts
+            j = sorted(long_pd, key=lambda x: x[0])[0][1]
             flags.add("pd:%s:%s" % (c["name"], j.get("JobID")), "amber", "compute",
                       "%d job(s) pending over %g h on %s" % (len(long_pd), CFG["pending_h"], c["name"]),
                       "e.g. %s (%s), reason %s" % (j.get("JobID"), trunc(j.get("Name"), 40), j.get("Reason")),
                       "Consider moving them to a less busy partition or cluster.")
+        if held:   # put on hold on purpose (scontrol hold): worth knowing, not a queue problem
+            j = sorted(held, key=lambda x: x[0])[0][1]
+            flags.add("held:%s:%s" % (c["name"], j.get("JobID")), "info", "compute",
+                      "%d job(s) on hold on %s" % (len(held), c["name"]),
+                      "e.g. %s (%s), submitted %s; it starts after scontrol release" % (
+                          j.get("JobID"), trunc(j.get("Name"), 40), ago(sorted(held, key=lambda x: x[0])[0][0])), "")
         seen = {}
         for j in c["jobs"]:
             if j.get("State") in ("RUNNING", "PENDING"):
                 k = (j.get("Name"), j.get("WorkDir"))
                 seen.setdefault(k, []).append(j.get("JobID"))
         for (nm, wd), ids in seen.items():
-            if len(ids) > 1 and nm:
+            # tasks of one array job (123_0, 123_1) share a name and folder on purpose
+            if len(ids) > 1 and nm and len({str(x).split("_")[0] for x in ids}) > 1:
                 flags.add("dup:%s:%s" % (c["name"], nm), "amber", "compute",
                           "Possible duplicate jobs on %s: %s" % (c["name"], trunc(nm, 40)),
                           "%d jobs share a name and folder: %s" % (len(ids), ", ".join(ids[:6])),
