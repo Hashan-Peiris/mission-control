@@ -19,7 +19,8 @@ lock you out of a cluster with failed logins and never needs your credentials.
 ## What it looks like
 
 The screenshots below come from a made-up demo: a Codex agent computing elastic constants with VASP
-and a Claude Code agent fine-tuning a machine-learned potential, on one compute node.
+and a Claude Code agent fine-tuning a machine-learned potential, on one compute node. The pages follow
+your system's dark or light setting; these are dark.
 
 **The dashboard.** What needs you across all sessions comes first: here, a question on the agent's
 screen you can answer with one tap, a rule change it asked for, an edit that broke the contract, and
@@ -49,7 +50,7 @@ summary folded in place and a box to message the agent as if you were at its ter
 ![The conversation](docs/img/conversation.png)
 
 **The working folder** (under Resources): its size over two days, what kind of files fill it, the biggest
-files, and every 50 GB crossed. **On the phone**, the same pages, in dark mode here.
+files, and every 50 GB crossed. **On the phone**, the same pages, laid out for a narrow screen.
 
 <p><img src="docs/img/storage.png" alt="The working folder" width="49%"> <img src="docs/img/phone-overview.png" alt="The dashboard on a phone" width="24%"> <img src="docs/img/phone-session.png" alt="A session page on a phone" width="24%"></p>
 
