@@ -2959,7 +2959,7 @@ def md(text):
 CONV_JS = r"""
 (function(){
 var D=window.MC_CONV||[],L=document.getElementById('list'),Q=document.getElementById('q'),O=document.getElementById('order'),KEY=document.body.getAttribute('data-key');
-var ROLES=['agent','sub','user','task','event','review'],pending=[];
+var ROLES=['agent','sub','user','task','event','review'],P=window.MCP;
 var NAME={agent:'Agent',sub:'Sub-agent',user:'You',task:'Task for',event:'Event',review:'Approval reviewer'},AV={agent:'A',task:'→',review:'✓'};
 var TEX={times:'×',cdot:'·',approx:'≈',le:'≤',leq:'≤',ge:'≥',geq:'≥',pm:'±',to:'→',rightarrow:'→',sim:'~',ne:'≠',neq:'≠',infty:'∞',
  Delta:'Δ',delta:'δ',mu:'μ',sigma:'σ',alpha:'α',beta:'β',gamma:'γ',theta:'θ',lambda:'λ',pi:'π',epsilon:'ε',AA:'Å',circ:'°',degree:'°',',':' ',';':' ','!':'',' ':' ','%':'%'};
@@ -2988,15 +2988,16 @@ function idOf(m){return m.e+'|'+m.r+'|'+m.x.length+'|'+m.x.slice(0,60);}
 function atBottom(){return window.innerHeight+window.scrollY>=document.body.scrollHeight-160;}
 function toLatest(){if(O.value==='new')window.scrollTo(0,0);else window.scrollTo(0,document.body.scrollHeight);}
 function render(){var q=(Q.value||'').toLowerCase();
- var items=D.filter(function(m){return on(m.r)&&(!q||m.x.toLowerCase().indexOf(q)>=0);}).concat(q?[]:pending);
+ var items=D.filter(function(m){return on(m.r)&&(!q||m.x.toLowerCase().indexOf(q)>=0);}).concat(q||!P?[]:P.list().map(function(p){return {e:p.e,r:'user',x:p.x,pend:p};}));
  if(O.value==='new')items=items.slice().reverse();
  var h=[],lastDay='',pk=null,pe=0;
  items.forEach(function(m){var d=day(m.e);if(d!==lastDay){h.push('<div class="day"><span>'+d+'</span></div>');lastDay=d;pk=null;}
   if(m.r==='event'){h.push('<div class="evt"><span>'+inl(m.x)+' · '+tm(m.e)+'</span></div>');pk=null;return;}
+  if(m.pend){h.push(P.row(m.pend));pk=null;return;}
   if(m.r==='compact'){h.push('<details class="cmp"><summary>Context compacted · '+tm(m.e)+' · the agent carries on from this summary</summary><div class="mb">'+md(m.x)+'</div></details>');pk=null;return;}
   var k=m.r+'|'+(m.w||''),cont=k===pk&&Math.abs(m.e-pe)<600;pk=k;pe=m.e;
   var long=m.x.length>2200||m.x.split('\n').length>26;
-  h.push('<div class="row r-'+m.r+(cont?' cont':'')+(m.pending?' pending':'')+'">'+(m.r==='user'?'':'<div class="av">'+av(m)+'</div>')+
+  h.push('<div class="row r-'+m.r+(cont?' cont':'')+'">'+(m.r==='user'?'':'<div class="av">'+av(m)+'</div>')+
    '<div class="bub">'+(cont?'':'<div class="mh"><span class="who">'+who(m)+'</span><span class="tm">'+tm(m.e)+'</span>'+(m.md?'<span class="mdl">'+esc(m.md)+'</span>':'')+'</div>')+
    '<div class="mb'+(long?' clip':'')+'" title="'+tm(m.e)+'">'+md(m.x)+'</div>'+(long?'<button class="more">Show all</button>':'')+'</div></div>');});
  L.innerHTML=h.join('')||'<div class="empty">No messages match.</div>';
@@ -3007,20 +3008,23 @@ try{var so=localStorage.getItem('mc.order');if(so)O.value=so;}catch(e){}
 O.addEventListener('change',function(){try{localStorage.setItem('mc.order',O.value);}catch(e){}render();toLatest();});
 ROLES.forEach(function(r){var el=document.getElementById('f_'+r);if(el)el.addEventListener('change',function(){el.parentNode.classList.toggle('off',!el.checked);render();});});
 document.getElementById('jump').addEventListener('click',toLatest);
-document.addEventListener('mc-sent',function(ev){pending.push({t:'',e:Date.now()/1000,r:'user',w:'',x:ev.detail.text,pending:true});render();toLatest();});
-D.sort(function(a,b){return a.e-b.e;});render();toLatest();
+function mine(){return D.filter(function(m){return m.r==='user';});}
+var np=P?P.list().length:0;
+if(P)P.on(function(){var n=P.list().length,grew=n>np;np=n;render();if(grew||atBottom())toLatest();});
+D.sort(function(a,b){return a.e-b.e;});if(P)P.seen(mine());render();toLatest();
 // opened with mctl (http): pick up new messages every minute without reloading the page
 if(/^https?:/.test(location.protocol)){var pad=function(n){return (n<10?'0':'')+n;};
  window.mcConvPoll=function(){var d=new Date(),f='conv/'+encodeURIComponent(KEY)+'/'+d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'.js';
   fetch(f,{cache:'no-store'}).then(function(r){return r.ok?r.text():'';}).then(function(t){var i=t.indexOf('MC_CONV,'),j=t.lastIndexOf(');');if(i<0||j<0)return;
    var arr=JSON.parse(t.slice(i+8,j)),seen={},add=0,bottom=atBottom();D.forEach(function(m){seen[idOf(m)]=1;});
-   arr.forEach(function(m){if(!seen[idOf(m)]){D.push(m);add++;if(m.r==='user')pending=pending.filter(function(p){return p.x.trim()!==m.x.trim();});}});
-   if(add){D.sort(function(a,b){return a.e-b.e;});render();if(bottom)toLatest();}}).catch(function(){});};
+   arr.forEach(function(m){if(!seen[idOf(m)]){D.push(m);add++;}});
+   if(add){D.sort(function(a,b){return a.e-b.e;});if(P)P.seen(mine());render();if(bottom)toLatest();}}).catch(function(){});};
  setInterval(window.mcConvPoll,30000);document.addEventListener('visibilitychange',function(){if(!document.hidden)window.mcConvPoll();});}
 })();
 """
 
 CONV_CSS = """
+.hback{color:inherit;text-decoration:none}.hback:hover{text-decoration:underline;text-underline-offset:4px}
 .ctl{position:sticky;top:var(--abh,48px);z-index:10;background:color-mix(in srgb,var(--bg) 88%,transparent);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
 padding:10px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;border-bottom:1px solid var(--line);margin-bottom:4px}
 .ctl input[type=search]{flex:1;min-width:200px;padding:8px 14px;border-radius:99px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:14px}
@@ -3134,10 +3138,13 @@ def appbar(nav, cur=None, where="root", conv=False, collected=None):
     for h in order:
         parts.append('<span class="hg">%s</span>' % esc(LOGIN_HOSTS.get(h, h)))
         for n in groups[h]:
-            href = pre + n["key"] + (".conversation.html" if conv and n.get("conv") else ".html")
+            # On a conversation page the other pills stay in conversation view, and this session's own pill goes back to its session page.
+            back = conv and n["key"] == cur
+            href = pre + n["key"] + (".conversation.html" if conv and n.get("conv") and not back else ".html")
+            tip = "Back to the %s session page" % n["name"] if back else "%s on %s" % (n["name"], h)
             dot = "gray" if n.get("dim") else {"red": "red", "amber": "amber"}.get(n.get("sev"), "")
-            parts.append('<a class="np%s%s" style="%s" href="%s" title="%s on %s"><span class="dot %s"></span>%s</a>' % (
-                " cur" if n["key"] == cur else "", " dim" if n.get("dim") else "", hue(n["key"]), esc(href), esc(n["name"]), esc(h), dot,
+            parts.append('<a class="np%s%s" style="%s" href="%s" title="%s"><span class="dot %s"></span>%s</a>' % (
+                " cur" if n["key"] == cur else "", " dim" if n.get("dim") else "", hue(n["key"]), esc(href), esc(tip), dot,
                 esc(trunc(n["name"], 30))))
     newb = ('<button class="pill newb" id="mc-new" type="button" title="Start a new agent session in tmux">+ New session</button>'
             if LAUNCH.get("hosts") else "")
@@ -3374,14 +3381,14 @@ def write_conv_page(snap, nav):
         for r, lab in ROLE_CHIPS if counts.get(r))
     scripts = "".join('<script src="conv/%s/%s.js"></script>' % (esc(gkey), esc(d)) for d in cv.get("days") or [])
     page = ('<!doctype html><html lang="en"><head>%s<title>%s \u00b7 conversation</title><style>%s%s</style></head><body class="convpage" data-key="%s" style="%s">%s<main class="chatpage">'
-            '<header><div><h1>%s</h1><p class="sub">%s on %s \u00b7 <span id="n"></span> \u00b7 new messages appear by themselves when opened with mctl</p></div>'
+            '<header><div><h1><a class="hback" href="%s.html" title="Back to the session page">%s</a></h1><p class="sub">%s on %s \u00b7 <span id="n"></span> \u00b7 new messages appear by themselves when opened with mctl</p></div>'
             '<a class="np" href="%s.html">\u2190 Session page</a></header>'
             '<div class="ctl"><input id="q" type="search" placeholder="Search the conversation">%s'
             '<select id="order"><option value="chat">Chat order</option><option value="new">Newest first</option></select><button id="jump">Latest \u2193</button></div>'
             '<div id="list" class="chat"></div><div class="composer">%s</div></main>%s<script>%s</script>%s</body></html>') % (
-        HEAD_META, esc(gname), CSS, CONV_CSS, esc(gkey), hue(gkey), appbar(nav, gkey, "goals", True, snap.get("collected")), esc(gname),
+        HEAD_META, esc(gname), CSS, CONV_CSS, esc(gkey), hue(gkey), appbar(nav, gkey, "goals", True, snap.get("collected")), esc(gkey), esc(gname),
         esc((snap["goal"].get("agent_kind") or "agent").capitalize()), esc(LOGIN_HOSTS.get(snap.get("node_name"), snap.get("node_name") or "?")),
-        esc(gkey), chips, send_box(snap, compact=True), scripts, CONV_JS, SEND_JS + REFRESH_JS + TOOLS_JS)
+        esc(gkey), chips, send_box(snap, compact=True), scripts + PEND_JS, CONV_JS, SEND_JS + REFRESH_JS + TOOLS_JS)
     fp = os.path.join(MC_DIR, "goals", gkey + ".conversation.html")
     if rd(fp) != page:
         with open(fp, "w", encoding="utf-8") as f:
@@ -3878,7 +3885,11 @@ footer{color:var(--faint);font-size:12px;margin-top:18px;line-height:1.7}svg.sp{
 .r-user .bub{background:var(--c-you);color:#fff;border-color:transparent;border-radius:20px 20px 6px 20px;max-width:min(76%,680px)}.r-user.cont .bub{border-top-right-radius:8px}
 .r-user .bub .who,.r-user .bub .tm{color:rgba(255,255,255,.82)}.r-user .mb code{background:rgba(255,255,255,.16);border-color:transparent;color:#fff}
 .r-user .mb pre{background:rgba(0,0,0,.24);border-color:transparent;color:#fff}.r-user .more{color:#fff;border-color:rgba(255,255,255,.55)}
-.row.pending .bub{opacity:.8}.row.pending .tm:after{content:" · sent"}
+.row.pend .bub{background:var(--t-you);color:var(--mut);border:1px dashed color-mix(in srgb,var(--c-you) 60%,transparent);box-shadow:none}.row.pend .bub .who,.row.pend .bub .tm{color:var(--mut)}.pw{white-space:pre-wrap}
+.pst{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11.5px;color:var(--mut)}.pend.warn .pst{color:var(--amb)}.pend.bad .pst{color:var(--red)}
+.pend.warn .bub{border-color:color-mix(in srgb,var(--amb) 60%,transparent)}.pend.bad .bub{border-color:color-mix(in srgb,var(--red) 60%,transparent)}
+.pdot{width:7px;height:7px;border-radius:50%;background:var(--c-you);animation:mcpulse .9s ease-in-out infinite alternate}@keyframes mcpulse{from{opacity:.25}to{opacity:1}}@media (prefers-reduced-motion:reduce){.pdot{animation:none}}
+.pendrows .row{margin:10px 0}.pendrows:empty{display:none}
 .evt{display:flex;align-items:center;gap:10px;margin:16px 0;font-size:12px}.evt:before,.evt:after{content:"";flex:1;height:1px;background:var(--line)}
 .evt span{padding:3px 12px;border-radius:99px;background:var(--t-event);color:var(--amb)}
 details.cmp{margin:16px auto;max-width:760px;border:1px dashed color-mix(in srgb,var(--amb) 45%,transparent);border-radius:12px;padding:6px 12px;background:none;box-shadow:none}
@@ -4266,7 +4277,7 @@ function swap(h){
  [].forEach.call(nm.querySelectorAll('details'),function(x,i){var k=x.getAttribute('data-sec')||('#'+i);if(k in open)x.open=open[k];});
  var sb=document.getElementById('sendbox'),nsb=nm.querySelector('#sendbox');if(sb&&nsb)nsb.parentNode.replaceChild(sb,nsb);   // keeps what you typed
  om.parentNode.replaceChild(nm,om);
- applyX();if(window.mcHideScan)window.mcHideScan();if(window.mcNotify)window.mcNotify();window.scrollTo(0,y);
+ applyX();if(window.mcHideScan)window.mcHideScan();if(window.mcNotify)window.mcNotify();if(window.mcPendPaint)window.mcPendPaint();window.scrollTo(0,y);
  if(aid){var e=document.getElementById(aid);if(e&&document.activeElement!==e){try{e.focus({preventScroll:true});if(s0!==null)e.setSelectionRange(s0,s1);}catch(_){}}}
  return true;}
 function pull(){if(inflight)return inflight;
@@ -4294,6 +4305,47 @@ if(btn)btn.addEventListener('click',function(){
 })();
 </script>"""
 
+PEND_JS = r"""<script>
+// Your messages from the send box, shown greyed in the chat until the agent's own log records them.
+// States: sending, sent (typed into the agent's terminal), question (not sent: a prompt on its screen), failed.
+// Sent ones are kept in this browser (localStorage, per session) so they survive page refreshes and the session/conversation switch.
+window.MCP=(function(){
+var items=[],subs=[],K='';
+function key(){if(!K){var b=document.getElementById('sendbox');K=(b&&b.getAttribute('data-key'))||document.body.getAttribute('data-key')||'';}return K;}
+function lk(){return 'mc-pend:'+key();}
+function now(){return Date.now()/1000;}
+function load(){try{items=(JSON.parse(localStorage.getItem(lk())||'[]')||[]).filter(function(p){return p&&p.x&&p.st==='sent'&&now()-p.e<43200;});}catch(e){items=[];}}
+function save(){try{var a=items.filter(function(p){return p.st==='sent';}).slice(-20);if(a.length)localStorage.setItem(lk(),JSON.stringify(a));else localStorage.removeItem(lk());}catch(e){}}
+function norm(t){return String(t||'').toLowerCase().replace(/[^a-z0-9]+/g,'');}
+function same(a,b){a=norm(a);b=norm(b);var n=Math.min(a.length,b.length,160);return n>0&&a.slice(0,n)===b.slice(0,n);}
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function hm(e){return new Date(e*1000).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});}
+function fire(){save();subs.forEach(function(f){try{f();}catch(e){}});}
+// drops the ones the agent's log now shows (messages reach the terminal in order, so a later one recorded means earlier ones were too)
+function seen(rec){var last=0,n0=items.length;rec.forEach(function(m){if(m.e>last)last=m.e;});
+ items=items.filter(function(p){if(p.st!=='sent')return true;
+  if(rec.some(function(m){return m.e>=p.e-300&&same(m.x,p.x);}))return false;return !(last&&p.e<last-120);});
+ if(items.length!==n0)fire();}
+var ST={sending:['','<span class="pdot"></span>Sending…'],sent:['','✓ Sent '],question:['warn','Not sent yet · the agent is asking something (see below)'],
+ failed:['bad','Not sent · your text is still in the box']};
+function row(p){var st=ST[p.st]||ST.sent,x=p.x.length>1500?p.x.slice(0,1500)+'…':p.x;
+ return '<div class="row r-user pend '+st[0]+'"><div class="bub"><div class="mh"><span class="who">You</span><span class="tm">'+hm(p.e)+'</span></div>'+
+  '<div class="mb pw">'+esc(x)+'</div><div class="pst">'+st[1]+(p.st==='sent'?hm(p.t||p.e)+' · in the agent’s terminal, not yet in its log':'')+'</div></div></div>';}
+function paint(){   // the session page: under the latest words, just above the send box
+ var box=document.getElementById('sendbox');if(!box||document.getElementById('list'))return;
+ var j=document.getElementById('mc-lastyou');if(j){try{var o=JSON.parse(j.textContent);if(o&&o.e){var n0=items.length;seen([o]);if(items.length!==n0)return;}}catch(e){}}
+ var h=box.parentNode.querySelector('.pendrows');
+ if(!h){h=document.createElement('div');h.className='chat pendrows';box.parentNode.insertBefore(h,box);}
+ h.innerHTML=items.map(row).join('');}
+load();subs.push(paint);
+window.mcPendPaint=paint;
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',paint);else paint();
+return {list:function(){return items.slice();},on:function(f){subs.push(f);},row:row,seen:seen,
+ start:function(x){items=items.filter(function(p){return p.st==='sending'||p.st==='sent';});var p={id:'p'+Date.now(),x:x,e:now(),st:'sending'};items.push(p);fire();return p.id;},
+ set:function(id,st){items.forEach(function(p){if(p.id===id){p.st=st;if(st==='sent')p.t=now();}});fire();}};
+})();
+</script>"""
+
 SEND_JS = r"""<script>
 (function(){
 var box=document.getElementById('sendbox');if(!box)return;
@@ -4303,6 +4355,7 @@ function off(msg){ta.disabled=true;btn.disabled=true;hint.innerHTML=msg;}
 if(box.getAttribute('data-notmux')==='1'){off('This agent runs outside tmux, so it can\u2019t receive messages from here.');return;}
 if(!S||!S.token){off('Read-only copy. To message the agent, open the dashboard by typing <b>mctl</b> in WSL (it opens <span class="mono">http://localhost:8765</span>).');return;}
 function send(force){var t=ta.value;if(!t.trim())return;btn.disabled=true;window.MC_BUSY=true;res.innerHTML='<div class="small mut">Sending\u2026</div>';
+ var P=window.MCP,pid=P?P.start(t):null,mark=function(st){if(P&&pid)P.set(pid,st);};
  fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json','X-MC-Token':S.token},body:JSON.stringify({key:box.getAttribute('data-key'),text:t,force:!!force})})
  .then(function(r){return r.json();}).then(function(d){btn.disabled=false;window.MC_BUSY=false;
   var when=new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}),scr=d.screen?'<pre class="sendscr">'+esc(d.screen)+'</pre>':'';
@@ -4314,14 +4367,14 @@ function send(force){var t=ta.value;if(!t.trim())return;btn.disabled=true;window
     var bb=document.createElement('button');bb.type='button';bb.className='btn2 sm';bb.textContent='Make this binding';bb.setAttribute('data-cop','amend');
     bb.setAttribute('data-ctext',sent.trim().slice(0,1200));bb.setAttribute('data-cconfirm','Add this message to the contract as an amendment, so later checks hold the agent to it?');
     var bm=document.createElement('div');bm.className='actmsg';bd.appendChild(bb);bd.appendChild(bm);res.insertBefore(bd,res.firstChild.nextSibling);}
-   try{document.dispatchEvent(new CustomEvent('mc-sent',{detail:{text:sent}}));}catch(e){}}
-  else if(d.code===3){var q=d.question,qa='';
+   mark('sent');}
+  else if(d.code===3){mark('question');var q=d.question,qa='';
    if(q&&q.options&&q.options.length){qa='<div class="qa" data-key="'+esc(box.getAttribute('data-key'))+'" data-sig="'+esc(q.sig)+'">'+(q.context||[]).map(function(c){return '<div class="qctx mono">'+esc(c)+'</div>';}).join('')+'<div class="qbtns">'+
     q.options.map(function(o){return '<button type="button" class="btn2'+(/^no/i.test(o.label)?' dng':'')+'" data-ans="'+esc(o.n)+'">'+esc(q.kind==='menu'?o.n+'. '+o.label:o.label)+'</button>';}).join('')+'</div><div class="actmsg"></div></div>';}
    res.innerHTML='<div class="flag amber"><div class="t">Not sent yet</div><div class="d">'+esc(d.message)+(q&&q.text?'<br><b>'+esc(q.text)+'</b>':'')+'</div>'+qa+'<div class="a"><button type="button" class="more" id="sendforce">'+(q&&q.kind==='text'?'Send my message as the answer':'Send anyway')+'</button></div></div>'+scr;
    document.getElementById('sendforce').onclick=function(){send(true);};}
-  else{res.innerHTML='<div class="flag red"><div class="t">Not sent</div><div class="d">'+esc(d.message||'failed')+'</div></div>'+scr;}})
- .catch(function(e){btn.disabled=false;window.MC_BUSY=false;res.innerHTML='<div class="flag red"><div class="t">Not sent</div><div class="d">The local mission control server didn\u2019t answer. Type mctl in WSL to restart it.</div></div>';});}
+  else{mark('failed');res.innerHTML='<div class="flag red"><div class="t">Not sent</div><div class="d">'+esc(d.message||'failed')+'</div></div>'+scr;}})
+ .catch(function(e){btn.disabled=false;window.MC_BUSY=false;mark('failed');res.innerHTML='<div class="flag red"><div class="t">Not sent</div><div class="d">The local mission control server didn\u2019t answer. Type mctl in WSL to restart it.</div></div>';});}
 btn.addEventListener('click',function(){send(false);});
 ta.addEventListener('input',function(){ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,220)+'px';});
 ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send(false);}});
@@ -4490,7 +4543,7 @@ window.mcNotify();
 </script>"""
 
 # Pages carry a fingerprint of their code, so an open page reloads fully (rather than swapping content) after an update.
-BUILD = hashlib.md5((CSS + CONV_CSS + CONV_JS + HIDE_JS + FRESH_JS + REFRESH_JS + SEND_JS + TOOLS_JS).encode("utf-8")).hexdigest()[:12]
+BUILD = hashlib.md5((CSS + CONV_CSS + CONV_JS + HIDE_JS + FRESH_JS + REFRESH_JS + PEND_JS + SEND_JS + TOOLS_JS).encode("utf-8")).hexdigest()[:12]
 HEAD_META += '<meta name="mc-build" content="%s">' % BUILD
 
 
@@ -4642,6 +4695,9 @@ def render(s):
         o.append("</div>")
     else:
         o.append('<div class="empty">No agent messages captured yet.</div>')
+    ly = cv.get("last_you") or {}
+    if ly.get("epoch"):
+        o.append('<script type="application/json" id="mc-lastyou">%s</script>' % json.dumps({"e": ly["epoch"], "x": (ly.get("text") or "")[:400]}).replace("</", "<\\/"))
     o.append(send_box(s))
     o.append("</section>")
 
@@ -4828,7 +4884,7 @@ def render(s):
              '<div>Mission control types into a session only when you press a button%s. Press a block\u2019s \u00d7 to hide it here; <span class="mono">mctl hide NAME</span> hides it everywhere.%s</div></footer>' % (
                  hs, esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(s["collected"]))) if s.get("collected") else "never",
                  esc(time.strftime("%H:%M", time.localtime(s["generated"]))), CFG["interval"], never_note(), hidden_note()))
-    o.append("</main>%s%s%s%s</body></html>" % (HIDE_JS, SEND_JS, REFRESH_JS, TOOLS_JS))
+    o.append("</main>%s%s%s%s%s</body></html>" % (HIDE_JS, PEND_JS, SEND_JS, REFRESH_JS, TOOLS_JS))
     return "\n".join(o)
 
 
