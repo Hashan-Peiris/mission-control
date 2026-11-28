@@ -2237,6 +2237,28 @@ def meaning_alike(a, b):
     return not wa or not wb or len(wa & wb) / float(len(wa | wb)) >= 0.5
 
 
+def conv_history(gkey, conv):
+    """The whole stored conversation: the sessions running now, plus older days kept on disk from sessions that ended
+    (so a word's first use and its counts cover the project, not just the current sessions)."""
+    base = os.path.join(MC_DIR, "goals", "conv", gkey)
+    have = {time.strftime("%Y-%m-%d", time.localtime(m["e"])) if m.get("e") else "undated" for m in conv}
+    out = list(conv)
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        names = []
+    for fn in names:
+        if not fn.endswith(".js") or fn[:-3] in have:
+            continue
+        s = rd(os.path.join(base, fn), "") or ""
+        try:
+            out += [m for m in json.loads(s[s.index("MC_CONV,") + 8: s.rindex(");")]) if isinstance(m, dict)]
+        except ValueError:
+            continue
+    out.sort(key=lambda m: m.get("e") or 0)
+    return out
+
+
 def terms_report(gkey, flags, conv, sessions, ndoc, contract_raw):
     st = terms_state(gkey)
     before = json.dumps(st, sort_keys=True)
@@ -2373,10 +2395,12 @@ def terms_report(gkey, flags, conv, sessions, ndoc, contract_raw):
         for mm in SUGG_RX.finditer(m["x"]):
             w = mm.group(1)
             n = w.lower()
-            if n in TERM_COMMON or TERM_SKIP.search(w) or len(n) < 4 or (n.count("-") and not re.search(r"[a-z]", w)):
+            # labels like V6, P2 or S4 count even when short; a hyphenated word needs 4 letters or more
+            if n in TERM_COMMON or TERM_SKIP.search(w) or len(n) < (4 if "-" in n else 2) or (n.count("-") and not re.search(r"[a-z]", w)):
                 continue
             if m["r"] == "user":
-                yours.add(n)
+                if n not in cnt:   # you brought it in before any agent used it (asking what it means doesn't hide it)
+                    yours.add(n)
                 continue
             if m["r"] not in ("agent", "sub"):
                 continue
@@ -2390,7 +2414,16 @@ def terms_report(gkey, flags, conv, sessions, ndoc, contract_raw):
         w, m = first_by[n]
         sugg.append({"term": w, "n": n, "id": term_id(gkey, n), "count": c, "days": len(days[n]),
                      "first": {"who": term_who(m.get("w"), m["r"]), "t": m["e"]}})
-    sugg.sort(key=lambda x: -x["count"] * len(days[x["n"]]) ** .5)
+    score = lambda x: -x["count"] * len(days[x["n"]]) ** .5
+    sugg.sort(key=score)
+    pick, per = [], {}   # labels (V6) and hyphenated coinages (no-kick) both get room: at most 6 of the 10 from one kind
+    for x in sugg:
+        k = "-" in x["n"]
+        if per.get(k, 0) < 6 and len(pick) < 10:
+            pick.append(x)
+            per[k] = per.get(k, 0) + 1
+    pick += [x for x in sugg if x not in pick][:10 - len(pick)]
+    sugg = sorted(pick, key=score)
     vis = [r for r in out if not r["hidden"]]
     rep = {"terms": out[:90], "sugg": sugg[:10], "setup": st.get("setup"), "has_list": any(e["src"] == "list" for e in ents),
            "counts": {"total": len(vis), "waiting": sum(1 for r in vis if r["waiting"]), "pending": sum(1 for r in vis if r["pending"]),
@@ -3156,7 +3189,7 @@ def analyze_goal(gdesc, shared):
                 f["acts"] = [{"label": "Check what it remembers", "op": "probe",
                               "confirm": "Ask the agent to list its goal, rules, limits and next steps from memory? Its answer is scored on the Memory card."}]
     try:
-        terms = terms_report(gkey, flags, conv, fam or ([main] if main else []), ndoc, rd(CONTRACT, "") or "")
+        terms = terms_report(gkey, flags, conv_history(gkey, conv), fam or ([main] if main else []), ndoc, rd(CONTRACT, "") or "")
     except Exception as e:  # noqa: same as memory
         sys.stderr.write("terms %s: %s\n" % (gkey, e))
         terms = None
