@@ -175,6 +175,25 @@ an item on the page, and so do hours of work with no plan step finished and the 
 summaries themselves show, folded, in the conversation. Compactions from before this was added are read once from the
 session's log.
 
+## Terms: what the agents' words mean
+
+Long sessions grow their own vocabulary: model labels, stage names, and ordinary words used in a private sense
+("qualified", "sealed", "exposed"). Agents rarely define them. The Terms card on each session page keeps track:
+- **Word list.** "Ask the agent to keep a word list" asks it to write each new term and its meaning to
+  `.mc/glossary.jsonl` in its folder (`{"term", "meaning", "by", "ts"}`, plus `"why"` when a meaning changes), to define
+  new words the first time it uses them, and to pin that rule in AGENTS.md so it survives compactions.
+- **Point at a word.** Underlined words in the chat open their meaning: who used it first and when, who defined it
+  first, how often the main agent and each sub-agent use it, and any older meanings. Select any other word or phrase to
+  ask what it means; one message asks about every waiting word, and each answer (`T1a2b3: meaning`) files itself.
+- **Meanings that move.** A newer meaning from the same agent shows as "changed", with before and after. Different
+  meanings from the main agent and a sub-agent show as "defined differently". "Used differently lately?" is an
+  automatic hint from the words around a term, early compared with recent (and main agent compared with sub-agents);
+  it can also mean the topic simply moved, so **Question this** sends the agent the quotes and asks.
+- **Contract words are pinned.** When a word the contract uses gets a new meaning, that is an item waiting for you:
+  accept the new meaning, or keep the pinned one (the agent is told).
+- **Used often, never explained** lists frequent coinages nobody has defined. **I know this** hides a word on every
+  session. New and changed words appear in the morning brief.
+
 ## Answer the agent's questions
 
 When an agent asks something (Codex or Claude approval prompts, a numbered menu, a y/n question), the

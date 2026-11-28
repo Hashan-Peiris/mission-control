@@ -957,6 +957,128 @@ def cmd_contract_edit(key, req):
             ms[k] = (ms.get(k) or [])[-9:] + [time.time()]
             mem_save(key, ms)
             return out(True, "Recorded.")
+        elif op.startswith("term_"):   # words on the Terms card; never touch the contract file
+            tst, known = terms_state(key), terms_known()
+            rep = snap.get("terms") or {}
+            rows = {r["id"]: r for r in (rep.get("terms") or []) + (rep.get("sugg") or [])}
+            text = re.sub(r"\s+", " ", str(req.get("text") or "")).strip().strip("`*\"“”.,;:!?")
+            tids = [x for x in re.split(r"[,\s]+", str(req.get("items") or req.get("item") or "")) if re.match(r"^T[0-9a-f]{5}$", x)]
+            watch = tst.setdefault("watch", {})
+            if text and op in ("term_add", "term_ask", "term_asked", "term_hide"):
+                if len(text) < 2 or len(text) > 60:
+                    return out(False, "Pick a word or a short phrase (up to 60 characters).")
+                n = term_norm(text)
+                if op != "term_hide":
+                    watch.setdefault(n, {"term": text, "t": time.time()})
+                    known.discard(n)
+                tids.append(term_id(key, n))
+                rows.setdefault(term_id(key, n), {"id": term_id(key, n), "n": n, "term": text, "meaning": ""})
+            for t in tids:   # a suggestion picked from the card becomes a word to ask about
+                r = rows.get(t)
+                if r and op in ("term_add", "term_ask") and not r.get("meaning"):
+                    watch.setdefault(r["n"], {"term": r["term"], "t": time.time()})
+            pick = [rows[t] for t in tids if t in rows]
+            if op == "term_add":
+                terms_save(key, tst)
+                terms_known_save(known)
+                nw = sum(1 for n in watch if not any(r.get("n") == n and r.get("meaning") for r in rows.values()))
+                return out(True, "Saved “%s”. %d word%s wait for a meaning: Ask agent on the Terms card asks about them together." % (
+                    pick[0]["term"] if pick else text, nw, "" if nw == 1 else "s"))
+            if op in ("term_ask", "term_asked"):
+                want = {r["n"]: r for r in pick}
+                for n, w in watch.items():   # and every other word still waiting, so the agent is asked once
+                    r = next((x for x in rows.values() if x.get("n") == n), None)
+                    if not (r and r.get("meaning")) and n not in known:
+                        want.setdefault(n, r or {"id": term_id(key, n), "n": n, "term": w.get("term") or n})
+                want = list(want.values())[:25]
+                if not want:
+                    return out(False, "No words are waiting for a meaning. Select a word in the chat, or pick one on the Terms card.")
+                if op == "term_asked":
+                    tst.setdefault("asked", {}).update({r["n"]: time.time() for r in want})
+                    terms_save(key, tst)
+                    return out(True, "Recorded.")
+                terms_save(key, tst)
+                terms_known_save(known)
+                lines = "\n".join("- %s · “%s”%s" % (r["id"], r["term"], (" (it was recorded as: %s)" % trunc(r["meaning"], 200)) if r.get("meaning") else "")
+                                  for r in want)
+                return out(True, "Asked the agent about %d word%s; each answer shows on the Terms card when it replies." % (len(want), "" if len(want) == 1 else "s"),
+                           "[mission control] The user asks what %s mean%s in this project:\n%s\n\nAnswer each on its own line, starting with its id: "
+                           "\"%s: what it means, in plain words\". Also add each one to .mc/glossary.jsonl in your working folder, one JSON line per "
+                           "word: {\"term\": \"...\", \"meaning\": \"...\", \"by\": \"main\" (or your sub-agent name), \"ts\": \"<ISO time>\"}. If a "
+                           "meaning changed during the project, say what it meant before and when it changed. Then carry on with your work." % (
+                               "this word" if len(want) == 1 else "these words", "s" if len(want) == 1 else "", lines, want[0]["id"]))
+            r = pick[0] if pick else None
+            if op in ("term_question", "term_questioned", "term_same", "term_hide", "term_unhide", "term_accept", "term_keep") and not r:
+                return out(False, "That word isn't on the page any more.")
+            if op == "term_question":
+                bits = []
+                if r.get("pending"):
+                    bits.append("Pinned meaning (the contract uses this word): %s\nNewer meaning (%s, %s): %s" % (r["pinned"], r["pending"]["by"], hm(r["pending"]["t"]), r["pending"]["meaning"]))
+                elif r.get("changed"):
+                    c = r["changed"]
+                    bits.append("Earlier meaning (%s, %s): %s\nNewer meaning (%s, %s): %s" % (c["by0"], hm(c["t0"]), c["from"], c["by"], hm(c["t"]), r["meaning"]))
+                if r.get("differ"):
+                    bits.append("Different meanings recorded:\n" + "\n".join("- %s: %s" % (d["by"], d["meaning"]) for d in r["differ"]))
+                if r.get("shift"):
+                    sh = r["shift"]
+                    bits.append("It is used differently lately.\nThen (%s, %s): “%s”\nNow (%s, %s): “%s”" % (
+                        sh["then"]["who"], hm(sh["then"]["t"]), sh["then"]["text"], sh["now"]["who"], hm(sh["now"]["t"]), sh["now"]["text"]))
+                if r.get("mainsub"):
+                    ms = r["mainsub"]
+                    bits.append("The main agent and a sub-agent use it in different settings.\nMain agent: “%s”\n%s: “%s”" % (
+                        ms["main"]["text"], ms["sub"]["who"].capitalize(), ms["sub"]["text"]))
+                if not bits and r.get("meaning"):
+                    bits.append("Recorded meaning (%s): %s" % (r["by"], r["meaning"]))
+                return out(True, "Asked the agent whether “%s” still means the same; its answer shows on the Terms card." % r["term"],
+                           "[mission control] The user asks whether “%s” still means the same thing in this project.\n%s\n\nAnswer on one line, "
+                           "starting with its id: \"%s: <what it means now>; same meaning as before\" or \"%s: <what it means now>; changed: <what "
+                           "changed and why>\". If the main agent and a sub-agent mean different things, say which is right. If it changed, add the "
+                           "new meaning with a \"why\" to .mc/glossary.jsonl. Then carry on with your work." % (r["term"], "\n\n".join(bits), r["id"], r["id"]))
+            if op == "term_questioned":
+                tst.setdefault("questioned", {})[r["n"]] = time.time()
+                terms_save(key, tst)
+                return out(True, "Recorded.")
+            if op == "term_same":
+                tst.setdefault("same", {})[r["n"]] = time.time()
+                terms_save(key, tst)
+                return out(True, "Noted: same meaning. The hint stays away for 30 days.")
+            if op in ("term_hide", "term_unhide"):
+                (known.add if op == "term_hide" else known.discard)(r["n"])
+                terms_known_save(known)
+                return out(True, "Hidden on every session's Terms card (“Hidden” brings it back)." if op == "term_hide" else "Brought back.")
+            if op in ("term_accept", "term_keep"):
+                p = r.get("pending")
+                if not p or p.get("sig") != str(req.get("psig") or ""):
+                    return out(False, "That meaning changed or was already decided since this page was made. The page refreshes in a moment; try again then.")
+                if op == "term_accept":
+                    tst.setdefault("pinned", {})[r["n"]] = {"meaning": p["meaning"], "t": time.time(), "by": "you"}
+                    terms_save(key, tst)
+                    return out(True, "The new meaning of “%s” is pinned." % r["term"])
+                tst.setdefault("kept", {}).setdefault(r["n"], []).append(p["sig"])
+                terms_save(key, tst)
+                return out(True, "Kept the pinned meaning of “%s”." % r["term"],
+                           "[mission control] The user keeps the pinned meaning of \u201c%s\u201d for this goal, because the contract relies on it.\n"
+                           "Pinned meaning: %s\nYour newer meaning: %s\nPlease keep using \u201c%s\u201d in its pinned meaning, and give "
+                           "the newer idea a word of its own. Add a line with the pinned meaning to .mc/glossary.jsonl. Then carry on with your "
+                           "work." % (r["term"], r["pinned"], p["meaning"], r["term"]))
+            if op in ("term_setup", "term_setup_sent"):
+                if op == "term_setup_sent":
+                    tst["setup"] = time.time()
+                    terms_save(key, tst)
+                    return out(True, "Recorded.")
+                seed = [x["term"] for x in rep.get("sugg") or []][:12] + [r2["term"] for r2 in rep.get("terms") or [] if r2.get("waiting")][:12]
+                return out(True, "Asked the agent to keep a word list; its words show on the Terms card as it adds them.",
+                           "[mission control] Request from the user: keep a word list for this project, so the user can follow your reports.\n"
+                           "1. When you coin a term or use an ordinary word in a special sense (a model label, a stage name, words like \"qualified\" "
+                           "or \"sealed\"), add one JSON line to .mc/glossary.jsonl in your working folder: {\"term\": \"...\", \"meaning\": \"what it "
+                           "means, in plain words, one or two sentences\", \"by\": \"main\" (or your sub-agent name), \"ts\": \"<ISO time>\"}.\n"
+                           "2. If a term's meaning changes, add a new line with the new meaning and a \"why\" field. Never edit or delete old lines.\n"
+                           "3. Define any new term in plain words the first time you use it in a message to the user.\n"
+                           "4. Add rules 1 to 3 to AGENTS.md in your working folder, in a short \"Word list (from mission control)\" section, keeping "
+                           "everything else as it is, so they survive compactions and reach your sub-agents.\n"
+                           "5. Now add the terms you already use regularly (up to about 30)%s.\nThen carry on with your work." % (
+                               (", including: " + ", ".join(seed)) if seed else ""))
+            return out(False, "Unknown change.")
         elif op in ("approve", "reject", "approve_once"):
             pids = [x for x in re.split(r"[,\s]+", str(req.get("pid") or "")) if x][:40]
             sigs = [x for x in re.split(r"[,\s]+", str(req.get("psig") or "")) if x]
@@ -1066,6 +1188,7 @@ def clears_text(key, hours):
         "gpu": "Goes away when the GPU is busy again.",
         "storage": "Goes away 6 h after the spike.",
         "goal": "Goes away when the agent\u2019s state changes.",
+        "term": "Goes away when you accept the new meaning or keep the pinned one.",
         "memory": "Goes away when a newer summary or memory check keeps every rule and limit, after a reminder, or 48 h after the compaction.",
         "drift": "Goes away when the agent finishes a plan step or does something else.",
         "agent": "Goes away when an agent runs in the session again.",
@@ -1658,7 +1781,8 @@ def goal_doc(goal):
             break
     reqs = [dict(r, cwd=c) for c, lst in (doc.get("requests") or {}).items() if c in cwds for r in lst]
     answers = [dict(r, cwd=c) for c, lst in (doc.get("answers") or {}).items() if c in cwds for r in lst]
-    return {"ok": doc.get("ok", False), "tmux": goal.get("tm") or {}, "sessions": sessions, "goal_db": doc.get("goal_db"),
+    gloss = [dict(e, cwd=c) for c, v in (doc.get("glossary") or {}).items() if c in cwds for e in ((v or {}).get("entries") or [])]
+    return {"glossary": gloss, "ok": doc.get("ok", False), "tmux": goal.get("tm") or {}, "sessions": sessions, "goal_db": doc.get("goal_db"),
             "node": doc.get("node"), "params": params, "decisions": dec, "git": git, "goal_cwds": cwds,
             "elapsed_s": doc.get("elapsed_s", 0), "specs": specs, "requests": reqs, "answers": answers, "storage": stor}
 
@@ -1999,6 +2123,438 @@ def memory_html(s):
                 esc(hm(c["e"])), esc(full), kept, left, " \u00b7 ".join(after)))
         o.append('<table class="small mtab"><tr><th>Compaction</th><th>Kept</th><th>Left out</th><th>%.0f h before \u2192 after</th></tr>%s</table>' % (
             min(3, max((c.get("w_h") or 3) for c in comps[-8:])), "".join(rows)))
+    o.append("</section>")
+    return "".join(o)
+
+
+# ---- terms: what the agents' own words mean, who used and defined each first, and when a meaning moves.
+# Meanings come from the agent's word list (.mc/glossary.jsonl in its folder) and its answers when you ask
+# ("T1a2b3: meaning"). History is kept here, since the file on the node may be rewritten. The usage hint is only a hint:
+# word statistics can tell that a term now shows up in a different setting, not whether its meaning changed.
+TERMS_DIR = os.path.join(STATE, "terms")
+TERM_STOP = MEM_STOP | set(("was were been being which who whom how why where not but if so such onto over under about after before between "
+                            "during per via our them their his her would could might does did done any both other same new old one two "
+                            "three first last next out off now still yet again once result results check checks checked run runs running "
+                            "i'm i'll i've it's that's").split())
+TERM_COMMON = set(("long-term short-term follow-up read-only up-to-date so-called re-run step-by-step real-time end-to-end built-in well-known "
+                   "one-time non-zero first-principles ab-initio state-of-the-art open-source on-the-fly per-atom per-structure high-energy "
+                   "low-energy short-range long-range two-step one-step full-size small-scale large-scale time-step check-in e-mail x-ray "
+                   "self-consistent single-point half-hour half-day day-to-day in-place out-of-date sub-agent sub-agents co-author").split())
+TERM_SKIP = re.compile(r"(?i)^(?:gpt|claude|opus|sonnet|haiku|codex|gemini|o\d|vasp|python|cuda|lammps|ubuntu|wsl)\b|^[ahlv]\d{2,3}s?$|^mi\d{3}|^\d|^x\d")
+SUGG_RX = re.compile(r"(?<![\w/.\-@])([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+){1,3}|[A-Z][a-z]*\d+[A-Za-z]*)(?![\w/\-@]|\.\w)")
+TERM_WORD = re.compile(r"[a-z][a-z0-9]{2,}")
+TERM_SHIFT_MAX = 0.2      # early vs recent (and main vs sub-agent) context similarity, relative to its own spread
+TERM_HINTS_MAX = 3        # usage hints shown per session at most
+
+
+def term_norm(t):
+    t = re.sub(r"[`*\"“”‘’]+", "", str(t or "")).strip().strip(".,;:!?()[]{}'")
+    return re.sub(r"\s+", " ", t).lower()[:80]
+
+
+def term_id(gkey, n):
+    return "T" + hashlib.sha1(("%s|%s" % (gkey, n)).encode("utf-8", "replace")).hexdigest()[:5]
+
+
+def term_rx(n):
+    parts = [re.escape(w) for w in re.split(r"[\s\-]+", n) if w]
+    return re.compile(r"(?<![\w-])" + r"[\s\-]?".join(parts) + r"(?![\w-])", re.I) if parts else None
+
+
+def terms_state(gkey):
+    return rjson(os.path.join(TERMS_DIR, gkey + ".json"), {}) or {}
+
+
+def terms_save(gkey, st):
+    items_save(os.path.join(TERMS_DIR, gkey + ".json"), st)
+
+
+def terms_known():
+    return set((rjson(os.path.join(TERMS_DIR, "_known.json"), {}) or {}).get("known") or [])
+
+
+def terms_known_save(known):
+    items_save(os.path.join(TERMS_DIR, "_known.json"), {"known": sorted(known)[-3000:]})
+
+
+def term_who(lab, role="agent"):
+    """Who wrote it, in words: you, the main agent, or a sub-agent."""
+    lab = str(lab or "").strip()
+    if role == "user":
+        return "you"
+    if lab.lower() in ("", "main", "main agent"):
+        return "main agent"
+    s = "sub-agent " + lab[4:] if re.match(r"(?i)^sub-\w", lab) else lab if "agent" in lab.lower() else "sub-agent " + lab
+    return s + (" (its task from the main agent)" if role == "task" else "")
+
+
+def term_line(text, m):
+    a = text.rfind("\n", 0, m.start())
+    b = text.find("\n", m.end())
+    line = re.sub(r"\s+", " ", text[a + 1: b if b > 0 else len(text)]).strip().lstrip("-*#>| ").strip()
+    if len(line) > 240:   # keep the word in view
+        i = max(0, line.lower().find(m.group(0).lower()) - 100)
+        line = ("…" if i else "") + line[i:i + 230] + "…"
+    return line
+
+
+def term_bag(text, m, n, w=6):
+    own = set(re.split(r"[\s\-]+", n))
+    a = text[:m.start()].split()[-w:]
+    b = text[m.end():].split()[:w]
+    return {k: 1 for k in TERM_WORD.findall(" ".join(a + b).lower()) if k not in TERM_STOP and k not in own}
+
+
+def bag_cos(a, b):
+    if not a or not b:
+        return 0.0
+    d = sum(v * b.get(k, 0) for k, v in a.items())
+    return d / ((sum(v * v for v in a.values()) ** .5) * (sum(v * v for v in b.values()) ** .5))
+
+
+def bag_sum(bags):
+    c = {}
+    for bg in bags:
+        for k, v in bg.items():
+            c[k] = c.get(k, 0) + v
+    return c
+
+
+def use_ratio(A, B):
+    """How alike two groups of uses are, relative to how alike each group is with itself (halves of it)."""
+    if len(A) < 4 or len(B) < 4:
+        return None
+    a0, a1, b0, b1 = bag_sum(A[::2]), bag_sum(A[1::2]), bag_sum(B[::2]), bag_sum(B[1::2])
+    base = (bag_cos(a0, a1) + bag_cos(b0, b1)) / 2
+    if base < 0.25:
+        return None   # too varied to say anything
+    return round(((bag_cos(a0, b0) + bag_cos(a1, b1)) / 2) / base, 2), round(base, 2)
+
+
+def meaning_alike(a, b):
+    wa = set(TERM_WORD.findall(a.lower())) - TERM_STOP
+    wb = set(TERM_WORD.findall(b.lower())) - TERM_STOP
+    return not wa or not wb or len(wa & wb) / float(len(wa | wb)) >= 0.5
+
+
+def terms_report(gkey, flags, conv, sessions, ndoc, contract_raw):
+    st = terms_state(gkey)
+    before = json.dumps(st, sort_keys=True)
+    known = terms_known()
+    ents, watch = st.setdefault("entries", []), st.setdefault("watch", {})
+    have = {e.get("sig") for e in ents}
+
+    def add_entry(term, meaning, by, t, why, src):
+        n, meaning = term_norm(term), re.sub(r"\s+", " ", str(meaning or "")).strip()
+        if not n or not meaning or len(n) > 60:
+            return
+        sig = hashlib.sha1(("%s|%s|%s" % (n, meaning.lower(), by)).encode("utf-8", "replace")).hexdigest()[:10]
+        if sig in have:
+            return
+        have.add(sig)
+        ents.append({"n": n, "term": trunc(str(term).strip().strip("`*\"“”"), 80), "meaning": trunc(meaning, 900), "by": by,
+                     "t": t or NOW, "why": trunc(str(why or ""), 600), "src": src, "sig": sig})
+    for e in (ndoc or {}).get("glossary") or []:
+        add_entry(e.get("term"), e.get("meaning"), term_who(e.get("by")), iso_epoch(e.get("ts")), e.get("why"), "list")
+    ids = {term_id(gkey, n): n for n in list(watch) + [e["n"] for e in ents]}
+    for s in sessions:   # answers to "what does this mean", only for words asked about here
+        for a in s.get("term_answers") or []:
+            n = ids.get(str(a.get("id") or ""))
+            if n:
+                add_entry((watch.get(n) or {}).get("term") or next((e["term"] for e in ents if e["n"] == n), n), a.get("meaning"),
+                          term_who(s.get("label")), iso_epoch(a.get("ts")), "", "answer")
+    ents.sort(key=lambda e: e.get("t") or 0)
+    st["entries"] = ents[-1500:]
+
+    names = {}
+    for e in ents:
+        names[e["n"]] = e["term"]
+    for n, w in watch.items():
+        names.setdefault(n, w.get("term") or n)
+    msgs = [m for m in conv if m.get("r") in ("agent", "sub", "user", "task") and m.get("x")]
+    low = [m["x"].lower() for m in msgs]
+    craw = contract_raw or ""
+    pinned, kept = st.setdefault("pinned", {}), st.setdefault("kept", {})
+    asked, questioned, same = st.get("asked") or {}, st.get("questioned") or {}, st.get("same") or {}
+    out, hints = [], []
+    for n, term in names.items():
+        rx = term_rx(n)
+        if not rx:
+            continue
+        hist = []
+        for e in ents:
+            if e["n"] == n and not (hist and hist[-1]["meaning"].lower() == e["meaning"].lower() and hist[-1]["by"] == e["by"]):
+                hist.append({"meaning": e["meaning"], "by": e["by"], "t": e["t"], "why": e.get("why") or "", "src": e["src"], "sig": e["sig"]})
+        key0 = re.split(r"[\s\-]+", n)[0]
+        first, hits = None, []
+        for m, xl in zip(msgs, low):
+            if key0 not in xl:
+                continue
+            mm = rx.search(m["x"])
+            if not mm:
+                continue
+            if first is None:
+                first = {"who": term_who(m.get("w"), m["r"]), "t": m["e"], "text": term_line(m["x"], mm)}
+            if m["r"] in ("agent", "sub"):
+                hits.append((m, mm))
+        subs = {}
+        for m, _ in hits:
+            if m["r"] == "sub":
+                w = term_who(m.get("w"))
+                subs[w] = subs.get(w, 0) + 1
+        cur = hist[-1] if hist else None
+        latest_by = {}
+        for h in hist:
+            latest_by[h["by"]] = h
+        differ = None
+        if len(latest_by) > 1:
+            vals = list(latest_by.values())
+            if any(not meaning_alike(vals[0]["meaning"], v["meaning"]) for v in vals[1:]):
+                differ = [{"by": v["by"], "meaning": v["meaning"], "t": v["t"]} for v in vals]
+        changed = None
+        if cur and len(hist) > 1:
+            # its own author moved it (two agents disagreeing shows as "defined differently" instead)
+            prev = next((h for h in reversed(hist[:-1]) if h["by"] == cur["by"] and not meaning_alike(h["meaning"], cur["meaning"])), None)
+            if prev:
+                changed = {"from": prev["meaning"], "by0": prev["by"], "t0": prev["t"], "t": cur["t"], "by": cur["by"], "why": cur.get("why") or ""}
+        tid = term_id(gkey, n)
+        incon = bool(craw and rx.search(craw))
+        pend = None
+        if incon and hist:
+            if n not in pinned:   # the first meaning seen for a word the contract uses becomes its pinned meaning
+                pinned[n] = {"meaning": hist[0]["meaning"], "t": NOW, "by": "first meaning"}
+            pm = pinned[n]["meaning"]
+            if cur and not meaning_alike(pm, cur["meaning"]) and cur["sig"] not in (kept.get(n) or []):
+                pend = {"meaning": cur["meaning"], "by": cur["by"], "t": cur["t"], "sig": cur["sig"], "why": cur.get("why") or ""}
+                flags.add("term:%s" % n, "amber", "integrity", "“%s” has a new meaning, and the contract uses it" % term,
+                          "Pinned meaning: %s\nNew meaning (%s, %s): %s" % (pm, cur["by"], hm(cur["t"]), cur["meaning"]),
+                          "Accept the new meaning, or keep the pinned one (the agent is told).", needs_you=True,
+                          acts=[{"label": "Accept new meaning", "op": "term_accept", "item": tid, "psig": cur["sig"],
+                                 "confirm": "Pin the new meaning of “%s”? Contract rules that use the word then mean the new thing." % term},
+                                {"label": "Keep the pinned meaning", "op": "term_keep", "item": tid, "psig": cur["sig"],
+                                 "confirm": "Tell the agent to keep using “%s” in its pinned meaning?" % term}])
+        shift = mainsub = None
+        if len(hits) >= 16 and NOW - (same.get(n) or 0) > 30 * 86400 and NOW - (questioned.get(n) or 0) > 14 * 86400:
+            k = max(4, len(hits) // 4)
+            if hits[-k][0]["e"] - hits[k - 1][0]["e"] >= 3 * 86400:
+                r = use_ratio([term_bag(m["x"], mm, n) for m, mm in hits[:k]], [term_bag(m["x"], mm, n) for m, mm in hits[-k:]])
+                if r and r[0] < TERM_SHIFT_MAX and r[1] >= 0.3:
+                    m0, mm0 = hits[0]
+                    m1, mm1 = hits[-1]
+                    shift = {"score": r[0], "then": {"who": term_who(m0.get("w"), m0["r"]), "t": m0["e"], "text": term_line(m0["x"], mm0)},
+                             "now": {"who": term_who(m1.get("w"), m1["r"]), "t": m1["e"], "text": term_line(m1["x"], mm1)}}
+        mh = [(m, mm) for m, mm in hits if m["r"] == "agent"][-40:]
+        sh = [(m, mm) for m, mm in hits if m["r"] == "sub"][-40:]
+        if len(mh) >= 4 and len(sh) >= 4 and NOW - (same.get(n) or 0) > 30 * 86400:
+            r = use_ratio([term_bag(m["x"], mm, n) for m, mm in mh], [term_bag(m["x"], mm, n) for m, mm in sh])
+            if r and r[0] < TERM_SHIFT_MAX:
+                mainsub = {"score": r[0], "main": {"who": "main agent", "t": mh[-1][0]["e"], "text": term_line(mh[-1][0]["x"], mh[-1][1])},
+                           "sub": {"who": term_who(sh[-1][0].get("w")), "t": sh[-1][0]["e"], "text": term_line(sh[-1][0]["x"], sh[-1][1])}}
+        row = {"id": tid, "n": n, "term": term, "meaning": cur["meaning"] if cur else "", "by": cur["by"] if cur else "",
+               "t": cur["t"] if cur else None, "src": cur["src"] if cur else "", "why": (cur or {}).get("why") or "",
+               "hist": [{k: h[k] for k in ("meaning", "by", "t", "why")} for h in hist[-6:]],
+               "first_use": first, "first_def": {"who": hist[0]["by"], "t": hist[0]["t"]} if hist else None,
+               "main": sum(1 for m, _ in hits if m["r"] == "agent"), "subs": subs, "last": hits[-1][0]["e"] if hits else None,
+               "contract": incon, "pinned": pinned[n]["meaning"] if incon and n in pinned else None, "pending": pend,
+               "changed": changed, "differ": differ, "shift": shift, "mainsub": mainsub, "waiting": not hist,
+               "asked": asked.get(n), "hidden": n in known and not pend, "watched": (watch.get(n) or {}).get("t")}
+        if shift:
+            hints.append((shift["score"], row))
+        out.append(row)
+    for _, row in sorted(hints, key=lambda x: x[0])[TERM_HINTS_MAX:]:
+        row["shift"] = None   # only the clearest few
+    rank = lambda r: (0 if r["pending"] else 1 if r["differ"] else 2 if r["changed"] and NOW - (r["t"] or 0) < 14 * 86400 else
+                      3 if r["shift"] or r["mainsub"] else 4 if r["waiting"] else 5, -(r["last"] or r["t"] or 0))
+    out.sort(key=rank)
+
+    # words the agents use a lot that nobody has explained (you didn't bring them in, and you haven't said you know them)
+    cnt, days, first_by, yours = {}, {}, {}, set()
+    for m in msgs:
+        for mm in SUGG_RX.finditer(m["x"]):
+            w = mm.group(1)
+            n = w.lower()
+            if n in TERM_COMMON or TERM_SKIP.search(w) or len(n) < 4 or (n.count("-") and not re.search(r"[a-z]", w)):
+                continue
+            if m["r"] == "user":
+                yours.add(n)
+                continue
+            if m["r"] not in ("agent", "sub"):
+                continue
+            cnt[n] = cnt.get(n, 0) + 1
+            days.setdefault(n, set()).add(int(m["e"] // 86400))
+            first_by.setdefault(n, (w, m))
+    sugg = []
+    for n, c in cnt.items():
+        if n in names or n in known or n in yours or c < 4 or len(days[n]) < 2:
+            continue
+        w, m = first_by[n]
+        sugg.append({"term": w, "n": n, "id": term_id(gkey, n), "count": c, "days": len(days[n]),
+                     "first": {"who": term_who(m.get("w"), m["r"]), "t": m["e"]}})
+    sugg.sort(key=lambda x: -x["count"] * len(days[x["n"]]) ** .5)
+    vis = [r for r in out if not r["hidden"]]
+    rep = {"terms": out[:90], "sugg": sugg[:10], "setup": st.get("setup"), "has_list": any(e["src"] == "list" for e in ents),
+           "counts": {"total": len(vis), "waiting": sum(1 for r in vis if r["waiting"]), "pending": sum(1 for r in vis if r["pending"]),
+                      "changed": sum(1 for r in vis if r["changed"] and NOW - (r["t"] or 0) < 14 * 86400),
+                      "hints": sum(1 for r in vis if r["shift"] or r["mainsub"] or r["differ"]), "hidden": len(out) - len(vis)},
+           "new24": [r["term"] for r in vis if r["first_def"] and NOW - (r["first_def"]["t"] or 0) < 86400][:8],
+           "changed24": [r["term"] for r in vis if r["changed"] and NOW - (r["changed"]["t"] or 0) < 86400][:8]}
+    if json.dumps(st, sort_keys=True) != before:
+        terms_save(gkey, st)
+    return rep
+
+
+def term_client(r):
+    """One word, as the chat's word card needs it (times already in words)."""
+    q = lambda x: {"who": x["who"], "t": hm(x["t"]), "text": x["text"]} if x else None
+    return {"id": r["id"], "n": r["n"], "term": r["term"], "meaning": r["meaning"], "by": r["by"], "t": hm(r["t"]), "src": r["src"],
+            "contract": r["contract"], "pinned": r["pinned"], "waiting": r["waiting"], "asked": hm(r["asked"]) if r.get("asked") else "",
+            "pending": dict(r["pending"], t=hm(r["pending"]["t"])) if r["pending"] else None,
+            "changed": dict(r["changed"], t0=hm(r["changed"]["t0"]), t=hm(r["changed"]["t"])) if r["changed"] else None,
+            "differ": [dict(d, t=hm(d["t"])) for d in r["differ"]] if r["differ"] else None,
+            "shift": {"then": q(r["shift"]["then"]), "now": q(r["shift"]["now"])} if r["shift"] else None,
+            "mainsub": {"main": q(r["mainsub"]["main"]), "sub": q(r["mainsub"]["sub"])} if r["mainsub"] else None,
+            "first_use": dict(r["first_use"], t=hm(r["first_use"]["t"]), text=trunc(r["first_use"]["text"], 200)) if r["first_use"] else None,
+            "first_def": {"who": r["first_def"]["who"], "t": hm(r["first_def"]["t"])} if r["first_def"] else None,
+            "main": r["main"], "subs": r["subs"]}
+
+
+def terms_json(s):
+    rep = s.get("terms") or {}
+    rows = [term_client(r) for r in rep.get("terms") or [] if not r.get("hidden")]
+    return '<script type="application/json" id="mc-terms" data-key="%s">%s</script>' % (
+        esc(s["key"]), json.dumps(rows, separators=(",", ":")).replace("</", "<\\/"))
+
+
+def term_btn(label, op, r, confirm="", psig="", cls="btn2"):
+    a = {"label": label, "op": op, "item": r["id"]}
+    if confirm:
+        a["confirm"] = confirm
+    if psig:
+        a["psig"] = psig
+    return act_btn(a, cls)
+
+
+def term_row_html(r, gkey):
+    badges = []
+    if r["pending"]:
+        badges.append('<span class="tbad amb">new meaning · waiting for you</span>')
+    if r["differ"]:
+        badges.append('<span class="tbad amb">defined differently</span>')
+    if r["changed"] and not r["pending"]:
+        badges.append('<span class="tbad amb">changed %s</span>' % esc(hm(r["changed"]["t"])))
+    if r["shift"] or r["mainsub"]:
+        badges.append('<span class="tbad">%s</span>' % ("main and sub-agents differ?" if r["mainsub"] and not r["shift"] else "used differently lately?"))
+    if r["contract"]:
+        badges.append('<span class="tbad">in contract</span>')
+    if r["waiting"]:
+        badges.append('<span class="tbad">%s</span>' % (("asked " + esc(hm(r["asked"]))) if r.get("asked") else "no meaning yet"))
+    lead = (r["pinned"] if r["pending"] else r["meaning"]) or ("Asked at %s; the answer shows here." % hm(r["asked"]) if r.get("asked") else "Waiting to be asked.")
+    o = ['<details class="trow" id="%s"><summary><span class="tn">%s</span>%s<span class="tmean">%s</span></summary><div class="tbody">' % (
+        esc(r["id"]), esc(r["term"]), "".join(badges), esc(trunc(lead, 150)))]
+    if r["meaning"] and not r["pending"]:   # a pending one shows its pinned and new meaning below instead
+        o.append('<div class="tline">%s</div>' % esc(r["meaning"]))
+    if r["meaning"] and not r["pending"]:
+        o.append('<div class="tmeta">%s · %s%s</div>' % (esc(r["by"]), esc(hm(r["t"])), " · answer to your question" if r["src"] == "answer" else ""))
+    if r["pending"]:
+        p = r["pending"]
+        o.append('<div class="tq amb"><span class="tl">Pinned (the contract uses this word)</span>%s</div><div class="tq amb"><span class="tl">New meaning, %s, %s%s</span>%s</div>' % (
+            esc(r["pinned"]), esc(p["by"]), esc(hm(p["t"])), (" · why: " + esc(p["why"])) if p.get("why") else "", esc(p["meaning"])))
+    elif r["pinned"]:
+        o.append('<div class="tmeta">Pinned for the contract: %s</div>' % esc(trunc(r["pinned"], 200)))
+    if r["changed"] and not r["pending"]:
+        c = r["changed"]
+        o.append('<div class="tq amb"><span class="tl">Before, %s, %s</span>%s</div>' % (esc(c["by0"]), esc(hm(c["t0"])), esc(c["from"])))
+    if r["differ"]:
+        o.append('<div class="tq amb"><span class="tl">Defined differently</span>%s</div>' % "".join(
+            '<div><b>%s</b> (%s): %s</div>' % (esc(d["by"]), esc(hm(d["t"])), esc(d["meaning"])) for d in r["differ"]))
+    if r["shift"]:
+        sh = r["shift"]
+        o.append('<div class="tq"><span class="tl">Used differently lately? An automatic hint: it can also mean the topic moved.</span>'
+                 '<div><i>%s, %s:</i> “%s”</div><div><i>%s, %s:</i> “%s”</div></div>' % (
+                     esc(hm(sh["then"]["t"])), esc(sh["then"]["who"]), esc(sh["then"]["text"]), esc(hm(sh["now"]["t"])), esc(sh["now"]["who"]), esc(sh["now"]["text"])))
+    if r["mainsub"]:
+        ms = r["mainsub"]
+        o.append('<div class="tq"><span class="tl">The main agent and a sub-agent use it in different settings (a hint)</span>'
+                 '<div><i>main agent:</i> “%s”</div><div><i>%s:</i> “%s”</div></div>' % (
+                     esc(ms["main"]["text"]), esc(ms["sub"]["who"]), esc(ms["sub"]["text"])))
+    shown_m = {(r["changed"] or {}).get("from")} | {d["meaning"] for d in r["differ"] or []}
+    older = [h for h in r["hist"][:-1] if h["meaning"] not in shown_m]
+    if older:
+        o.append('<details class="fold"><summary>Earlier meanings (%d)</summary>%s</details>' % (len(older), "".join(
+            '<div class="tq"><span class="tl">%s, %s</span>%s</div>' % (esc(h["by"]), esc(hm(h["t"])), esc(h["meaning"])) for h in reversed(older))))
+    who = []
+    if r["first_use"]:
+        who.append("First used by %s, %s" % (r["first_use"]["who"], hm(r["first_use"]["t"])))
+    if r["first_def"]:
+        who.append("first defined by %s, %s" % (r["first_def"]["who"], hm(r["first_def"]["t"])))
+    uses = ["main agent: %d" % r["main"]] + ["%s: %d" % kv for kv in sorted(r["subs"].items())]
+    o.append('<div class="tmeta">%s<br>Uses: %s</div>' % (esc(" · ".join(who) or "Not used in the recorded chat yet"), esc(" · ".join(uses))))
+    if r["first_use"] and r["first_use"]["text"]:
+        o.append('<div class="tmeta">First use: “%s”</div>' % esc(trunc(r["first_use"]["text"], 220)))
+    b = []
+    if r["pending"]:
+        b.append(term_btn("Accept new meaning", "term_accept", r, "Pin the new meaning of “%s”? Contract rules that use it then mean the new thing." % r["term"], r["pending"]["sig"]))
+        b.append(term_btn("Keep the pinned meaning", "term_keep", r, "Tell the agent to keep using “%s” in its pinned meaning?" % r["term"], r["pending"]["sig"]))
+    b.append(term_btn("Ask agent" if r["waiting"] else "Ask again", "term_ask", r,
+                      "Ask the agent what “%s” means? Other words waiting for a meaning go in the same message." % r["term"]))
+    if r["pending"] or r["changed"] or r["differ"] or r["shift"] or r["mainsub"]:
+        b.append(term_btn("Question this", "term_question", r, "Ask the agent whether “%s” still means the same thing? It gets the quotes shown here." % r["term"]))
+    if r["shift"] or r["mainsub"]:
+        b.append(term_btn("Same meaning", "term_same", r))
+    b.append(term_btn("I know this", "term_hide", r, "Hide “%s” on every session’s Terms card and stop underlining it?" % r["term"]))
+    o.append('<div class="cacts" data-ckey="%s">%s<div class="actmsg"></div></div></div></details>' % (esc(gkey), " ".join(b)))
+    return "".join(o)
+
+
+def terms_html(s):
+    rep = s.get("terms")
+    if rep is None:
+        return ""
+    gk, c = s["key"], rep.get("counts") or {}
+    rows = [r for r in rep.get("terms") or [] if not r.get("hidden")]
+    hidden = [r for r in rep.get("terms") or [] if r.get("hidden")]
+    bits = ["%d word%s" % (c.get("total", 0), "" if c.get("total") == 1 else "s") if c.get("total") else "no words yet"]
+    for k, w in (("pending", "waiting for you"), ("changed", "changed"), ("waiting", "without a meaning")):
+        if c.get(k):
+            bits.append("%d %s" % (c[k], w))
+    o = ['<section class="card tcard" id="terms"%s><h2>Terms <span class="h2n">%s</span></h2>' % (sec("g", "terms"), esc(" · ".join(bits))),
+         '<div class="ttip">%s</div>' % ("Underlined words in the chat open their meaning. Select any other word or phrase to ask what it means."
+                                         if rows else "Select any word or phrase in the agent\u2019s messages to ask what it means.")]
+    if not rep.get("has_list"):
+        if rep.get("setup"):
+            o.append('<div class="mrow mut">Asked for a word list at %s; its words show here as it adds them.</div>' % esc(hm(rep["setup"])))
+        else:
+            o.append('<div class="small mut" style="margin:-2px 0 8px">Agents rarely explain their own words. Ask this one to keep a word list '
+                     '(.mc/glossary.jsonl) and to define new words the first time it uses them; it also pins that rule in AGENTS.md.</div>')
+        o.append('<div class="cacts" data-ckey="%s" style="margin:0 0 10px">%s<span class="actmsg"></span></div>' % (esc(gk), act_btn(
+            {"label": "Ask again for a word list" if rep.get("setup") else "Ask the agent to keep a word list", "op": "term_setup",
+             "confirm": "Send the agent a short request: keep .mc/glossary.jsonl, define new words on first use, pin that in AGENTS.md, and add the words it already uses?"})))
+    wait = [r for r in rows if r["waiting"]]
+    if wait:
+        o.append('<div class="mrow"><b>Waiting for a meaning:</b> %s <span class="cacts" data-ckey="%s">%s<span class="actmsg"></span></span></div>' % (
+            esc(", ".join(r["term"] for r in wait[:12]) + (" and %d more" % (len(wait) - 12) if len(wait) > 12 else "")), esc(gk),
+            act_btn({"label": "Ask agent about %s" % ("it" if len(wait) == 1 else "these %d" % len(wait)), "op": "term_ask",
+                     "confirm": "Ask the agent what %s mean%s? Answers show here." % ("this word" if len(wait) == 1 else "these %d words" % len(wait), "s" if len(wait) == 1 else "")})))
+    shown = [r for r in rows if not r["waiting"]]
+    if shown:
+        if len(shown) > 8:
+            o.append('<input class="tfind" type="search" placeholder="Find a word" aria-label="Find a word">')
+        o.append('<div class="tlist">%s</div>' % "".join(term_row_html(r, gk) for r in shown[:8]))
+        if len(shown) > 8:
+            o.append('<details class="fold tmore"><summary>%d more words</summary><div class="tlist">%s</div></details>' % (
+                len(shown) - 8, "".join(term_row_html(r, gk) for r in shown[8:])))
+    if rep.get("sugg"):
+        o.append('<details class="fold"><summary>Used often, never explained (%d)</summary><div class="small mut" style="margin:4px 0 6px">'
+                 'Words the agents keep using that nobody has defined. Ask adds them to the waiting list.</div>%s</details>' % (
+                     len(rep["sugg"]), "".join(
+                         '<span class="tsug cacts" data-ckey="%s"><span>%s <span class="faint">×%d</span></span>%s%s<span class="actmsg"></span></span>' % (
+                             esc(gk), esc(x["term"]), x["count"], act_btn({"label": "Ask", "op": "term_add", "item": x["id"]}, "btn2 tsm"),
+                             act_btn({"label": "I know it", "op": "term_hide", "text": x["term"]}, "btn2 tsm")) for x in rep["sugg"])))
+    if hidden:
+        o.append('<details class="fold"><summary>Hidden (%d)</summary>%s</details>' % (len(hidden), "".join(
+            '<span class="tsug cacts" data-ckey="%s"><span>%s</span>%s<span class="actmsg"></span></span>' % (
+                esc(gk), esc(r["term"]), act_btn({"label": "Bring back", "op": "term_unhide", "item": r["id"]}, "btn2 tsm")) for r in hidden[:40])))
+    o.append(terms_json(s))
     o.append("</section>")
     return "".join(o)
 
@@ -2599,6 +3155,11 @@ def analyze_goal(gdesc, shared):
             elif not f.get("acts"):
                 f["acts"] = [{"label": "Check what it remembers", "op": "probe",
                               "confirm": "Ask the agent to list its goal, rules, limits and next steps from memory? Its answer is scored on the Memory card."}]
+    try:
+        terms = terms_report(gkey, flags, conv, fam or ([main] if main else []), ndoc, rd(CONTRACT, "") or "")
+    except Exception as e:  # noqa: same as memory
+        sys.stderr.write("terms %s: %s\n" % (gkey, e))
+        terms = None
     items_decorate(flags, gkey, sessions, ndoc)
 
     # ---- timeline
@@ -2673,7 +3234,7 @@ def analyze_goal(gdesc, shared):
                     "waste_pct": None if waste_pct is None else round(waste_pct, 1), "gpu_h": round(gpu_h, 1),
                     "running_cores": running_cores},
         "params": {"table": ptable, "scan": {k: params.get(k) for k in ("files", "dirs", "roots", "truncated", "note", "cached", "t")}},
-        "changes": changes[-20:], "instructions": instr, "timeline": tl, "criteria": crit_rows, "memory": memory,
+        "changes": changes[-20:], "instructions": instr, "timeline": tl, "criteria": crit_rows, "memory": memory, "terms": terms,
         "measured": [{k: m.get(k) for k in ("epoch", "src", "cmd", "file", "metrics", "n_test", "who")} for m in measured[-30:]],
         "sessions": [{"label": s.get("label"), "host": s.get("host"), "kind": s.get("kind"), "role": s.get("role"),
                       "model": s.get("meta", {}).get("ctx_model") or s.get("meta", {}).get("model_provider"),
@@ -3001,6 +3562,7 @@ function render(){var q=(Q.value||'').toLowerCase();
    '<div class="bub">'+(cont?'':'<div class="mh"><span class="who">'+who(m)+'</span><span class="tm">'+tm(m.e)+'</span>'+(m.md?'<span class="mdl">'+esc(m.md)+'</span>':'')+'</div>')+
    '<div class="mb'+(long?' clip':'')+'" title="'+tm(m.e)+'">'+md(m.x)+'</div>'+(long?'<button class="more">Show all</button>':'')+'</div></div>');});
  L.innerHTML=h.join('')||'<div class="empty">No messages match.</div>';
+ if(window.mcTermMark)window.mcTermMark(L);
  document.getElementById('n').textContent=D.length.toLocaleString()+' messages';}
 L.addEventListener('click',function(ev){var b=ev.target.closest('.more');if(!b)return;var mb=b.previousElementSibling;var c=mb.classList.toggle('clip');b.textContent=c?'Show all':'Show less';});
 var tmr;Q.addEventListener('input',function(){clearTimeout(tmr);tmr=setTimeout(render,200);});
@@ -3045,7 +3607,7 @@ ROLE_CHIPS = [("agent", "Agent"), ("sub", "Sub-agents"), ("user", "You"), ("task
 # Every block on the pages can be hidden: click its x (this browser), or `mctl hide NAME` (every machine).
 SECTIONS = [("latest", "Agent's latest words"), ("cards", "Key numbers"), ("needs", "Needs you"), ("criteria", "Acceptance criteria"),
             ("plan", "Plan"), ("resources", "Resources"), ("integrity", "Scientific integrity"), ("watchdog", "Watchdog"),
-            ("memory", "Memory"), ("timeline", "What happened"), ("instructions", "Your instructions"), ("screen", "Live screen"), ("slurm", "Slurm jobs"),
+            ("memory", "Memory"), ("terms", "Terms"), ("timeline", "What happened"), ("instructions", "Your instructions"), ("screen", "Live screen"), ("slurm", "Slurm jobs"),
             ("sessions", "Agent sessions"), ("referee", "Referee review"), ("contract", "Contract"), ("others", "Other agent logs")]
 SEC_LABEL = dict(SECTIONS)
 
@@ -3388,7 +3950,7 @@ def write_conv_page(snap, nav):
             '<div id="list" class="chat"></div><div class="composer">%s</div></main>%s<script>%s</script>%s</body></html>') % (
         HEAD_META, esc(gname), CSS, CONV_CSS, esc(gkey), hue(gkey), appbar(nav, gkey, "goals", True, snap.get("collected")), esc(gkey), esc(gname),
         esc((snap["goal"].get("agent_kind") or "agent").capitalize()), esc(LOGIN_HOSTS.get(snap.get("node_name"), snap.get("node_name") or "?")),
-        esc(gkey), chips, send_box(snap, compact=True), scripts + PEND_JS, CONV_JS, SEND_JS + REFRESH_JS + TOOLS_JS)
+        esc(gkey), chips, send_box(snap, compact=True), scripts + PEND_JS + terms_json(dict(snap, key=gkey)), CONV_JS, SEND_JS + REFRESH_JS + TOOLS_JS + TERMS_JS)
     fp = os.path.join(MC_DIR, "goals", gkey + ".conversation.html")
     if rd(fp) != page:
         with open(fp, "w", encoding="utf-8") as f:
@@ -3662,7 +4224,7 @@ def overview(shared, snaps):
                       "target": (x.get("tmux") or {}).get("target") or x["session"],
                       "conv_count": (x.get("conv") or {}).get("count") or 0,
                       "g": {k: x["goal"].get(k) for k in ("codex_running", "sleep_until", "paused", "status", "busy", "last_activity")},
-                      "plan_now": x["plan"]["now"], "crit_met": sum(1 for r in crit if r["status"] == "met"), "crit_total": len(crit),
+                      "plan_now": x["plan"]["now"], "crit_met": sum(1 for r in crit if r["status"] == "met"), "crit_total": len(crit), "terms_new": ((x.get("terms") or {}).get("new24") or []), "terms_changed": ((x.get("terms") or {}).get("changed24") or []),
                       "crit_noev": sum(1 for r in crit if r["status"] == "no evidence"),
                       "reds": sum(1 for f in gf if f["sev"] == "red"), "ambers": sum(1 for f in gf if f["sev"] == "amber"),
                       "top": top, "unreachable": x.get("unreachable"), "ended": x.get("ended"), "sev": worst_sev(gf)})
@@ -3820,6 +4382,9 @@ def alerts(ov):
             lines.append("%s: %s, last activity %s, plan %d/%d%s" % (
                 g["name"], "node unreachable" if g["unreachable"] else (g["status"] or "?"), ago(g["last"]), g["plan_done"], g["plan_total"],
                 (", criteria %d/%d" % (g["crit_met"], g["crit_total"])) if g["crit_total"] else ""))
+            if g.get("terms_new") or g.get("terms_changed"):   # the agents' words: new ones, and ones whose meaning moved
+                lines.append("  words: %s%s" % (("new " + ", ".join(g["terms_new"][:6])) if g.get("terms_new") else "",
+                                                ("%schanged %s" % ("; " if g.get("terms_new") else "", ", ".join(g["terms_changed"][:6]))) if g.get("terms_changed") else ""))
         c = ov["compute"]
         lines.append("Jobs: %d running, %d pending" % (sum(r["running"] for r in ov["resources"]), sum(r["pending"] for r in ov["resources"])))
         lines.append("Compute 48h: %.0f core-h, %s idle/failed" % (c["alloc_ch"], ("%d%%" % c["waste_pct"]) if c["waste_pct"] is not None else "n/a"))
@@ -3890,6 +4455,24 @@ footer{color:var(--faint);font-size:12px;margin-top:18px;line-height:1.7}svg.sp{
 .pend.warn .bub{border-color:color-mix(in srgb,var(--amb) 60%,transparent)}.pend.bad .bub{border-color:color-mix(in srgb,var(--red) 60%,transparent)}
 .pdot{width:7px;height:7px;border-radius:50%;background:var(--c-you);animation:mcpulse .9s ease-in-out infinite alternate}@keyframes mcpulse{from{opacity:.25}to{opacity:1}}@media (prefers-reduced-motion:reduce){.pdot{animation:none}}
 .pendrows .row{margin:10px 0}.pendrows:empty{display:none}
+.tw{text-decoration:underline dotted;text-decoration-thickness:1.5px;text-underline-offset:3px;text-decoration-color:color-mix(in srgb,currentColor 50%,transparent);cursor:help;border-radius:3px}
+.tw:hover,.tw:focus-visible{background:color-mix(in srgb,var(--c-you) 16%,transparent);outline:none}.tw.warn{text-decoration-color:var(--amb)}.tw.wait{text-decoration-style:dashed}
+.tpop{position:absolute;z-index:70;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.28);padding:12px 14px 10px;font-size:13.5px;line-height:1.45;text-align:left}
+.tpop.sheet{position:fixed;left:8px;right:8px;bottom:8px;max-height:68vh;overflow:auto}
+.tph{display:flex;align-items:center;gap:8px;margin-bottom:6px}.tph b{font-size:15.5px}.tpx{margin-left:auto;border:0;background:none;color:var(--mut);font-size:20px;line-height:1;cursor:pointer;padding:2px 4px}
+.tmn{margin:2px 0 4px}.tmeta{font-size:12px;color:var(--mut);margin-top:6px}.tl{display:block;font-size:11.5px;color:var(--mut);margin-bottom:2px}
+.tq{margin:8px 0;padding:1px 0 1px 10px;border-left:2px solid var(--line)}.tq.amb{border-left-color:var(--amb)}.tq div{margin-top:3px}
+.tpop .cacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}.tpop .actmsg{flex-basis:100%}.tpl{display:inline-block;margin-top:8px;font-size:12px}
+.tchip{position:absolute;z-index:71;background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,.25);padding:6px}
+.tchip .cacts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;max-width:min(420px,calc(100vw - 32px))}.tchip .actmsg{flex-basis:100%;font-size:12px}
+.tbad{display:inline-block;font-size:11px;line-height:1.5;border:1px solid var(--line);border-radius:999px;padding:0 7px;margin-left:6px;color:var(--mut);white-space:nowrap;vertical-align:1px}
+.tbad.amb{border-color:color-mix(in srgb,var(--amb) 60%,transparent);color:var(--amb)}
+details.trow{background:none;border:0;border-top:1px solid var(--line);border-radius:0;box-shadow:none;margin:0;padding:9px 0}.tlist{margin-top:4px}.tlist>.trow:first-child{border-top:0}.trow>summary{list-style:none;cursor:pointer}.trow>summary::-webkit-details-marker{display:none}
+.trow .tn{font-weight:650}.tmean{display:block;color:var(--mut);font-size:13px;margin-top:2px}.trow[open] .tmean{display:none}.trow[open] .tline,.trow .tbody{font-size:13.5px}
+.tbody{padding:4px 0 2px}.tline{margin:2px 0}.tbody .cacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.tbody .actmsg{flex-basis:100%}
+.tfind{width:100%;max-width:320px;margin:2px 0 6px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit;font-size:13px}
+.cacts.tsug{display:inline-flex;width:auto;max-width:100%;margin-top:3px;align-items:center;gap:4px;flex-wrap:wrap;border:1px solid var(--line);border-radius:999px;padding:2px 3px 2px 10px;margin:3px 4px 3px 0;font-size:13px}
+.tsug .actmsg{font-size:11.5px}.ttip{font-size:12px;color:var(--faint);margin:-2px 0 8px}.btn2.tsm{padding:1px 8px;font-size:12px}
 .evt{display:flex;align-items:center;gap:10px;margin:16px 0;font-size:12px}.evt:before,.evt:after{content:"";flex:1;height:1px;background:var(--line)}
 .evt span{padding:3px 12px;border-radius:99px;background:var(--t-event);color:var(--amb)}
 details.cmp{margin:16px auto;max-width:760px;border:1px dashed color-mix(in srgb,var(--amb) 45%,transparent);border-radius:12px;padding:6px 12px;background:none;box-shadow:none}
@@ -4277,7 +4860,7 @@ function swap(h){
  [].forEach.call(nm.querySelectorAll('details'),function(x,i){var k=x.getAttribute('data-sec')||('#'+i);if(k in open)x.open=open[k];});
  var sb=document.getElementById('sendbox'),nsb=nm.querySelector('#sendbox');if(sb&&nsb)nsb.parentNode.replaceChild(sb,nsb);   // keeps what you typed
  om.parentNode.replaceChild(nm,om);
- applyX();if(window.mcHideScan)window.mcHideScan();if(window.mcNotify)window.mcNotify();if(window.mcPendPaint)window.mcPendPaint();window.scrollTo(0,y);
+ applyX();if(window.mcHideScan)window.mcHideScan();if(window.mcNotify)window.mcNotify();if(window.mcPendPaint)window.mcPendPaint();if(window.mcTermsInit)window.mcTermsInit();window.scrollTo(0,y);
  if(aid){var e=document.getElementById(aid);if(e&&document.activeElement!==e){try{e.focus({preventScroll:true});if(s0!==null)e.setSelectionRange(s0,s1);}catch(_){}}}
  return true;}
 function pull(){if(inflight)return inflight;
@@ -4343,6 +4926,96 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 return {list:function(){return items.slice();},on:function(f){subs.push(f);},row:row,seen:seen,
  start:function(x){items=items.filter(function(p){return p.st==='sending'||p.st==='sent';});var p={id:'p'+Date.now(),x:x,e:now(),st:'sending'};items.push(p);fire();return p.id;},
  set:function(id,st){items.forEach(function(p){if(p.id===id){p.st=st;if(st==='sent')p.t=now();}});fire();}};
+})();
+</script>"""
+
+TERMS_JS = r"""<script>
+// Terms: underline the agents' words in the chat; a tap opens what each means (who used and defined it first, older
+// meanings, hints that its use moved). Selecting any other word or phrase offers to ask the agent what it means.
+(function(){
+var T=[],byId={},byN={},rx=null,rt=null,KEY='',pop=null,chip=null,lastDown=0;
+function esc(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function load(){var J=document.getElementById('mc-terms');T=[];byId={};byN={};rx=rt=null;if(!J)return;KEY=J.getAttribute('data-key')||'';
+ try{T=JSON.parse(J.textContent)||[];}catch(e){T=[];}
+ var parts=[];T.forEach(function(t){byId[t.id]=t;byN[t.n]=t;parts.push(t.n.split(/[\s-]+/).map(function(w){return w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}).join('[\\s-]?'));});
+ parts.sort(function(a,b){return b.length-a.length;});
+ if(parts.length){var src='(^|[^\\w-])('+parts.join('|')+')(?![\\w-])';rx=new RegExp(src,'gi');rt=new RegExp(src,'i');}}
+function find(s){var k=String(s).toLowerCase().replace(/\s+/g,' ').trim();if(byN[k])return byN[k];var k2=k.replace(/[\s-]+/g,'');
+ for(var n in byN)if(n.replace(/[\s-]+/g,'')===k2)return byN[n];return null;}
+function mark(root){if(!rx||!root)return;var n0=0;
+ var w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode:function(nd){var p=nd.parentNode;
+  if(!p||!p.closest('.mb')||p.closest('pre,a,button,.tw,.tpop,.tcard,textarea'))return NodeFilter.FILTER_REJECT;
+  return rt.test(nd.nodeValue)?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP;}}),list=[],nd;
+ while((nd=w.nextNode())&&list.length<3000)list.push(nd);
+ list.forEach(function(nd){var s=nd.nodeValue,frag=document.createDocumentFragment(),last=0,m;rx.lastIndex=0;
+  while((m=rx.exec(s))){var st=m.index+m[1].length,t=find(m[2]);if(!t)continue;
+   if(st>last)frag.appendChild(document.createTextNode(s.slice(last,st)));
+   var sp=document.createElement('span');sp.className='tw'+(t.pending||t.differ?' warn':t.waiting?' wait':'');sp.setAttribute('data-t',t.id);
+   sp.setAttribute('tabindex','0');sp.setAttribute('role','button');sp.textContent=m[2];frag.appendChild(sp);last=st+m[2].length;n0++;}
+  if(last){if(last<s.length)frag.appendChild(document.createTextNode(s.slice(last)));nd.parentNode.replaceChild(frag,nd);}});}
+function btn(label,op,t,o){o=o||{};return '<button type="button" class="btn2" data-cop="'+op+'"'+(t?' data-citem="'+t.id+'"':'')+(o.text?' data-ctext="'+esc(o.text)+'"':'')+
+ (o.psig?' data-cpsig="'+esc(o.psig)+'"':'')+(o.confirm?' data-cconfirm="'+esc(o.confirm)+'"':'')+'>'+esc(label)+'</button>';}
+function q(label,x){return x?'<div class="tq"><span class="tl">'+esc(label)+'</span>'+esc(x)+'</div>':'';}
+function card(t){var h='<div class="tph"><b>'+esc(t.term)+'</b>'+(t.contract?'<span class="tbad">in contract</span>':'')+
+  '<button type="button" class="tpx" aria-label="Close">×</button></div>';
+ if(t.pending)h+=q('Pinned (the contract uses this word)',t.pinned)+'<div class="tq amb"><span class="tl">New meaning, '+esc(t.pending.by)+', '+esc(t.pending.t)+'</span>'+esc(t.pending.meaning)+'</div>';
+ else if(t.meaning)h+='<div class="tmn">'+esc(t.meaning)+'</div><div class="tmeta">'+esc(t.by)+' · '+esc(t.t)+(t.src==='answer'?' · answer to your question':'')+'</div>';
+ else h+='<div class="tmn mut">No meaning yet'+(t.asked?' · asked at '+esc(t.asked):'')+'.</div>';
+ if(t.changed&&!t.pending)h+='<div class="tq amb"><span class="tl">Before, '+esc(t.changed.by0)+', '+esc(t.changed.t0)+'</span>'+esc(t.changed.from)+'</div>';
+ if(t.differ)h+='<div class="tq amb"><span class="tl">Defined differently</span>'+t.differ.map(function(d){return '<div><b>'+esc(d.by)+':</b> '+esc(d.meaning)+'</div>';}).join('')+'</div>';
+ if(t.shift)h+='<div class="tq"><span class="tl">Used differently lately? (a hint; the topic may just have moved)</span><div><i>'+esc(t.shift.then.t)+':</i> “'+esc(t.shift.then.text)+'”</div><div><i>'+esc(t.shift.now.t)+':</i> “'+esc(t.shift.now.text)+'”</div></div>';
+ if(t.mainsub)h+='<div class="tq"><span class="tl">Main agent and a sub-agent use it differently? (a hint)</span><div><i>main agent:</i> “'+esc(t.mainsub.main.text)+'”</div><div><i>'+esc(t.mainsub.sub.who)+':</i> “'+esc(t.mainsub.sub.text)+'”</div></div>';
+ var who=[];if(t.first_use)who.push('First used by '+t.first_use.who+', '+t.first_use.t);if(t.first_def)who.push('first defined by '+t.first_def.who+', '+t.first_def.t);
+ var uses=['main agent: '+t.main];for(var k in t.subs)uses.push(k+': '+t.subs[k]);
+ h+='<div class="tmeta">'+esc(who.join(' · '))+(who.length?'<br>':'')+'Uses: '+esc(uses.join(' · '))+'</div>';
+ var b=[];
+ if(t.pending){b.push(btn('Accept new meaning','term_accept',t,{psig:t.pending.sig,confirm:'Pin the new meaning of “'+t.term+'”? Contract rules that use it then mean the new thing.'}));
+  b.push(btn('Keep the pinned meaning','term_keep',t,{psig:t.pending.sig,confirm:'Tell the agent to keep using “'+t.term+'” in its pinned meaning?'}));}
+ b.push(btn(t.waiting?'Ask agent':'Ask again','term_ask',t,{confirm:'Ask the agent what “'+t.term+'” means? Other words waiting for a meaning go in the same message.'}));
+ if(t.pending||t.changed||t.differ||t.shift||t.mainsub)b.push(btn('Question this','term_question',t,{confirm:'Ask the agent whether “'+t.term+'” still means the same thing? It gets the quotes shown here.'}));
+ if(t.shift||t.mainsub)b.push(btn('Same meaning','term_same',t));
+ b.push(btn('I know this','term_hide',t,{confirm:'Hide “'+t.term+'” on every session’s Terms card and stop underlining it?'}));
+ h+='<div class="cacts" data-ckey="'+esc(KEY)+'">'+b.join('')+'<div class="actmsg"></div></div>';
+ if(!document.getElementById('terms'))h+='<a class="tpl" href="'+encodeURIComponent(KEY)+'.html#'+t.id+'">All terms for this session</a>';
+ return h;}
+function place(el,box){var r=el.getBoundingClientRect(),vw=document.documentElement.clientWidth;
+ if(vw<640){box.classList.add('sheet');return;}
+ var w=Math.min(400,vw-16);box.style.width=w+'px';box.style.left=Math.max(8,Math.min(r.left,vw-w-8))+window.scrollX+'px';
+ var ph=box.offsetHeight,below=r.bottom+6;box.style.top=(below+ph>window.innerHeight-8&&r.top>ph+14?r.top-ph-6:below)+window.scrollY+'px';}
+function close(){if(pop){pop.remove();pop=null;}}
+function open(el,t){close();hideChip();pop=document.createElement('div');pop.className='tpop';pop.setAttribute('role','dialog');pop.innerHTML=card(t);
+ document.body.appendChild(pop);place(el,pop);var f=pop.querySelector('button.btn2');if(f&&!('ontouchstart' in window))f.focus({preventScroll:true});}
+function hideChip(){if(chip){chip.remove();chip=null;}}
+function sel(){var s=window.getSelection&&window.getSelection();if(!s||s.isCollapsed||!s.rangeCount)return null;
+ var a=s.anchorNode&&(s.anchorNode.nodeType===1?s.anchorNode:s.anchorNode.parentNode);if(!a||!a.closest||!a.closest('.mb')||a.closest('.tcard,.tpop'))return null;
+ var t=s.toString().replace(/\s+/g,' ').trim().replace(/^[^\w]+|[^\w]+$/g,'');if(t.length<2||t.length>60)return null;
+ return {t:t,r:s.getRangeAt(0).getBoundingClientRect()};}
+function showChip(){if(!KEY&&!document.getElementById('sendbox'))return;var x=sel();if(!x){if(chip&&Date.now()-lastDown>1500&&!chip.getAttribute('data-busy'))hideChip();return;}
+ hideChip();var k=find(x.t);chip=document.createElement('div');chip.className='tchip';
+ if(k)chip.innerHTML='<button type="button" class="btn2 topen">What “'+esc(k.term)+'” means</button>';
+ else chip.innerHTML='<div class="cacts" data-ckey="'+esc(KEY||(document.getElementById('sendbox')||{}).getAttribute('data-key'))+'">'+
+  btn('Ask what “'+(x.t.length>28?x.t.slice(0,26)+'…':x.t)+'” means','term_ask',null,{text:x.t,confirm:'Ask the agent what “'+x.t+'” means? Other words waiting for a meaning go in the same message.'})+
+  btn('Save for later','term_add',null,{text:x.t})+'<div class="actmsg"></div></div>';
+ document.body.appendChild(chip);var vw=document.documentElement.clientWidth,cw=chip.offsetWidth,ch=chip.offsetHeight;
+ chip.style.left=Math.max(8,Math.min(x.r.left+x.r.width/2-cw/2,vw-cw-8))+window.scrollX+'px';
+ chip.style.top=(x.r.top>ch+60?x.r.top-ch-8:x.r.bottom+8)+window.scrollY+'px';
+ var o=chip.querySelector('.topen');if(o)o.onclick=function(){var el=document.createElement('span');document.body.appendChild(el);el.style.cssText='position:absolute;left:'+(x.r.left+window.scrollX)+'px;top:'+(x.r.top+window.scrollY)+'px;width:1px;height:'+x.r.height+'px';open(el,k);el.remove();};
+ [].forEach.call(chip.querySelectorAll('button[data-cop]'),function(b){b.addEventListener('click',function(){chip.setAttribute('data-busy','1');setTimeout(function(){if(chip)chip.removeAttribute('data-busy');},9000);});});}
+var stt;
+document.addEventListener('pointerdown',function(e){if(e.target.closest&&e.target.closest('.tchip,.tpop'))lastDown=Date.now();},true);
+document.addEventListener('mouseup',function(e){if(e.target.closest&&e.target.closest('.tchip,.tpop'))return;setTimeout(showChip,20);});
+document.addEventListener('selectionchange',function(){clearTimeout(stt);stt=setTimeout(showChip,500);});
+document.addEventListener('click',function(e){var tw=e.target.closest&&e.target.closest('.tw');
+ if(tw){var t=byId[tw.getAttribute('data-t')];if(t&&!(window.getSelection&&String(window.getSelection())).trim()){open(tw,t);}return;}
+ if(pop&&(e.target.closest('.tpx')||!e.target.closest('.tpop')))close();});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){close();hideChip();}
+ var a=document.activeElement;if((e.key==='Enter'||e.key===' ')&&a&&a.classList&&a.classList.contains('tw')){e.preventDefault();var t=byId[a.getAttribute('data-t')];if(t)open(a,t);}});
+document.addEventListener('input',function(e){if(!e.target.classList||!e.target.classList.contains('tfind'))return;var v=e.target.value.toLowerCase().trim(),c=e.target.closest('.tcard');
+ [].forEach.call(c.querySelectorAll('.trow'),function(r){r.style.display=!v||r.textContent.toLowerCase().indexOf(v)>=0?'':'none';});var m=c.querySelector('.tmore');if(m&&v)m.open=true;});
+function init(){load();mark(document.getElementById('list'));[].forEach.call(document.querySelectorAll('[data-sec="g:latest"]'),mark);
+ var h=location.hash.slice(1);if(/^T[0-9a-f]{5}$/.test(h)){var d=document.getElementById(h);if(d){var mo=d.closest('.tmore');if(mo)mo.open=true;d.open=true;d.scrollIntoView({block:'center'});}}}
+window.mcTermMark=mark;window.mcTermsInit=init;
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
 })();
 </script>"""
 
@@ -4509,7 +5182,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
  if(['set','allow','unlock','unwatch','criterion','uncriterion','amend','bind'].indexOf(body.op)>=0)q=(q||'Change the contract?')+'\n\nThe agent gets a short message about the change.';
  if(body.op==='ask'){var n=(body.items||'').split(',').length;var t=prompt('Ask the agent about '+(n>1?'these '+n+' items':'this item')+'.\nYour question (leave empty for: is this intended? fix it if not):','');if(t===null)return;body.text=t;q='';}
  else if(body.op==='ack'){var t2=prompt('Dismiss this item? It stays hidden until it changes (7 days at most).\nWhy is it a non-issue? (optional, kept with it)','');if(t2===null)return;body.text=t2;q='';}
- if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say(['ask','probe','remind','pin'].indexOf(body.op)>=0?'Sending\u2026':'Saving\u2026','');
+ if(q&&!confirm(q))return;b.disabled=true;window.MC_BUSY=true;say(['ask','probe','remind','pin','term_ask','term_question','term_setup','term_keep'].indexOf(body.op)>=0?'Sending\u2026':'Saving\u2026','');
  post('/api/contract',body).then(function(j){window.MC_BUSY=false;b.disabled=false;say(j.message||'',j.ok?'ok':'bad');
   if(j.ok&&(body.op==='ack'||body.op==='unack')){var fl=b.closest('.flag');if(fl)moveItem(fl,body.op==='ack',b);}
   if(j.ok&&form){var ins2=form.querySelectorAll('input');for(var i=0;i<ins2.length;i++)if(ins2[i].type!=='hidden')ins2[i].value='';}})
@@ -4543,7 +5216,7 @@ window.mcNotify();
 </script>"""
 
 # Pages carry a fingerprint of their code, so an open page reloads fully (rather than swapping content) after an update.
-BUILD = hashlib.md5((CSS + CONV_CSS + CONV_JS + HIDE_JS + FRESH_JS + REFRESH_JS + PEND_JS + SEND_JS + TOOLS_JS).encode("utf-8")).hexdigest()[:12]
+BUILD = hashlib.md5((CSS + CONV_CSS + CONV_JS + HIDE_JS + FRESH_JS + REFRESH_JS + PEND_JS + SEND_JS + TOOLS_JS + TERMS_JS).encode("utf-8")).hexdigest()[:12]
 HEAD_META += '<meta name="mc-build" content="%s">' % BUILD
 
 
@@ -4799,6 +5472,7 @@ def render(s):
         " (cut short)" if sc.get("truncated") else ""))
     o.append("</section>")
     o.append(memory_html(s))
+    o.append(terms_html(s))
 
     # other flags (goal / compute amber+info not shown above)
     other = [f for f in s["flags"] if f["area"] in ("goal", "compute", "connection") and not in_needs(f)]
@@ -4884,7 +5558,7 @@ def render(s):
              '<div>Mission control types into a session only when you press a button%s. Press a block\u2019s \u00d7 to hide it here; <span class="mono">mctl hide NAME</span> hides it everywhere.%s</div></footer>' % (
                  hs, esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(s["collected"]))) if s.get("collected") else "never",
                  esc(time.strftime("%H:%M", time.localtime(s["generated"]))), CFG["interval"], never_note(), hidden_note()))
-    o.append("</main>%s%s%s%s%s</body></html>" % (HIDE_JS, PEND_JS, SEND_JS, REFRESH_JS, TOOLS_JS))
+    o.append("</main>%s%s%s%s%s%s</body></html>" % (HIDE_JS, PEND_JS, SEND_JS, REFRESH_JS, TOOLS_JS, TERMS_JS))
     return "\n".join(o)
 
 

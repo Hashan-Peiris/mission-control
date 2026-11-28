@@ -741,15 +741,21 @@ ANSWER_LINE = re.compile(r"(?im)^\W{0,6}(I[0-9a-f]{5})\W{0,3}\s*[:\-\u2013\u2014
                          r"\**\s*[:\-\u2013\u2014.,]?\s*(.*)$")
 
 
+# what one of its words means, when the user asked ("T1a2b3: meaning in plain words")
+TERM_LINE = re.compile(r"(?m)^\W{0,6}(T[0-9a-f]{5})\W{0,3}\s*[:\-\u2013\u2014]\s*\**\s*(\S.*)$")
+
+
 def add_agent(st, ts, text):
     if not text or not text.strip():
         return
     push(st["agent"], {"ts": ts, "text": trunc(text.strip(), 1800)}, 30)
     for m in ANSWER_LINE.finditer(text):
         push(st.setdefault("item_answers", []), {"ts": ts, "id": m.group(1), "status": m.group(2), "note": trunc(m.group(3).strip(), 400)}, 120)
+    for m in TERM_LINE.finditer(text):
+        push(st.setdefault("term_answers", []), {"ts": ts, "id": m.group(1), "meaning": trunc(m.group(2).strip().strip("*` "), 900)}, 200)
     add_msg(st, ts, "agent", text.strip())
     scan_shortcuts(st, ts, "agent message", text)
-    text = ANSWER_LINE.sub("", text)   # its answers about dashboard items are not claims about the goal
+    text = TERM_LINE.sub("", ANSWER_LINE.sub("", text))   # its answers about dashboard items and words are not claims about the goal
     for m in CLAIM_RE.finditer(text):
         ctx = text[max(0, m.start() - 120): m.end() + 40]
         if re.search(r"(?i)rmse|mae|error|accura|deviation", ctx):
@@ -1488,6 +1494,31 @@ def param_scan(roots, cache):
     return res
 
 
+def glossary_read(c, cache):
+    fp = os.path.join(c, ".mc", "glossary.jsonl")
+    try:
+        stt = os.stat(fp)
+    except OSError:
+        return None
+    sig = "%d:%d" % (int(stt.st_mtime), stt.st_size)
+    gc = cache.setdefault("glossary", {})
+    prev = gc.get(fp) or {}
+    # sent again for half an hour after each change (so a lost or unanalyzed copy can't hide it), then every 2 h
+    if prev.get("sig") == sig and time.time() - stt.st_mtime > 1800 and time.time() - prev.get("sent", 0) < 7200:
+        return {"sig": sig, "same": True}
+    ents = []
+    for line in tail_file(fp, 90000, 400) or []:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("term") and r.get("meaning"):
+            ents.append({k: trunc(re.sub(r"\s+", " ", str(r.get(k) if r.get(k) is not None else "")).strip(), n)
+                         for k, n in (("term", 80), ("meaning", 900), ("by", 80), ("ts", 40), ("why", 600))})
+    gc[fp] = {"sig": sig, "sent": time.time()}
+    return {"sig": sig, "entries": ents}
+
+
 def tail_file(path, nbytes=6000, nlines=25):
     try:
         with open(path, "rb") as f:
@@ -1754,6 +1785,12 @@ def main():
             if isinstance(r, dict) and r.get("item"):
                 ans.setdefault(c, []).append({k: trunc(str(r.get(k, "")), 600) for k in ("item", "status", "note", "ts", "param", "value")})
     out["answers"] = ans
+    gl = {}
+    for c in cwds[:8]:   # the agent's word list (.mc/glossary.jsonl): sent when it changed, and every 2 h in case a copy was lost
+        g = glossary_read(c, cache)
+        if g:
+            gl[c] = g
+    out["glossary"] = gl
     tops = []   # each goal's working folder once (a folder inside another one is counted with it)
     for c in sorted(set(cwds[:8]), key=len):
         if c and c != "/" and not any(c == t or c.startswith(t.rstrip("/") + "/") for t in tops) and c.rstrip("/") != os.path.expanduser("~"):

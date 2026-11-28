@@ -58,6 +58,9 @@ picks that up), or in `~/.config/mission-control/private-words` or `.git/info/pr
   only changes how the page shows an item; nothing is sent. "Check what it remembers" and "Remind it of the contract"
   (Memory card) also send a message only when you press them. Reading compaction summaries is read-only, like the rest
   of the digest.
+- Terms card: "Ask the agent to keep a word list", "Ask agent" about words, "Question this" and "Keep the pinned
+  meaning" send a message only when you press them. Saving a word, "Same meaning", "I know this" and accepting a new
+  meaning send nothing. Reading `.mc/glossary.jsonl` is read-only.
 - Messages to an agent about the contract (a rule you lock, unlock or allow, a criterion or amendment you
   add, your answer to its request, "Tell the agent how to ask") are sent only when you press that button
   and confirm. `CONTRACT_TELL_AGENT=0` in config.env keeps contract changes from being messaged.

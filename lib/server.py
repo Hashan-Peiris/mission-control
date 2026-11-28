@@ -321,9 +321,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except OSError:
                     pass
             why = (err.strip().splitlines() or ["the session was busy or asking something"])[-1]
-            done = {"ask": "asked", "probe": "probed", "remind": "reminded", "pin": "pinned"}.get(body.get("op"))
-            if done:   # an item question, a memory check or a reminder: recorded only once it went out
-                if rc == 0 and done in ("asked", "probed"):
+            done = {"ask": "asked", "probe": "probed", "remind": "reminded", "pin": "pinned", "term_ask": "term_asked",
+                    "term_question": "term_questioned", "term_setup": "term_setup_sent"}.get(body.get("op"))
+            if done:   # an item question, a memory check, a reminder or a word question: recorded only once it went out
+                if rc == 0 and done in ("asked", "probed", "term_asked", "term_questioned"):
                     self._check_back(150)
                 if rc == 124:   # handed over but no word back (another PC asleep, or its answer lost)
                     return {"ok": False, "message": "%s. It isn't recorded as sent; if the agent got it, its answer still shows up." % why.rstrip(".")}
